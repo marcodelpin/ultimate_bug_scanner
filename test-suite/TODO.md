@@ -6,7 +6,7 @@
 - [x] Connect the new runner to developer workflow (document usage in `test-suite/README.md`, wire optional helper script).
 - [x] Capture run artifacts per case (stdout/stderr, parsed summary) to simplify debugging failed scanners.
 - [ ] Add substring/rule-id requirement checks so we can prove specific categories fire.
-- [ ] Extend manifest to Python fixtures once parser stabilizes; include both `test-suite/python/buggy` and `python/clean` directories.
+- [x] Extend manifest to Python fixtures once parser stabilizes; include both `test-suite/python/buggy` and `python/clean` directories.
 - [ ] Extend manifest to Go, Rust, C++, Java, Ruby fixtures in `test-suite/<lang>/`.
 - [ ] Investigate why `modules/ubs-js.sh` sometimes reports `Files scanned: 0` even when files exist.
 - [ ] Add threshold coverage for edge-case fixtures (unicode, floating-point, timezone).

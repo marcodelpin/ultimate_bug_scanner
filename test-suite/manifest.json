@@ -105,12 +105,12 @@
       "path": "test-suite/python/buggy",
       "language": "python",
       "tags": ["python", "buggy"],
-      "enabled": false,
-      "skip_reason": "Python module still under development; counts are noisy.",
+      "args": ["--only=python"],
       "expect": {
         "exit_code": "nonzero",
         "totals": {
-          "critical": {"min": 1}
+          "critical": {"min": 1},
+          "warning": {"min": 1}
         }
       }
     },
@@ -120,13 +120,12 @@
       "path": "test-suite/python/clean",
       "language": "python",
       "tags": ["python", "clean"],
-      "enabled": false,
-      "skip_reason": "Need stable python module output before asserting clean pass.",
+      "args": ["--only=python"],
       "expect": {
         "exit_code": "zero",
         "totals": {
           "critical": {"max": 0},
-          "warning": {"max": 0}
+          "warning": {"max": 1}
         }
       }
     }
