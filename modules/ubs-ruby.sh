@@ -737,6 +737,7 @@ count=
 if [[ "$HAS_AST_GREP" -eq 1 ]]; then
   deep_chain_json=$(analyze_rb_chain_guards "$DETAIL_LIMIT")
   if [[ -n "$deep_chain_json" ]]; then
+    local parsed_counts
     parsed_counts=$(python3 - <<'PY' <<<"$deep_chain_json"
 import json, sys
 try:
