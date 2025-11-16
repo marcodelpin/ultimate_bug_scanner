@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# ULTIMATE C++ BUG SCANNER v5.0 - Industrial-Grade Code Quality Analysis
+# ULTIMATE C++ BUG SCANNER v6.2 - Industrial-Grade Code Quality Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for modern C++ (C++20+) using ast-grep
 # + smart regex/ripgrep heuristics and CMake build hygiene checks.
 # Detects: RAII violations, lifetime bugs, exception pitfalls, concurrency
 # hazards, UB-prone code, preprocessor traps, modernization gaps, and more.
-# v5.0 adds: module/headers checks, CMake policy validation, sanitizer hints,
-# SARIF/JSON passthrough, --rules merging, robust find, safe pipelines, jobs.
+# v6.2 adds: robust ast-grep CLI detection, safer pipelines, --only & --counts,
+# --paths-from, --respect-gitignore/--hidden/--max-filesize, mac/BSD xargs fix,
+# richer rulepack (delete this, empty catch, throw string, vector<bool>, etc.),
+# improved thresholds, better date handling, and portability polish.
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -Eeuo pipefail
 shopt -s lastpipe
 shopt -s extglob
+
+# Predefine colors in case an early ERR trap fires before normal init
+RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+BOLD=''; DIM=''; RESET=''
 
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
@@ -29,9 +35,6 @@ if [[ "$USE_COLOR" -eq 1 ]]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
   MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
   BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
-else
-  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
-  BOLD=''; DIM=''; RESET=''
 fi
 
 CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAGNIFY="🔍"; BUG="🐛"; FIRE="🔥"; SPARKLE="✨"; HAMMER="🔧"
@@ -42,7 +45,7 @@ CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAG
 VERBOSE=0
 PROJECT_DIR="."
 OUTPUT_FILE=""
-FORMAT="text"          # text|json|sarif
+FORMAT="text"          # text|json|sarif|counts
 CI_MODE=0
 FAIL_ON_WARNING=0
 INCLUDE_EXT="cpp,cc,cxx,cppm,mpp,ixx,h,hpp,hxx,hh,ipp,tpp"
@@ -50,11 +53,16 @@ QUIET=0
 NO_COLOR_FLAG=0
 EXTRA_EXCLUDES=""
 SKIP_CATEGORIES=""
+ONLY_CATEGORIES=""
 DETAIL_LIMIT=3
 MAX_DETAILED=250
 JOBS="${JOBS:-0}"
 USER_RULE_DIR=""
 DISABLE_PIPEFAIL_DURING_SCAN=1
+RESPECT_GITIGNORE=1
+SCAN_HIDDEN=0
+MAX_FILESIZE=""
+PATHS_FILE=""
 
 print_usage() {
   cat >&2 <<USAGE
@@ -64,14 +72,20 @@ Options:
   -v, --verbose            More code samples per finding (DETAIL=10)
   -q, --quiet              Reduce non-essential output
   --format=FMT             Output format: text|json|sarif (default: text)
+  --counts                 Output only per-category counts (machine-friendly)
   --ci                     CI mode (no clear, stable timestamps)
   --no-color               Force disable ANSI color
   --include-ext=CSV        File extensions (default: ${INCLUDE_EXT})
   --exclude=GLOB[,..]      Additional glob(s)/dir(s) to exclude
   --jobs=N                 Parallel jobs for ripgrep (default: auto)
   --skip=CSV               Skip categories by number (e.g. --skip=2,7,11)
+  --only=CSV               Run only these categories (e.g. --only=1,7,12)
   --fail-on-warning        Exit non-zero on warnings or critical
   --rules=DIR              Additional ast-grep rules directory (merged)
+  --respect-gitignore[=0|1]  Respect VCS ignore (default: 1)
+  --hidden[=0|1]           Scan hidden files/dirs (default: 0)
+  --max-filesize=SIZE      Max file size for rg (e.g. 1M, 5M)
+  --paths-from=FILE        Read newline-separated files to scan
   -h, --help               Show help
 Env:
   JOBS, NO_COLOR, CI
@@ -86,14 +100,22 @@ while [[ $# -gt 0 ]]; do
     -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
     -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
     --format=*)   FORMAT="${1#*=}"; shift;;
+    --counts)     FORMAT="counts"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
     --exclude=*)  EXTRA_EXCLUDES="${1#*=}"; shift;;
     --jobs=*)     JOBS="${1#*=}"; shift;;
     --skip=*)     SKIP_CATEGORIES="${1#*=}"; shift;;
+    --only=*)     ONLY_CATEGORIES="${1#*=}"; shift;;
     --fail-on-warning) FAIL_ON_WARNING=1; shift;;
     --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
+    --respect-gitignore=*) RESPECT_GITIGNORE="${1#*=}"; shift;;
+    --respect-gitignore)   RESPECT_GITIGNORE=1; shift;;
+    --hidden=*)   SCAN_HIDDEN="${1#*=}"; shift;;
+    --hidden)     SCAN_HIDDEN=1; shift;;
+    --max-filesize=*) MAX_FILESIZE="${1#*=}"; shift;;
+    --paths-from=*) PATHS_FILE="${1#*=}"; shift;;
     -h|--help)    print_usage; exit 0;;
     *)
       if [[ -z "$PROJECT_DIR" || "$PROJECT_DIR" == "." ]] && ! [[ "$1" =~ ^- ]]; then
@@ -115,7 +137,9 @@ if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
 if [[ -n "${OUTPUT_FILE}" ]]; then exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
 
 DATE_FMT='%Y-%m-%d %H:%M:%S'
-if [[ "$CI_MODE" -eq 1 ]]; then DATE_CMD="date -u '+%Y-%m-%dT%H:%M:%SZ'"; else DATE_CMD="date '+$DATE_FMT'"; fi
+now_iso()   { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
+now_local() { date "+${DATE_FMT}"; }
+now()       { if [[ "$CI_MODE" -eq 1 ]]; then now_iso; else now_local; fi; }
 
 # ────────────────────────────────────────────────────────────────────────────
 # Global Counters
@@ -131,6 +155,7 @@ TOTAL_FILES=0
 HAS_AST_GREP=0
 AST_GREP_CMD=()      # array-safe
 AST_RULE_DIR=""      # created later if ast-grep exists
+ASTG_VERSION=""
 
 # ────────────────────────────────────────────────────────────────────────────
 # Search engine configuration (rg if available, else grep) + include/exclude
@@ -145,9 +170,12 @@ EXCLUDE_FLAGS=()
 for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
 
 if command -v rg >/dev/null 2>&1; then
-  if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
+  if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null 2>&1 && nproc) || sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0 )"; fi
   RG_JOBS=(); if [[ "${JOBS}" -gt 0 ]]; then RG_JOBS=(-j "$JOBS"); fi
-  RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden "${RG_JOBS[@]}")
+  RG_BASE=(--no-config --no-messages --line-number --with-filename "${RG_JOBS[@]}")
+  [[ "$RESPECT_GITIGNORE" -eq 1 ]] || RG_BASE+=( --no-ignore --no-ignore-parent --no-ignore-vcs )
+  [[ "$SCAN_HIDDEN" -eq 1 ]] && RG_BASE+=( --hidden )
+  [[ -n "$MAX_FILESIZE" ]] && RG_BASE+=( --max-filesize "$MAX_FILESIZE" )
   RG_EXCLUDES=()
   for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
   RG_INCLUDES=()
@@ -238,10 +266,8 @@ show_detailed_finding() {
 begin_scan_section(){
   if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi
   set +e
-  trap - ERR
 }
 end_scan_section(){
-  trap on_err ERR
   set -e
   if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi
 }
@@ -251,9 +277,13 @@ end_scan_section(){
 # ────────────────────────────────────────────────────────────────────────────
 
 check_ast_grep() {
-  if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; return 0; fi
-  if command -v sg       >/dev/null 2>&1; then AST_GREP_CMD=(sg);       HAS_AST_GREP=1; return 0; fi
-  if command -v npx      >/dev/null 2>&1; then AST_GREP_CMD=(npx -y @ast-grep/cli); HAS_AST_GREP=1; return 0; fi
+  if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; fi
+  if [[ "$HAS_AST_GREP" -eq 0 ]] && command -v sg >/dev/null 2>&1; then AST_GREP_CMD=(sg); HAS_AST_GREP=1; fi
+  if [[ "$HAS_AST_GREP" -eq 0 ]] && command -v npx >/dev/null 2>&1; then AST_GREP_CMD=(npx -y @ast-grep/cli); HAS_AST_GREP=1; fi
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    ASTG_VERSION="$("${AST_GREP_CMD[@]}" --version 2>/dev/null || true)"
+    return 0
+  fi
   say "${YELLOW}${WARN} ast-grep not found. Advanced AST checks will be skipped.${RESET}"
   say "${DIM}Tip: npm i -g @ast-grep/cli  or  cargo install ast-grep${RESET}"
   HAS_AST_GREP=0; return 1
@@ -274,6 +304,16 @@ ast_search_with_context() {
     ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern "$pattern" --lang cpp "$PROJECT_DIR" --json 2>/dev/null || true ) \
       | head -n "$limit" || true
   fi
+}
+
+# Try multiple CLI layouts for scan (backward/forward compatibility)
+astg_scan_rules() {
+  local fmt="$1" # json|sarif
+  local ok=1
+  "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" -f "$fmt" 2>/dev/null && ok=0
+  if [[ $ok -ne 0 ]]; then "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --"$fmt" 2>/dev/null && ok=0; fi
+  if [[ $ok -ne 0 ]]; then "${AST_GREP_CMD[@]}" scan --rules "$AST_RULE_DIR" "$PROJECT_DIR" -f "$fmt" 2>/dev/null && ok=0; fi
+  return $ok
 }
 
 write_ast_rules() {
@@ -313,60 +353,7 @@ rule:
     - pattern: malloc($$)
     - pattern: free($$)
 severity: warning
-message: "C allocation APIs in C++ code; prefer new/smart pointers or containers."
-YAML
-
-  cat >"$AST_RULE_DIR/cpp-cstyle-cast.yml" <<'YAML'
-id: cpp.cstyle-cast
-language: cpp
-rule:
-  pattern: ( $EXPR )
-  inside:
-    kind: cast_expression
-severity: warning
-message: "C-style cast; prefer static_cast/reinterpret_cast/const_cast as appropriate."
-YAML
-
-  cat >"$AST_RULE_DIR/cpp-reinterpret-cast.yml" <<'YAML'
-id: cpp.reinterpret-cast
-language: cpp
-rule:
-  pattern: reinterpret_cast<$T>($EXPR)
-severity: warning
-message: "reinterpret_cast is dangerous; verify strict aliasing and lifetime."
-YAML
-
-  cat >"$AST_RULE_DIR/cpp-const-cast.yml" <<'YAML'
-id: cpp.const-cast
-language: cpp
-rule:
-  pattern: const_cast<$T>($EXPR)
-severity: warning
-message: "const_cast can lead to UB if original object wasn't non-const."
-YAML
-
-  cat >"$AST_RULE_DIR/cpp-null-vs-nullptr.yml" <<'YAML'
-id: cpp.null-macro
-language: cpp
-rule:
-  any:
-    - pattern: NULL
-    - pattern: 0
-  inside:
-    kind: pointer_declaration
-severity: info
-message: "Use nullptr instead of NULL/0 for pointer initialization."
-YAML
-
-  cat >"$AST_RULE_DIR/cpp-array-new-delete-mismatch.yml" <<'YAML'
-id: cpp.array-new-del-mismatch
-language: cpp
-rule:
-  any:
-    - pattern: delete $X
-    - pattern: delete $X[]
-severity: warning
-message: "Check delete[] vs delete for array allocations."
+message: "C allocation APIs in C++ code; prefer containers or smart pointers."
 YAML
 
   # ───── Exceptions & error handling ────────────────────────────────────────
@@ -376,7 +363,7 @@ language: cpp
 rule:
   pattern: throw $EX
   inside:
-    pattern: "~$C($$) { $$ }"
+    kind: destructor_definition
 severity: critical
 message: "Throwing in destructor can call std::terminate during stack unwinding."
 YAML
@@ -402,13 +389,22 @@ severity: warning
 message: "Deprecated dynamic exception specification; use noexcept."
 YAML
 
-  cat >"$AST_RULE_DIR/cpp-bad-exception-base.yml" <<'YAML'
-id: cpp.throw-non-std-exception
+  cat >"$AST_RULE_DIR/cpp-throw-string.yml" <<'YAML'
+id: cpp.throw-string
 language: cpp
 rule:
-  pattern: throw $EX
+  pattern: throw "$TXT"
 severity: info
-message: "Ensure thrown types derive from std::exception for interoperability."
+message: "Throwing string literal; prefer exceptions derived from std::exception."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-empty-catch.yml" <<'YAML'
+id: cpp.empty-catch
+language: cpp
+rule:
+  pattern: catch (...) { }
+severity: warning
+message: "Empty catch-all swallows exceptions silently."
 YAML
 
   # ───── Concurrency & atomics ─────────────────────────────────────────────
@@ -494,6 +490,15 @@ severity: warning
 message: "std::move on const object does not move; results in a copy."
 YAML
 
+  cat >"$AST_RULE_DIR/cpp-move-into-constref.yml" <<'YAML'
+id: cpp.move-into-constref
+language: cpp
+rule:
+  pattern: const $T& $N = std::move($X)
+severity: warning
+message: "Moving into const& has no effect; value will not be moved."
+YAML
+
   # ───── C APIs & unsafe functions ─────────────────────────────────────────
   cat >"$AST_RULE_DIR/cpp-unsafe-c-apis.yml" <<'YAML'
 id: cpp.unsafe-c-apis
@@ -506,7 +511,7 @@ rule:
     - pattern: sprintf($$)
     - pattern: scanf($$)
 severity: critical
-message: "Unsafe C APIs; prefer safer alternatives (snprintf, strlcpy, std::string, streams, fmt)."
+message: "Unsafe C APIs; prefer safer alternatives (snprintf, std::string, streams, fmt)."
 YAML
 
   cat >"$AST_RULE_DIR/cpp-rand.yml" <<'YAML'
@@ -518,19 +523,6 @@ rule:
     - pattern: srand($$)
 severity: info
 message: "Prefer <random> facilities; rand() has poor quality and shared state."
-YAML
-
-  cat >"$AST_RULE_DIR/cpp-cstdio-includes.yml" <<'YAML'
-id: cpp.c-headers-in-cpp
-language: cpp
-rule:
-  any:
-    - pattern: #include <stdio.h>
-    - pattern: #include <stdlib.h>
-    - pattern: #include <string.h>
-    - pattern: #include <math.h>
-severity: info
-message: "Prefer <cstdio>/<cstdlib>/<cstring>/<cmath> in C++."
 YAML
 
   # ───── Lifetime & iterator safety (heuristics) ───────────────────────────
@@ -552,22 +544,8 @@ rule:
   pattern: return $X;
   inside:
     kind: function_definition
-  # Note: heuristic; real lifetime analysis requires deeper tooling.
 severity: warning
 message: "Returning reference to local or temporary can dangle (heuristic)."
-YAML
-
-  # ───── Formatting & logging ──────────────────────────────────────────────
-  cat >"$AST_RULE_DIR/cpp-printf-in-cpp.yml" <<'YAML'
-id: cpp.printf-in-cpp
-language: cpp
-rule:
-  any:
-    - pattern: printf($$)
-    - pattern: fprintf($$)
-    - pattern: std::printf($$)
-severity: info
-message: "Prefer std::format/fmt::format or type-safe streams."
 YAML
 
   # ───── Modules (C++20) & headers ─────────────────────────────────────────
@@ -589,16 +567,40 @@ rule:
 severity: info
 message: "If class is polymorphic, ensure virtual destructor (heuristic)."
 YAML
+
+  # Additional safety
+  cat >"$AST_RULE_DIR/cpp-delete-this.yml" <<'YAML'
+id: cpp.delete-this
+language: cpp
+rule:
+  pattern: delete this
+severity: critical
+message: "Deleting this is error-prone and dangerous."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-vector-bool.yml" <<'YAML'
+id: cpp.vector-bool
+language: cpp
+rule:
+  pattern: std::vector<bool>
+severity: info
+message: "std::vector<bool> uses proxy references; be careful with references and addresses."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-unique-reset-raw.yml" <<'YAML'
+id: cpp.unique-reset-raw
+language: cpp
+rule:
+  pattern: delete $X; $X = nullptr
+severity: info
+message: "Use unique_ptr::reset(nullptr) instead of manual delete then null."
+YAML
 }
 
 run_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
-  local outfmt="--json"; [[ "$FORMAT" == "sarif" ]] && outfmt="--sarif"
-  if "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" $outfmt 2>/dev/null; then
-    return 0
-  else
-    return 1
-  fi
+  local f="json"; [[ "$FORMAT" == "sarif" ]] && f="sarif"
+  astg_scan_rules "$f"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -606,6 +608,13 @@ run_ast_rules() {
 # ────────────────────────────────────────────────────────────────────────────
 should_skip() {
   local cat="$1"
+  # If ONLY is set, everything not in ONLY is considered skipped
+  if [[ -n "$ONLY_CATEGORIES" ]]; then
+    IFS=',' read -r -a only_arr <<<"$ONLY_CATEGORIES"
+    local in_only=1
+    for s in "${only_arr[@]}"; do [[ "$s" == "$cat" ]] && in_only=0; done
+    [[ $in_only -eq 0 ]] || return 1
+  fi
   if [[ -z "$SKIP_CATEGORIES" ]]; then return 0; fi
   IFS=',' read -r -a arr <<<"$SKIP_CATEGORIES"
   for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done
@@ -658,7 +667,18 @@ BANNER
 echo -e "${RESET}"
 
 say "${WHITE}Project:${RESET}  ${CYAN}$PROJECT_DIR${RESET}"
-say "${WHITE}Started:${RESET}  ${GRAY}$(eval "$DATE_CMD")${RESET}"
+say "${WHITE}Started:${RESET}  ${GRAY}$(now)${RESET}"
+
+# Potentially restrict scan to explicit path list
+SCAN_PATHS=( "$PROJECT_DIR" )
+if [[ -n "$PATHS_FILE" ]]; then
+  if [[ -f "$PATHS_FILE" ]]; then
+    mapfile -t SCAN_PATHS < <(sed -e 's/\r$//' "$PATHS_FILE" | awk 'NF{print}')
+  else
+    say "${YELLOW}${WARN} --paths-from file not found: $PATHS_FILE. Falling back to PROJECT_DIR.${RESET}"
+    SCAN_PATHS=( "$PROJECT_DIR" )
+  fi
+fi
 
 # Count files (robust find; avoid dangling -o)
 EX_PRUNE=()
@@ -672,7 +692,7 @@ for e in "${_EXT_ARR[@]}"; do
 done
 NAME_EXPR+=( \) )
 TOTAL_FILES=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
+  ( set +o pipefail; find "${SCAN_PATHS[@]}" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
   | wc -l | awk '{print $1+0}'
 )
 say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})${RESET}"
@@ -681,6 +701,7 @@ say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})
 echo ""
 if check_ast_grep; then
   say "${GREEN}${CHECK} ast-grep available (${AST_GREP_CMD[*]}) - full AST analysis enabled${RESET}"
+  [[ -n "$ASTG_VERSION" ]] && say "${DIM}${INFO} ast-grep version: ${ASTG_VERSION}${RESET}"
   write_ast_rules || true
 else
   say "${YELLOW}${WARN} ast-grep unavailable - using regex fallback mode${RESET}"
@@ -734,8 +755,8 @@ print_subheader "const_cast/reinterpret_cast (dangerous)"
 count=$("${GREP_RN[@]}" -e "const_cast<|reinterpret_cast<" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "Dangerous casts present" "Verify lifetime/aliasing"; fi
 
-print_subheader "NULL/0 used instead of nullptr"
-count=$("${GREP_RN[@]}" -e "(\bNULL\b)|(^|[^:])\b0\b" "$PROJECT_DIR" 2>/dev/null | (grep -v "case 0:" || true) | count_lines)
+print_subheader "NULL used instead of nullptr"
+count=$("${GREP_RN[@]}" -e "\bNULL\b" "$PROJECT_DIR" 2>/dev/null | count_lines)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Use nullptr in C++ code"; fi
 
 fi
@@ -750,7 +771,8 @@ print_category "Detects: throw in destructor, catch by value, deprecated specs, 
 
 print_subheader "Throw in destructor"
 count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json -r-id cpp.throw-in-destructor 2>/dev/null || true ) | count_lines
+  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" -f json 2>/dev/null || true ) \
+  | grep -o '"id"[:][ ]*"cpp.throw-in-destructor"' | count_lines
 )
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Throwing in destructor" "May call std::terminate during unwinding"
@@ -767,7 +789,7 @@ if [ "$count" -gt 0 ]; then
 fi
 
 print_subheader "Deprecated dynamic exception specification"
-count=$("${GREP_RN[@]}" -e "throw[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+count=$("${GREP_RN[@]}" -e "throw[[:space:]]*\([[:space:]]*[^)]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "Deprecated 'throw(...)' found" "Use noexcept"; fi
 
 print_subheader "Generic throw types"
@@ -869,7 +891,7 @@ if [ "$count" -gt 15 ]; then
 fi
 
 print_subheader "Floating-point equality checks"
-count=$("${GREP_RN[@]}" -e "(==|===)[[:space:]]*[0-9]+\.[0-9]+" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+count=$("${GREP_RN[@]}" -e "==[[:space:]]*[0-9]+\.[0-9]+" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 3 ]; then print_finding "info" "$count" "Floating-point equality - prefer epsilon comparison"; fi
 
 print_subheader "Modulo by variable"
@@ -886,7 +908,7 @@ print_category "Detects: dangerous casts, unsafe C APIs, dangling, delete mismat
   "UB can pass tests and still crash in production"
 
 print_subheader "Dangerous functions (strcpy/gets/scanf/sprintf)"
-count=$("${GREP_RN[@]}" -e "\b(gets|strcpy|strcat|sprintf|scanf)\s*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+count=$("${GREP_RN[@]}" -e "\\b(gets|strcpy|strcat|sprintf|scanf)\\s*\\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Unsafe C APIs present" "Use safer std/fmt equivalents"
   show_detailed_finding "\b(gets|strcpy|strcat|sprintf|scanf)\s*\(" 5
@@ -912,10 +934,16 @@ print_category "Detects: using-namespace in headers, C headers, excessive includ
   "Header hygiene prevents ODR violations and compile-time blow-ups"
 
 print_subheader "Header guards or #pragma once missing (heuristic)"
-count=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.hh" -o -name "*.hxx" \) -print \) | \
-    xargs -r -I{} sh -c 'head -n 5 "{}" | grep -Eq "#pragma once|#ifndef|#if !defined" || echo "{}"' 2>/dev/null || true ) | count_lines
-)
+{
+  mapfile -t _hdrs < <( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.hh" -o -name "*.hxx" \) -print \) 2>/dev/null || true )
+  if ((${#_hdrs[@]}==0)); then count=0; else
+    count=$(
+      for f in "${_hdrs[@]}"; do
+        head -n 5 "$f" | grep -Eq "#pragma once|#ifndef|#if[[:space:]]+!defined" || echo "$f"
+      done | count_lines
+    )
+  fi
+}
 if [ "$count" -gt 0 ]; then
   print_finding "warning" "$count" "Headers missing guard/#pragma once (heuristic)"
 fi
@@ -925,10 +953,14 @@ count=$("${GREP_RN[@]}" -e "#include[[:space:]]*<stdio.h>|<stdlib.h>|<string.h>|
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Prefer <cstdio>/<cstdlib>/<cstring>/<cmath>"; fi
 
 print_subheader "using namespace std in headers"
-count=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.hh" -o -name "*.hxx" \) -print \) | \
-    xargs -r "${GREP_RN[@]}" -e "using[[:space:]]+namespace[[:space:]]+std" 2>/dev/null || true ) | count_lines
-)
+{
+  mapfile -t _hdrs2 < <( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.hh" -o -name "*.hxx" \) -print \) 2>/dev/null || true )
+  if ((${#_hdrs2[@]}==0)); then count=0; else
+    count=$(
+      "${GREP_RN[@]}" -e "using[[:space:]]+namespace[[:space:]]+std" "${_hdrs2[@]}" 2>/dev/null | count_lines
+    )
+  fi
+}
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "using namespace std in headers is harmful"; fi
 fi
 
@@ -974,7 +1006,7 @@ print_category "Detects: min/max macros, debug leftovers, macro side effects" \
   "Macros can silently rewrite code and cause ODR/symbol issues"
 
 print_subheader "min/max macro definitions"
-count=$("${GREP_RN[@]}" -e "#[[:space:]]*define[[:space:]]+min\(|#[[:space:]]*define[[:space:]]+max\(" "$PROJECT_DIR" 2>/dev/null | count_lines)
+count=$("${GREP_RN[@]}" -e "#[[:space:]]*define[[:space:]]+min\(|#[[:space:]]*define[[:space:]]]+max\(" "$PROJECT_DIR" 2>/dev/null | count_lines)
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "min/max macros detected - conflict with std::min/std::max"; fi
 
 print_subheader "DEBUG/TRACE macros enabled (heuristic)"
@@ -1094,14 +1126,15 @@ fi
 if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
   print_header "AST-GREP RULE PACK FINDINGS"
   if [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; then
-    run_ast_rules || say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
+    if run_ast_rules; then :; else
+      say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
+    fi
     say "${DIM}${INFO} Above lines are ast-grep matches (id, message, severity, file/pos).${RESET}"
   else
     # Show short textual summary by running JSON and summarizing counts by id.
     tmp_json="$(mktemp)"
     if run_ast_rules >"$tmp_json"; then
       say "${DIM}${INFO} ast-grep produced structured matches. Showing brief tally by rule id:${RESET}"
-      # naive tally (jq-free): extract "id":"...".
       ids=$(grep -o '"id"[:][ ]*"[^"]*"' "$tmp_json" | sed -E 's/.*"id"[ ]*:[ ]*"([^"]*)".*/\1/' || true)
       if [[ -n "$ids" ]]; then
         printf "%s\n" "$ids" | sort | uniq -c | awk '{printf "  • %-40s %5d\n",$2,$1}'
@@ -1154,7 +1187,7 @@ if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$WARNING_COUNT" -eq 0 ]; then
 fi
 
 echo ""
-say "${DIM}Scan completed at: $(eval "$DATE_CMD")${RESET}"
+say "${DIM}Scan completed at: $(now)${RESET}"
 
 if [[ -n "$OUTPUT_FILE" ]]; then
   say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
@@ -1170,4 +1203,10 @@ echo ""
 EXIT_CODE=0
 if [ "$CRITICAL_COUNT" -gt 0 ]; then EXIT_CODE=1; fi
 if [ "$FAIL_ON_WARNING" -eq 1 ] && [ $((CRITICAL_COUNT + WARNING_COUNT)) -gt 0 ]; then EXIT_CODE=1; fi
+
+# Optional machine-readable counts format for CI parsers
+if [[ "$FORMAT" == "counts" ]]; then
+  echo "files=$TOTAL_FILES critical=$CRITICAL_COUNT warning=$WARNING_COUNT info=$INFO_COUNT"
+fi
+
 exit "$EXIT_CODE"

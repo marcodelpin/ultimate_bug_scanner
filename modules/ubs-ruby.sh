@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# RUBY ULTIMATE BUG SCANNER v1.0 (Bash) - Industrial-Grade Code Analysis
+# RUBY ULTIMATE BUG SCANNER v1.5 (Bash) - Industrial-Grade Code Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for modern Ruby (3.3+) using:
 #   • ast-grep (rule packs; language: ruby)
@@ -16,13 +16,16 @@
 #   • regex safety (ReDoS)        • code quality markers & performance
 #
 # Supports:
-#   --format text|json|sarif (ast-grep passthrough for json/sarif)
+#   --format text|json|sarif (json/sarif => pure machine output)
 #   --rules DIR   (merge user ast-grep rules)
-#   --fail-on-warning, --skip, --jobs, --include-ext, --exclude, --ci, --no-color
+#   --fail-on-warning, --skip, --only, --jobs, --ag-threads, --include-ext, --exclude
+#   --ci, --no-color, --list-rules, --ag-fixable-only, --ag-preview-fix
+#   --json-out, --sarif-out, --summary-json
 #   CI-friendly timestamps, robust find, safe pipelines, auto parallel jobs
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -Eeuo pipefail
+umask 022
 shopt -s lastpipe
 shopt -s extglob
 
@@ -54,14 +57,15 @@ CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAG
 VERBOSE=0
 PROJECT_DIR="."
 OUTPUT_FILE=""
-FORMAT="text"          # text|json|sarif (text implemented; ast-grep emits json/sarif when rule packs are run)
+FORMAT="text"          # text|json|sarif (json/sarif => pure machine output)
 CI_MODE=0
 FAIL_ON_WARNING=0
-INCLUDE_EXT="rb,rake,ru,gemspec,erb,haml,slim"
+INCLUDE_EXT="rb,rake,ru,gemspec,erb,haml,slim,rbi,rbs,jbuilder"
 QUIET=0
 NO_COLOR_FLAG=0
 EXTRA_EXCLUDES=""
 SKIP_CATEGORIES=""
+ONLY_CATEGORIES=""
 DETAIL_LIMIT=3
 MAX_DETAILED=250
 JOBS="${JOBS:-0}"
@@ -72,6 +76,14 @@ ENABLE_BUNDLER_TOOLS=1
 RB_TOOLS="rubocop,brakeman,bundler-audit,reek,fasterer"
 RB_TIMEOUT="${RB_TIMEOUT:-1200}"
 
+AG_THREADS=0
+LIST_RULES=0
+AG_FIXABLE_ONLY=0
+AG_PREVIEW_FIX=0
+SUMMARY_JSON=""
+SARIF_OUT=""
+JSON_OUT=""
+
 print_usage() {
   cat >&2 <<USAGE
 Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
@@ -80,19 +92,27 @@ Options:
   -v, --verbose            More code samples per finding (DETAIL=10)
   -q, --quiet              Reduce non-essential output
   --format=FMT             Output format: text|json|sarif (default: text)
+  --json-out=FILE          Save full JSON report to file (text still prints)
+  --sarif-out=FILE         Save SARIF to file (text still prints)
+  --summary-json=FILE      Save brief summary counters JSON
   --ci                     CI mode (no clear, stable timestamps)
   --no-color               Force disable ANSI color
   --include-ext=CSV        File extensions (default: $INCLUDE_EXT)
   --exclude=GLOB[,..]      Additional glob(s)/dir(s) to exclude
+  --only=CSV               Only run these category numbers/names
   --jobs=N                 Parallel jobs for ripgrep (default: auto)
+  --ag-threads=N           Threads for ast-grep (default: auto)
   --skip=CSV               Skip categories by number (e.g. --skip=2,7,11)
   --fail-on-warning        Exit non-zero on warnings or critical
   --rules=DIR              Additional ast-grep rules directory (merged)
+  --list-rules             List enabled ast-grep rule IDs and exit
+  --ag-fixable-only        Limit AST output to rules that provide fixes
+  --ag-preview-fix         Preview ast-grep fixes (no writes) in diff form
   --no-bundler             Disable bundler-based extra analyzers
   --rb-tools=CSV           Which extra tools to run (default: $RB_TOOLS)
   -h, --help               Show help
 Env:
-  JOBS, NO_COLOR, CI, RB_TIMEOUT
+  JOBS, NO_COLOR, CI, RB_TIMEOUT, UBS_METRICS_DIR
 Args:
   PROJECT_DIR              Directory to scan (default: ".")
   OUTPUT_FILE              File to save the report (optional)
@@ -104,14 +124,22 @@ while [[ $# -gt 0 ]]; do
     -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
     -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
     --format=*)   FORMAT="${1#*=}"; shift;;
+    --json-out=*) JSON_OUT="${1#*=}"; shift;;
+    --sarif-out=*) SARIF_OUT="${1#*=}"; shift;;
+    --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
     --exclude=*)  EXTRA_EXCLUDES="${1#*=}"; shift;;
+    --only=*)     ONLY_CATEGORIES="${1#*=}"; shift;;
     --jobs=*)     JOBS="${1#*=}"; shift;;
+    --ag-threads=*) AG_THREADS="${1#*=}"; shift;;
     --skip=*)     SKIP_CATEGORIES="${1#*=}"; shift;;
     --fail-on-warning) FAIL_ON_WARNING=1; shift;;
     --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
+    --list-rules) LIST_RULES=1; shift;;
+    --ag-fixable-only) AG_FIXABLE_ONLY=1; shift;;
+    --ag-preview-fix) AG_PREVIEW_FIX=1; shift;;
     --no-bundler) ENABLE_BUNDLER_TOOLS=0; shift;;
     --rb-tools=*) RB_TOOLS="${1#*=}"; shift;;
     -h|--help)    print_usage; exit 0;;
@@ -132,7 +160,13 @@ if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
 
 # Redirect output early to capture everything
-if [[ -n "${OUTPUT_FILE}" ]]; then exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
+if [[ -n "${OUTPUT_FILE}" ]]; then
+  if command -v tee >/dev/null 2>&1; then
+    exec > >(tee "${OUTPUT_FILE}") 2>&1
+  else
+    exec > "${OUTPUT_FILE}" 2>&1
+  fi
+fi
 
 DATE_FMT='%Y-%m-%d %H:%M:%S'
 if [[ "$CI_MODE" -eq 1 ]]; then DATE_CMD="date -u '+%Y-%m-%dT%H:%M:%SZ'"; else DATE_CMD="date '+$DATE_FMT'"; fi
@@ -163,7 +197,7 @@ IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
 INCLUDE_GLOBS=()
 for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
 
-EXCLUDE_DIRS=(.git .hg .svn .bzr .bundle vendor/bundle vendor/cache log tmp .yardoc coverage .tox .nox .cache .idea .vscode .history node_modules dist build pkg doc public/assets storage .sass-cache .rubocop-cache .reek .bundle-audit .solargraph .yardoc .gem)
+EXCLUDE_DIRS=(.git .hg .svn .bzr .bundle vendor/bundle vendor/cache log tmp .yardoc coverage .tox .nox .cache .idea .vscode .history node_modules dist build pkg doc public/assets storage .sass-cache .rubocop-cache .reek .bundle-audit .solargraph .gem spec/fixtures test/fixtures)
 if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
 EXCLUDE_FLAGS=()
 for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
@@ -327,91 +361,56 @@ ast_search() {
 
 analyze_rb_chain_guards() {
   local limit=${1:-$DETAIL_LIMIT}
-  if [[ "$HAS_AST_GREP" -ne 1 ]]; then return 1; fi
-  if ! command -v python3 >/dev/null 2>&1; then return 1; fi
-  local tmp_chains tmp_ifs result
+  [[ "$HAS_AST_GREP" -eq 1 ]] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  local tmp_chains result
   tmp_chains="$(mktemp -t ubs-rb-chains.XXXXXX 2>/dev/null || mktemp -t ubs-rb-chains)"
-  tmp_ifs="$(mktemp -t ubs-rb-ifs.XXXXXX 2>/dev/null || mktemp -t ubs-rb-ifs)"
 
-  ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern '$OBJ.$P1.$P2.$P3' --lang ruby "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_chains"
-  ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern $'if $COND\n  $BODY\nend' --lang ruby "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_ifs"
+  # Long call chains (4+ hops). Sample-friendly stream output
+  ( set +o pipefail; "${AST_GREP_CMD[@]}" --lang ruby \
+      --pattern '$A.$B.$C.$D' \
+      --json=stream "$PROJECT_DIR" 2>/dev/null || true ) >"$tmp_chains"
 
-  result=$(python3 - "$tmp_chains" "$tmp_ifs" "$limit" <<'PYHELP'
-import json, sys
-from collections import defaultdict
-
+  result=$(python3 - "$tmp_chains" "$limit" <<'PYHELP'
+import json, sys, re
 def load_stream(path):
     data = []
     try:
-        with open(path, 'r', encoding='utf-8') as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+        for line in open(path, 'r', encoding='utf-8'):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data.append(json.loads(line))
+            except Exception:
+                pass
     except FileNotFoundError:
-        return data
+        pass
     return data
 
-matches_path, guards_path, limit_raw = sys.argv[1:4]
+matches_path, limit_raw = sys.argv[1:3]
 limit = int(limit_raw)
 matches = load_stream(matches_path)
-guards = load_stream(guards_path)
-
-def as_pos(node):
-    return (node.get('line', 0), node.get('column', 0))
-
-def ge(a, b):
-    return a[0] > b[0] or (a[0] == b[0] and a[1] >= b[1])
-
-def le(a, b):
-    return a[0] < b[0] or (a[0] == b[0] and a[1] <= b[1])
-
-def within(target, region):
-    start, end = target
-    rs, re = region
-    return ge(start, rs) and le(end, re)
-
-guards_by_file = defaultdict(list)
-for guard in guards:
-    file_path = guard.get('file')
-    cond = guard.get('metaVariables', {}).get('single', {}).get('COND')
-    if not file_path or not cond:
-        continue
-    rng = cond.get('range') or {}
-    start = rng.get('start'); end = rng.get('end')
-    if not start or not end:
-        continue
-    guards_by_file[file_path].append((as_pos(start), as_pos(end)))
-
-unguarded = 0
-guarded = 0
-samples = []
-
-for match in matches:
-    file_path = match.get('file')
-    rng = match.get('range') or {}
-    start = rng.get('start'); end = rng.get('end')
-    if not file_path or not start or not end:
-        continue
-    start_pos = as_pos(start); end_pos = as_pos(end)
-    regions = guards_by_file.get(file_path, [])
-    if any(within((start_pos, end_pos), region) for region in regions):
+unguarded = 0; guarded = 0; samples = []
+safe_nav = re.compile(r'\&\.')
+for m in matches:
+    file_path = m.get('file')
+    code = (m.get('lines') or '').strip()
+    rng = m.get('range') or {}
+    line = (rng.get('start') or {}).get('line', 0) + 1
+    # basic suppression: safe navigation or explicit nil guard in same line
+    suppressed = bool(safe_nav.search(code)) or bool(re.search(r'\bif\b.+\bnil\?', code))
+    if suppressed:
         guarded += 1
-        continue
-    unguarded += 1
-    if len(samples) < limit:
-        snippet = (match.get('lines') or '').strip()
-        samples.append({'file': file_path, 'line': start_pos[0] + 1, 'code': snippet})
-
-print(json.dumps({'unguarded': unguarded, 'guarded': guarded, 'samples': samples}, ensure_ascii=False))
+    else:
+        unguarded += 1
+        if len(samples) < limit:
+            samples.append({'file': file_path, 'line': line, 'code': code})
+print(json.dumps({'unguarded': unguarded, 'guarded': guarded, 'samples': samples}))
 PYHELP
   )
 
-  rm -f "$tmp_chains" "$tmp_ifs"
+  rm -f "$tmp_chains"
   printf '%s' "$result"
 }
 
@@ -423,7 +422,7 @@ write_ast_rules() {
     cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
   fi
 
-  # ── Core Ruby rules ───────────────────────────────────────────────────────
+  # ── Core Ruby rules (expanded) ───────────────────────────────────────────
   cat >"$AST_RULE_DIR/nil-eq.yml" <<'YAML'
 id: rb.nil-eq
 language: ruby
@@ -433,6 +432,12 @@ rule:
     - pattern: $X != nil
 severity: warning
 message: "Prefer x.nil? / !x.nil? instead of == nil / != nil"
+fix: |
+  if ($MATCH =~ /==\s*nil/)
+    {{X}}.nil?
+  else
+    !{{X}}.nil?
+  end
 YAML
 
   cat >"$AST_RULE_DIR/is-literal.yml" <<'YAML'
@@ -494,8 +499,11 @@ id: rb.mutable-const
 language: ruby
 rule:
   any:
-    - pattern: CONST = []
-    - pattern: CONST = {}
+    - pattern: $C = []
+    - pattern: $C = {}
+constraints:
+  C:
+    regex: '^[A-Z][A-Z0-9_]*$'
 severity: info
 message: "Mutable constants may be modified; consider freezing or dup on read"
 YAML
@@ -505,9 +513,9 @@ id: rb.eval-exec
 language: ruby
 rule:
   any:
-    - pattern: eval($$)
-    - pattern: instance_eval($$)
-    - pattern: class_eval($$)
+    - pattern: eval($ARG)
+    - pattern: instance_eval($ARG)
+    - pattern: class_eval($ARG)
 severity: critical
 message: "eval*/_*eval with strings can lead to code injection"
 YAML
@@ -517,8 +525,8 @@ id: rb.marshal-load
 language: ruby
 rule:
   any:
-    - pattern: Marshal.load($$)
-    - pattern: Marshal.restore($$)
+    - pattern: Marshal.load($ANY)
+    - pattern: Marshal.restore($ANY)
 severity: critical
 message: "Unmarshalling untrusted data is insecure; prefer JSON or safer formats"
 YAML
@@ -527,10 +535,7 @@ YAML
 id: rb.yaml-unsafe
 language: ruby
 rule:
-  pattern: YAML.load($ARGS)
-  not:
-    has:
-      pattern: permitted_classes=$P
+  pattern: YAML.load($ARG)
 severity: warning
 message: "YAML.load may instantiate objects; prefer YAML.safe_load with permitted_classes"
 YAML
@@ -542,6 +547,8 @@ rule:
   any:
     - pattern: Digest::MD5.hexdigest($$)
     - pattern: Digest::SHA1.hexdigest($$)
+    - pattern: OpenSSL::Digest::MD5.new($$)
+    - pattern: OpenSSL::Digest::SHA1.new($$)
 severity: warning
 message: "Weak hash algorithm (MD5/SHA1); prefer SHA256/512"
 YAML
@@ -583,13 +590,144 @@ YAML
 id: rb.sql-interp
 language: ruby
 rule:
-  any:
-    - pattern: "DB[$SQL]"
-    - pattern: "ActiveRecord::Base.connection.execute($SQL)"
-  has:
-    pattern: "#{$VAR}"
+  all:
+    - any:
+        - pattern: ActiveRecord::Base.connection.execute($SQL)
+        - pattern: $X.find_by_sql($SQL)
+    - has:
+        regex: '#\{.+\}'
 severity: warning
 message: "Interpolated SQL; prefer parameterized queries (e.g., where(name: ?))"
+YAML
+
+  cat >"$AST_RULE_DIR/system-single-string.yml" <<'YAML'
+id: rb.system-single-string
+language: ruby
+rule:
+  any:
+    - pattern: system($CMD)
+    - pattern: exec($CMD)
+constraints:
+  CMD:
+    kind: string
+severity: critical
+message: "Shell invocation via single string; use argv array to avoid injection."
+YAML
+
+  cat >"$AST_RULE_DIR/open-pipe.yml" <<'YAML'
+id: rb.open-pipe
+language: ruby
+rule:
+  pattern: open($STR)
+constraints:
+  STR:
+    regex: '^\s*["'\'']\|'
+severity: warning
+message: "Kernel#open with leading '|' spawns a subshell; avoid or validate inputs."
+YAML
+
+  cat >"$AST_RULE_DIR/json-parse.yml" <<'YAML'
+id: rb.json-parse
+language: ruby
+rule:
+  pattern: JSON.parse($ARG)
+severity: info
+message: "Ensure JSON.parse is wrapped with rescue JSON::ParserError."
+YAML
+
+  cat >"$AST_RULE_DIR/file-open-no-block.yml" <<'YAML'
+id: rb.file-open-no-block
+language: ruby
+rule:
+  all:
+    - pattern: File.open($ARGS)
+    - not:
+        has:
+          regex: '\bdo\s*\||\{.*\|'
+severity: warning
+message: "File.open without a block; may leak descriptors; use a block to auto-close."
+YAML
+
+  cat >"$AST_RULE_DIR/tmp-no-block.yml" <<'YAML'
+id: rb.tmp-no-block
+language: ruby
+rule:
+  any:
+    - pattern: Dir.mktmpdir($$)
+    - pattern: Tempfile.new($$)
+severity: info
+message: "Tempfile/tmpdir without block can leak; use block form to ensure cleanup."
+YAML
+
+  cat >"$AST_RULE_DIR/rails-constantize.yml" <<'YAML'
+id: rails.constantize
+language: ruby
+rule:
+  any:
+    - pattern: $X.constantize
+severity: info
+message: "constantize may raise NameError; prefer safe_constantize when input is user-controlled."
+YAML
+
+  cat >"$AST_RULE_DIR/rails-update-attributes.yml" <<'YAML'
+id: rails.update-attributes
+language: ruby
+rule:
+  any:
+    - pattern: $REC.update_attributes($$)
+severity: info
+message: "update_attributes is deprecated; prefer update with strong params."
+YAML
+
+  cat >"$AST_RULE_DIR/rails-permit-bang.yml" <<'YAML'
+id: rails.permit-bang
+language: ruby
+rule:
+  pattern: $P.permit!
+severity: warning
+message: "Strong params permit! found; review carefully."
+YAML
+
+  cat >"$AST_RULE_DIR/rails-csrf-skip.yml" <<'YAML'
+id: rails.csrf-skip
+language: ruby
+rule:
+  any:
+    - pattern: skip_before_action :verify_authenticity_token
+severity: warning
+message: "CSRF protections skipped in controllers."
+YAML
+
+  cat >"$AST_RULE_DIR/float-eq.yml" <<'YAML'
+id: rb.float-eq
+language: ruby
+rule:
+  pattern: $LHS == $FLOAT
+constraints:
+  FLOAT:
+    regex: '^[0-9]+\.[0-9]+$'
+severity: warning
+message: "Exact float equality; use tolerance (|(a-b).abs < EPS)."
+YAML
+
+  cat >"$AST_RULE_DIR/and-or.yml" <<'YAML'
+id: rb.and-or
+language: ruby
+rule:
+  any:
+    - pattern: $A and $B
+    - pattern: $A or $B
+severity: info
+message: "'and'/'or' have lower precedence than &&/||; prefer &&/|| in expressions."
+YAML
+
+  cat >"$AST_RULE_DIR/retry.yml" <<'YAML'
+id: rb.retry
+language: ruby
+rule:
+  pattern: retry
+severity: info
+message: "Ensure bounded retries with backoff."
 YAML
 
   # ── Done writing rules ────────────────────────────────────────────────────
@@ -598,7 +736,22 @@ YAML
 run_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
   local outfmt="--json"; [[ "$FORMAT" == "sarif" ]] && outfmt="--sarif"
-  if "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" $outfmt 2>/dev/null; then
+  local threads=()
+  if [[ "$AG_THREADS" -gt 0 ]]; then
+    threads=(--threads "$AG_THREADS")
+  else
+    local n="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"
+    [[ "$n" -gt 0 ]] && threads=(--threads "$n")
+  fi
+  local extra=()
+  [[ "$AG_FIXABLE_ONLY" -eq 1 ]] && extra+=(--only-fixable)
+
+  if [[ "$AG_PREVIEW_FIX" -eq 1 ]]; then
+    "${AST_GREP_CMD[@]}" fix -r "$AST_RULE_DIR" "$PROJECT_DIR" --dry-run --diff "${threads[@]}" 2>/dev/null || true
+    return 0
+  fi
+
+  if "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" $outfmt "${threads[@]}" "${extra[@]}" 2>/dev/null; then
     return 0
   else
     return 1
@@ -619,11 +772,26 @@ run_rb_tool_text() {
   # run_rb_tool_text <tool> [args...]
   local tool="$1"; shift || true
   if [[ "$ENABLE_BUNDLER_TOOLS" -eq 1 && "$HAS_BUNDLE" -eq 1 ]]; then
-    with_timeout "$RB_TIMEOUT" "${BUNDLE_EXEC[@]}" "$tool" "$@" || true
+    if [[ "$tool" == "bundle" ]]; then
+      with_timeout "$RB_TIMEOUT" bundle "$@" || true
+    else
+      with_timeout "$RB_TIMEOUT" "${BUNDLE_EXEC[@]}" "$tool" "$@" || true
+    fi
   else
     if command -v "$tool" >/dev/null 2>&1; then
       with_timeout "$RB_TIMEOUT" "$tool" "$@" || true
     fi
+  fi
+}
+run_bundle_audit() {
+  if [[ "$HAS_BUNDLE" -eq 1 && -f "$PROJECT_DIR/Gemfile.lock" ]]; then
+    with_timeout "$RB_TIMEOUT" bundle audit check --update || true
+  elif command -v bundler-audit >/dev/null 2>&1; then
+    with_timeout "$RB_TIMEOUT" bundler-audit check --update || true
+  elif command -v bundle-audit >/dev/null 2>&1; then
+    with_timeout "$RB_TIMEOUT" bundle-audit check --update || true
+  else
+    say "  ${GRAY}${INFO} bundler-audit not available; skipping${RESET}"
   fi
 }
 
@@ -632,6 +800,11 @@ run_rb_tool_text() {
 # ────────────────────────────────────────────────────────────────────────────
 should_skip() {
   local cat="$1"
+  if [[ -n "$ONLY_CATEGORIES" ]]; then
+    IFS=',' read -r -a arr <<<"$ONLY_CATEGORIES"
+    for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 0; done
+    return 1
+  fi
   if [[ -z "$SKIP_CATEGORIES" ]]; then return 0; fi
   IFS=',' read -r -a arr <<<"$SKIP_CATEGORIES"
   for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done
@@ -697,8 +870,8 @@ for e in "${_EXT_ARR[@]}"; do
 done
 NAME_EXPR+=( \) )
 TOTAL_FILES=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
-  | wc -l | awk '{print $1+0}'
+  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print0 \) 2>/dev/null || true ) \
+  | tr -cd '\0' | wc -c | awk '{print $1+0}'
 )
 say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})${RESET}"
 
@@ -707,6 +880,10 @@ echo ""
 if check_ast_grep; then
   say "${GREEN}${CHECK} ast-grep available (${AST_GREP_CMD[*]}) - full AST analysis enabled${RESET}"
   write_ast_rules || true
+  if [[ "$LIST_RULES" -eq 1 ]]; then
+    (grep -RHAn --include '*.yml' '^id:' "$AST_RULE_DIR" || true) | sed 's/.*id:\s*//' | sort -u
+    exit 0
+  fi
 else
   say "${YELLOW}${WARN} ast-grep unavailable - using regex fallback mode${RESET}"
 fi
@@ -750,10 +927,9 @@ if [[ "$HAS_AST_GREP" -eq 1 ]]; then
 import json, sys
 try:
     data = json.load(sys.stdin)
+    print(f"{data.get('unguarded', 0)} {data.get('guarded', 0)}")
 except Exception:
     pass
-else:
-    print(f"{data.get('unguarded', 0)} {data.get('guarded', 0)}")
 PY
 )
     if [[ -n "$parsed_counts" ]]; then
@@ -765,7 +941,7 @@ PY
 fi
 if [[ -z "${count:-}" ]]; then
   count=$(
-    ast_search '$X.$Y.$Z.$W' \
+    ast_search '$A.$B.$C.$D' \
     || ( "${GREP_RN[@]}" -e "\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null || true ) | count_lines
   )
   guarded_chain_count=0
@@ -781,10 +957,10 @@ elif [ "$count" -gt 0 ]; then
   print_finding "info" "$count" "Some deep chaining detected"
   [[ -n "$deep_chain_json" ]] && show_ast_samples_from_json "$deep_chain_json"
 elif [ "$guarded_chain_count" -gt 0 ]; then
-  print_finding "good" "$guarded_chain_count" "Deep chains guarded" "Scanner suppressed method chains guarded by explicit if blocks"
+  print_finding "good" "$guarded_chain_count" "Deep chains guarded" "Scanner suppressed method chains guarded by explicit patterns"
 fi
 if [[ -n "$deep_chain_json" && "$guarded_chain_count" -gt 0 ]]; then
-  say "    ${DIM}Suppressed $guarded_chain_count guarded chain(s) detected inside if statements${RESET}"
+  say "    ${DIM}Suppressed $guarded_chain_count guarded chain(s) (safe-nav or inline guard)${RESET}"
 fi
 if [[ -n "$deep_chain_json" ]]; then
   persist_metric_json "deep_guard" "$deep_chain_json"
@@ -808,7 +984,7 @@ print_category "Detects: division by variable, float equality, modulo hazards" \
 print_subheader "Division by variable (possible ÷0)"
 count=$(
   ( "${GREP_RN[@]}" -e "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null || true ) \
-  | (grep -Ev "/[[:space:]]*(255|2|10|100|1000)\b|//|/\*" || true) | count_lines)
+  | (grep -E -v "/[[:space:]]*(255|2|10|100|1000)\b|//|/\*" || true) | count_lines)
 if [ "$count" -gt 25 ]; then
   print_finding "warning" "$count" "Division by variable - verify non-zero" "Guard: raise if denom.zero?"
   show_detailed_finding "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" 5
@@ -849,8 +1025,8 @@ fi
 
 print_subheader "Mutation during each/map"
 count=$("${GREP_RN[@]}" -e "\.(each|map|select|reject)\b" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -A3 -E "\.(push|<<|insert|delete|delete_if|pop|shift|unshift|clear)\b" || true) | \
-  (grep -c -E "(push|<<|insert|delete|delete_if|pop|shift|unshift|clear)" || true) )
+  (grep -E -A3 "\.(push|<<|insert|delete|delete_if|pop|shift|unshift|clear)\b" || true) | \
+  (grep -E -c "(push|<<|insert|delete|delete_if|pop|shift|unshift|clear)" || true) )
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 5 ]; then
   print_finding "warning" "$count" "Possible mutation during iteration" "Iterate over dup or collect to new array"
@@ -879,7 +1055,7 @@ fi
 
 print_subheader "Case equality (===) outside case/when"
 count=$("${GREP_RN[@]}" -e "===[[:space:]]*[A-Za-z_]" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v "when[[:space:]]" || true) | count_lines)
+  (grep -E -v "when[[:space:]]" || true) | count_lines)
 if [ "$count" -gt 0 ]; then
   print_finding "info" "$count" "=== used directly" "Ensure intent; === can be surprising"
 fi
@@ -903,7 +1079,7 @@ else
 fi
 
 print_subheader "rescue Exception"
-count=$("${GREP_RN[@]}" -e "rescue[[:space:]]+Exception" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+count=$("${GREP_RN[@]}" -e "rescue[[:space:]]+Exception\b" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Rescuing Exception" "Rescue StandardError or specific subclasses"
   show_detailed_finding "rescue[[:space:]]+Exception" 5
@@ -911,8 +1087,8 @@ fi
 
 print_subheader "rescue => e; raise e"
 count=$("${GREP_RN[@]}" -e "rescue[[:space:]]+[^=]+=>[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -A2 -E "raise[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$" || true) | \
-  (grep -c -E "raise[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$" || true))
+  (grep -E -A2 "raise[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$" || true) | \
+  (grep -E -c "raise[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$" || true))
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 0 ]; then
   print_finding "warning" "$count" "Use 'raise' not 'raise e' to keep traceback"
@@ -935,7 +1111,7 @@ print_category "Detects: code injection, unsafe deserialization, TLS off, weak c
 
 print_subheader "eval/instance_eval/class_eval"
 count=$("${GREP_RN[@]}" -e "(^|[^A-Za-z0-9_])(eval|instance_eval|class_eval)[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -Ev "^[[:space:]]*#" || true) | count_lines)
+  (grep -E -v "^[[:space:]]*#" || true) | count_lines)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "eval*/_*eval present" "Avoid executing dynamic code"
   show_detailed_finding "(^|[^A-Za-z0-9_])(eval|instance_eval|class_eval)[[:space:]]*\(" 5
@@ -945,7 +1121,7 @@ fi
 
 print_subheader "Marshal/YAML unsafe loads"
 count=$("${GREP_RN[@]}" -e "Marshal\.(load|restore)\(|YAML\.load\(" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v "YAML\.safe_load" || true) | count_lines)
+  (grep -E -v "YAML\.safe_load" || true) | count_lines)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Unsafe deserialization" "Use YAML.safe_load or JSON"
   show_detailed_finding "Marshal\.(load|restore)\(|YAML\.load\(" 5
@@ -960,7 +1136,7 @@ fi
 
 print_subheader "system/exec with single string (shell)"
 count=$("${GREP_RN[@]}" -e "(^|[^A-Za-z0-9_])(system|exec|Open3\.(capture2|capture3|popen3))\((['\"]).*\1\)" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v "," || true) | count_lines)
+  (grep -E -v "," || true) | count_lines)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Shell invocation risk (single-string)" "Use argv array: system('cmd', arg1, ...)"
   show_detailed_finding "(^|[^A-Za-z0-9_])(system|exec|Open3\.(capture2|capture3|popen3))\(" 3
@@ -974,23 +1150,23 @@ if [ "$count" -gt 0 ]; then
 fi
 
 print_subheader "Weak hash algorithms"
-count=$("${GREP_RN[@]}" -e "Digest::(MD5|SHA1)\.hexdigest" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+count=$("${GREP_RN[@]}" -e "Digest::(MD5|SHA1)\.hexdigest|OpenSSL::Digest::(MD5|SHA1)\.new" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 0 ]; then
   print_finding "warning" "$count" "Weak hash usage" "Use Digest::SHA256"
-  show_detailed_finding "Digest::(MD5|SHA1)\.hexdigest" 3
+  show_detailed_finding "Digest::(MD5|SHA1)\.hexdigest|OpenSSL::Digest::(MD5|SHA1)\.new" 3
 fi
 
 print_subheader "Hardcoded secrets"
-count=$("${GREP_RNI[@]}" -e "(password|api_?key|secret|token)[[:space:]]*[:=][[:space:]]*['\"][^\"']+['\"]" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v "#.*(password|api_?key|secret|token)" || true) | count_lines)
+count=$("${GREP_RNI[@]}" -e "\b(password|api_?key|client_secret|private_?key|bearer|authorization|token)\b[[:space:]]*[:=][[:space:]]*['\"][^\"']+['\"]" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -E -v "(^|/)(spec|test)/fixtures/" || true) | count_lines)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Potential hardcoded secrets" "Use env vars or credentials store"
-  show_detailed_finding "(password|api_?key|secret|token)[[:space:]]*[:=][[:space:]]*['\"][^\"']+['\"]" 5
+  show_detailed_finding "\b(password|api_?key|client_secret|private_?key|bearer|authorization|token)\b[[:space:]]*[:=][[:space:]]*['\"][^\"']+['\"]" 5
 fi
 
 print_subheader "SecureRandom absent where tokens generated"
 count=$("${GREP_RN[@]}" -e "token|secret|nonce|password" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v -i "SecureRandom" || true) | count_lines)
+  (grep -E -v -i "SecureRandom" || true) | count_lines)
 if [ "$count" -gt 20 ]; then
   print_finding "info" "$count" "Potential token generation sites" "Ensure SecureRandom is used"
 fi
@@ -1027,7 +1203,7 @@ print_category "Detects: File.open without block, Dir.chdir global effects, Temp
 
 print_subheader "File.open without block"
 count=$("${GREP_RN[@]}" -e "File\.open\([^\)]*\)" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v -E "do[[:space:]]*\||\{[[:space:]]*\|[^\|]*\|" || true) | count_lines)
+  (grep -E -v "do[[:space:]]*\||\{[[:space:]]*\|[^\|]*\|" || true) | count_lines)
 if [ "$count" -gt 5 ]; then
   print_finding "warning" "$count" "File.open used without block" "Use File.open(...){|f| ... }"
 fi
@@ -1040,7 +1216,7 @@ fi
 
 print_subheader "Tempfile / Dir.mktmpdir without blocks"
 count=$("${GREP_RN[@]}" -e "Tempfile\.new\(|Dir\.mktmpdir\(" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v -E "do[[:space:]]*\||\{[[:space:]]*\|[^\|]*\|" || true) | count_lines)
+  (grep -E -v "do[[:space:]]*\||\{[[:space:]]*\|[^\|]*\|" || true) | count_lines)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Tempfile/tmpdir without block may leak"; fi
 fi
 
@@ -1054,7 +1230,7 @@ print_category "Detects: JSON.load/parse without rescue, Integer(x) vs to_i, tim
 
 print_subheader "JSON.parse without rescue"
 count=$("${GREP_RN[@]}" -e "JSON\.parse\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-trycatch_count=$("${GREP_RNW[@]}" -B2 "begin" "$PROJECT_DIR" 2>/dev/null || true | (grep -c "JSON\.parse" || true))
+trycatch_count=$("${GREP_RNW[@]}" -B2 "begin" "$PROJECT_DIR" 2>/dev/null || true | (grep -E -c "JSON\.parse" || true))
 trycatch_count=$(printf '%s\n' "$trycatch_count" | awk 'END{print $0+0}')
 if [ "$count" -gt "$trycatch_count" ]; then
   ratio=$((count - trycatch_count))
@@ -1082,7 +1258,7 @@ print_category "Detects: return in ensure, retry, nested ternary, next/break in 
 
 print_subheader "return/break/next inside ensure"
 count=$("${GREP_RN[@]}" -e "ensure[[:space:]]*$" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -A3 -E "return|break|next" || true) | (grep -c -E "return|break|next" || true) )
+  (grep -E -A3 "return|break|next" || true) | (grep -E -c "return|break|next" || true) )
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 0 ]; then
   print_finding "warning" "$count" "Control transfer in ensure" "May swallow exceptions"
@@ -1146,7 +1322,7 @@ print_category "Detects: string concat in loops, regex compile in loops, gsub in
   "Micro-optimizations can matter in hot paths."
 
 print_subheader "String concatenation in loops"
-count=$("${GREP_RN[@]}" -e "for[[:space:]]|each[[:space:]]+do|\bwhile[[:space:]]" "$PROJECT_DIR" 2>/dev/null | (grep -A3 "<<\|+=\"" || true) | (grep -cw "<<\|+=\"" || true) )
+count=$("${GREP_RN[@]}" -e "for[[:space:]]|each[[:space:]]+do|\bwhile[[:space:]]" "$PROJECT_DIR" 2>/dev/null | (grep -E -A3 "<<|\+=\"" || true) | (grep -E -cw "<<|\+=\"" || true) )
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 5 ]; then
   print_finding "info" "$count" "String concat in loops" "Use String#<< with capacity or Array#join"
@@ -1154,7 +1330,7 @@ fi
 
 print_subheader "Regexp.new / %r in loops (compile each iteration)"
 count=$("${GREP_RN[@]}" -e "for[[:space:]]|each[[:space:]]+do|\bwhile[[:space:]]" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -A3 -E "Regexp\.new\(|%r\{" || true) | (grep -cw "Regexp\.new\|%r\{" || true) )
+  (grep -E -A3 "Regexp\.new\(|%r\{" || true) | (grep -E -cw "Regexp\.new|%r\{" || true) )
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 0 ]; then
   print_finding "info" "$count" "Regex compiled in loop" "Precompile outside loop"
@@ -1162,7 +1338,7 @@ fi
 
 print_subheader "gsub in loops"
 count=$("${GREP_RN[@]}" -e "for[[:space:]]|each[[:space:]]+do|\bwhile[[:space:]]" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -A3 -E "\.gsub\(" || true) | (grep -cw "\.gsub\(" || true) )
+  (grep -E -A3 "\.gsub\(" || true) | (grep -E -cw "\.gsub\(" || true) )
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 3 ]; then
   print_finding "info" "$count" "gsub in loops" "Consider bulk operations"
@@ -1177,7 +1353,7 @@ print_header "13. VARIABLE & SCOPE"
 print_category "Detects: global variables, class variables, monkey patching core" \
   "Scope issues cause hard-to-debug conflicts and side effects."
 
-print_subheader "Global variables ($var)"
+print_subheader "Global variables (\$var)"
 count=$("${GREP_RN[@]}" -e "[$][A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 10 ]; then
   print_finding "warning" "$count" "Use of global variables" "Prefer dependency injection or constants"
@@ -1262,7 +1438,7 @@ print_category "Detects: Thread.new without join, Ractor misuse patterns" \
 
 print_subheader "Thread.new without join at callsite"
 count=$("${GREP_RN[@]}" -e "Thread\.new\(" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v -E "\.join|\bjoin\b" || true) | count_lines )
+  (grep -E -v "\.join|\bjoin\b" || true) | count_lines )
 if [ "$count" -gt 0 ]; then
   print_finding "info" "$count" "Detached threads" "Ensure lifecycle, join, or thread pool"
 fi
@@ -1310,13 +1486,18 @@ fi
 if should_skip 18; then
 print_header "AST-GREP RULE PACK FINDINGS"
   if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
-    if run_ast_rules; then
-      say "${DIM}${INFO} Above JSON/SARIF lines are ast-grep matches (id, message, severity, file/pos).${RESET}"
-      if [[ "$FORMAT" == "sarif" ]]; then
-        say "${DIM}${INFO} Tip: ${BOLD}${AST_GREP_CMD[*]} scan -r $AST_RULE_DIR \"$PROJECT_DIR\" --sarif > report.sarif${RESET}"
+    if [[ "$AG_PREVIEW_FIX" -eq 1 ]]; then
+      run_ast_rules
+    elif [[ "$FORMAT" == "sarif" || -n "$SARIF_OUT" ]]; then
+      if run_ast_rules | tee "${SARIF_OUT:-/dev/null}" >/dev/null; then
+        [[ "$FORMAT" == "sarif" ]] && exit 0
+      fi
+    elif [[ "$FORMAT" == "json" || -n "$JSON_OUT" ]]; then
+      if run_ast_rules | tee "${JSON_OUT:-/dev/null}" >/dev/null; then
+        [[ "$FORMAT" == "json" ]] && exit 0
       fi
     else
-      say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
+      run_ast_rules || say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
     fi
   else
     say "${YELLOW}${WARN} ast-grep not available; install ast-grep or skip category 18.${RESET}"
@@ -1350,11 +1531,7 @@ if [[ "$ENABLE_BUNDLER_TOOLS" -eq 1 ]]; then
         ;;
       bundler-audit)
         print_subheader "bundler-audit (dependency vulns)"
-        if [[ "$HAS_BUNDLE" -eq 1 && -f "$PROJECT_DIR/Gemfile.lock" ]]; then
-          run_rb_tool_text bundle audit check --update || true
-        else
-          say "  ${GRAY}${INFO} Gemfile.lock not found or bundler missing; skipping bundler-audit${RESET}"
-        fi
+        run_bundle_audit
         ;;
       reek)
         print_subheader "reek (code smells)"
@@ -1380,6 +1557,12 @@ end_scan_section
 # ═══════════════════════════════════════════════════════════════════════════
 # FINAL SUMMARY
 # ═══════════════════════════════════════════════════════════════════════════
+
+# If machine format is requested globally, produce pure output and exit
+if [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; then
+  # run_ast_rules already streamed the artifact and exited earlier.
+  exit 0
+fi
 
 echo ""
 say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
@@ -1417,6 +1600,11 @@ say "${DIM}Scan completed at: $(eval "$DATE_CMD")${RESET}"
 
 if [[ -n "$OUTPUT_FILE" ]]; then
   say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
+fi
+if [[ -n "$SUMMARY_JSON" ]]; then
+  mkdir -p "$(dirname "$SUMMARY_JSON")" 2>/dev/null || true
+  printf '{"timestamp":"%s","files":%s,"critical":%s,"warning":%s,"info":%s}\n' \
+     "$(eval "$DATE_CMD")" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" >"$SUMMARY_JSON"
 fi
 
 echo ""

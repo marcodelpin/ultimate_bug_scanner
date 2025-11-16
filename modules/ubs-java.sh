@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# JAVA ULTIMATE BUG SCANNER v1.0 - Industrial-Grade Java 21+ Code Analysis
+# JAVA ULTIMATE BUG SCANNER v1.1 - Industrial-Grade Java 21+ Code Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for Java using ast-grep + semantic patterns
 # + build-tool checks (Maven/Gradle), formatting/lint integrations (optional)
 # Focus: Null/Optional pitfalls, equals/hashCode, concurrency/async, security,
 # I/O/resources, performance, regex/strings, serialization, code quality.
 #
-# Features:
+# Features (expanded):
 #   - Colorful, CI-friendly TTY output with NO_COLOR support
 #   - Robust find/rg search with include/exclude globs
 #   - Heuristics + AST rule packs (Java) written on-the-fly
@@ -26,8 +26,14 @@ shopt -s extglob
 # Error trapping
 # ────────────────────────────────────────────────────────────────────────────
 on_err() {
+  # Use safe expansions so we don't trip set -u before color variables are defined
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
-  echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
+  local _RED=${RED:-}; local _BOLD=${BOLD:-}; local _RESET=${RESET:-}; local _DIM=${DIM:-}; local _WHITE=${WHITE:-}
+  # Avoid recursive error loops by disabling ERR trap while printing
+  trap - ERR
+  echo -e "\n${_RED}${_BOLD}Unexpected error (exit $ec)${_RESET} ${_DIM}at ${src}:${line}${_RESET}\n${_DIM}Last command:${_RESET} ${_WHITE}$cmd${_RESET}" >&2
+  # Re-enable trap and exit with original code
+  trap on_err ERR
   exit "$ec"
 }
 trap on_err ERR
@@ -56,6 +62,8 @@ VERBOSE=0
 PROJECT_DIR="."
 OUTPUT_FILE=""
 FORMAT="text"          # text|json|sarif (text implemented; ast-grep emits json/sarif in rule-pack mode)
+ONLY_CATEGORIES=""
+DETAIL_LIMIT_OVERRIDE=""
 CI_MODE=0
 FAIL_ON_WARNING=0
 INCLUDE_EXT="java"
@@ -84,6 +92,8 @@ Options:
   --format=FMT               Output format: text|json|sarif (default: text)
   --ci                       CI mode (stable timestamps, no screen clear)
   --no-color                 Force disable ANSI color
+  --only=CSV                 Run only these categories (numbers), e.g. --only=1,4,16
+  --detail=N                 Show up to N code samples per finding (overrides -v/-q)
   --include-ext=CSV          File extensions (default: java)
   --exclude=GLOB[,..]        Additional glob(s)/dir(s) to exclude
   --jobs=N                   Parallel jobs for ripgrep (default: auto)
@@ -108,6 +118,8 @@ while [[ $# -gt 0 ]]; do
     -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
     --format=*)   FORMAT="${1#*=}"; shift;;
     --ci)         CI_MODE=1; shift;;
+    --only=*)     ONLY_CATEGORIES="${1#*=}"; shift;;
+    --detail=*)   DETAIL_LIMIT_OVERRIDE="${1#*=}"; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
     --exclude=*)  EXTRA_EXCLUDES="${1#*=}"; shift;;
@@ -127,6 +139,7 @@ while [[ $# -gt 0 ]]; do
       fi;;
   esac
 done
+if [[ -n "$DETAIL_LIMIT_OVERRIDE" ]]; then DETAIL_LIMIT="$DETAIL_LIMIT_OVERRIDE"; fi
 
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
@@ -157,6 +170,9 @@ HAS_GRADLE=0
 GRADLEW=""
 MVNW=""
 JAVA_TOOLCHAIN_OK=0
+START_TS=""
+END_TS=""
+START_TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%s')"
 
 # ────────────────────────────────────────────────────────────────────────────
 # Search engine configuration (rg if available, else grep)
@@ -272,6 +288,7 @@ begin_scan_section(){
   if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi
   set +e
   trap - ERR
+  # NB: scanning phase is best-effort; we restore strictness in end_scan_section
 }
 end_scan_section(){
   trap on_err ERR
@@ -297,7 +314,7 @@ check_java_env() {
   local ver
   ver="$( (echo "$JAVA_VERSION_STR" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '') )"
   if [[ -z "$ver" ]]; then ver="$(echo "$JAVA_VERSION_STR" | grep -oE '[0-9]+' | head -n1)"; fi
-  JAVA_MAJOR="$(echo "$ver" | awk -F. '{print $1+0}')"
+  JAVA_MAJOR="$(echo "$ver" | awk -F. '{print ($1+0)}')"
   if [[ "$JAVA_MAJOR" -ge "$JAVA_REQUIRED_MAJOR" ]]; then JAVA_TOOLCHAIN_OK=1; fi
 
   [[ -f "$PROJECT_DIR/mvnw" && -x "$PROJECT_DIR/mvnw" ]] && MVNW="$PROJECT_DIR/mvnw"
@@ -345,6 +362,73 @@ rule:
     - pattern: System.err.println($$)
 severity: info
 message: "System.out/err.println detected; prefer structured logging"
+YAML
+
+  # ====== Optional refinements ======
+  cat >"$AST_RULE_DIR/optional-isPresent-then-get.yml" <<'YAML'
+id: java.optional-isPresent-then-get
+language: java
+rule:
+  pattern: |
+    if ($O.isPresent()) {
+      $$ $O.get() $$
+    }
+severity: info
+message: "Optional.isPresent() followed by get(); prefer ifPresent/map/orElseThrow"
+YAML
+
+  cat >"$AST_RULE_DIR/optional-orElse-null.yml" <<'YAML'
+id: java.optional-orElse-null
+language: java
+rule:
+  pattern: $O.orElse(null)
+severity: info
+message: "Optional.orElse(null) reintroduces null; reconsider design"
+YAML
+
+  # ====== Logging best practices ======
+  cat >"$AST_RULE_DIR/logging-concat.yml" <<'YAML'
+id: java.logging-concat
+language: java
+rule:
+  any:
+    - pattern: $L.debug($A + $B, $$)
+    - pattern: $L.info($A + $B, $$)
+    - pattern: $L.warn($A + $B, $$)
+    - pattern: $L.error($A + $B, $$)
+    - pattern: $L.debug($A + $B)
+    - pattern: $L.info($A + $B)
+    - pattern: $L.warn($A + $B)
+    - pattern: $L.error($A + $B)
+severity: info
+message: "String concatenation in logging; prefer parameterized logging"
+YAML
+
+  # ====== Path building ======
+  cat >"$AST_RULE_DIR/paths-get-plus.yml" <<'YAML'
+id: java.paths-get-plus
+language: java
+rule:
+  any:
+    - pattern: java.nio.file.Paths.get($A + $B)
+    - pattern: java.nio.file.Paths.get($A, $B + $C)
+severity: info
+message: "Paths.get with '+' concatenation; prefer resolve() or multiple args"
+YAML
+
+  # ====== Secrets heuristics (basic) ======
+  cat >"$AST_RULE_DIR/hardcoded-secrets.yml" <<'YAML'
+id: java.hardcoded-secrets
+language: java
+rule:
+  pattern: String $K = $V;
+  constraints:
+    K:
+      regex: (?i).*(password|passwd|pwd|secret|token|api[-_]?key|auth|credential).*
+    V:
+      kind: string_literal
+severity: warning
+message: "Hardcoded secret-like identifier"
 YAML
 
   # ====== Optional / Null ======
@@ -599,12 +683,30 @@ detect_gradle_tasks() {
 # ────────────────────────────────────────────────────────────────────────────
 # Category skipping helper
 # ────────────────────────────────────────────────────────────────────────────
-should_skip() {
+should_run() {
   local cat="$1"
+  # If ONLY_CATEGORIES specified, run only listed
+  if [[ -n "$ONLY_CATEGORIES" ]]; then
+    IFS=',' read -r -a only_arr <<<"$ONLY_CATEGORIES"
+    for s in "${only_arr[@]}"; do [[ "$s" == "$cat" ]] && return 0; done
+    return 1
+  fi
+  # Otherwise, run everything except explicit skips
   if [[ -z "$SKIP_CATEGORIES" ]]; then return 0; fi
-  IFS=',' read -r -a arr <<<"$SKIP_CATEGORIES"
-  for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done
+  IFS=',' read -r -a skip_arr <<<"$SKIP_CATEGORIES"
+  for s in "${skip_arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done
   return 0
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# JSON summary emitter (for --format=json)
+# ────────────────────────────────────────────────────────────────────────────
+emit_json_summary() {
+  local started="$START_TS"
+  local finished="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%s')"
+  printf '{ "project":"%s","files":%s,"critical":%s,"warnings":%s,"info":%s,"started":"%s","finished":"%s","java":"%s","format":"%s" }\n' \
+    "$(printf %s "$PROJECT_DIR" | sed 's/"/\\"/g')" "$TOTAL_FILES" "$CRITICAL_COUNT" "$WARNING_COUNT" "$INFO_COUNT" \
+    "$started" "$finished" "$(printf %s "${JAVA_VERSION_STR:-unknown}" | sed 's/"/\\"/g')" "$FORMAT"
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -701,21 +803,26 @@ begin_scan_section
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 1: NULL & OPTIONAL PITFALLS
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 1; then
+if should_run 1; then
 print_header "1. NULL & OPTIONAL PITFALLS"
 print_category "Detects: Optional.get(), == null checks misuse, Objects.equals opportunities" \
   "Unnecessary NPEs and Optional misuse are common sources of production failures"
 
 print_subheader "Optional.get() usage (potential NoSuchElementException)"
 opt_get_ast=$(ast_search '$O.get()' || echo 0)
-opt_get_rg=$("${GREP_RN[@]}" -e "\.get\(\)" "$PROJECT_DIR" 2>/dev/null | (grep -vE "\.map|\.get\(|\.getClass" || true) | count_lines || true)
-opt_total=$(( opt_get_ast>0?opt_get_ast:opt_get_rg ))
+# Fallback regex: we can't perfectly know the receiver type; we still show samples.
+opt_get_rg=$("${GREP_RN[@]}" -e "\.get\(\s*\)" "$PROJECT_DIR" 2>/dev/null | (grep -vE "\.getClass\(" || true) | count_lines || true)
+opt_total=$(( opt_get_ast>0 ? opt_get_ast : opt_get_rg ))
 if [ "$opt_total" -gt 0 ]; then
   print_finding "warning" "$opt_total" "Optional.get() detected" "Prefer orElse/orElseThrow or ifPresent"
   show_detailed_finding "\.get\(\)" 5
 else
   print_finding "good" "No Optional.get() calls"
 fi
+
+print_subheader "Optional.isPresent() followed by get()"
+isp_get_ast=$(ast_search 'if ($O.isPresent()) { $$ $O.get() $$ }' || echo 0)
+if [ "$isp_get_ast" -gt 0 ]; then print_finding "info" "$isp_get_ast" "isPresent()+get() pattern"; fi
 
 print_subheader "Null checks using '==' with Strings (prefer Objects.equals)"
 str_eq_null=$("${GREP_RN[@]}" -e "==[[:space:]]*null|null[[:space:]]*==" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
@@ -725,7 +832,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 2: EQUALITY & HASHCODE
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 2; then
+if should_run 2; then
 print_header "2. EQUALITY & HASHCODE"
 print_category "Detects: String '==' compares, BigDecimal equals(), equals/hashCode mismatch" \
   "Equality issues cause subtle logic bugs and inconsistent collections behavior"
@@ -750,10 +857,14 @@ while IFS= read -r f; do
 done < <(find "$PROJECT_DIR" -type f \( -name "*.java" \) -print 2>/dev/null)
 fi
 
+print_subheader "Boxed primitives compared with '==' (heuristic)"
+boxed_eq=$("${GREP_RN[@]}" -e "\b(Integer|Long|Short|Byte|Boolean|Double|Float)\b[^;\n]*==[^;\n]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$boxed_eq" -gt 0 ]; then print_finding "info" "$boxed_eq" "Boxed primitives using '==' - consider equals()/Objects.equals()"; fi
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 3: CONCURRENCY & THREADING
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 3; then
+if should_run 3; then
 print_header "3. CONCURRENCY & THREADING"
 print_category "Detects: synchronized(this), Thread.start, newCachedThreadPool, sleep in synchronized, notify()" \
   "Concurrency misuse leads to deadlocks and performance issues"
@@ -782,7 +893,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 4: SECURITY
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 4; then
+if should_run 4; then
 print_header "4. SECURITY"
 print_category "Detects: Insecure SSL, weak hashes, http://, insecure deserialization, Random for secrets" \
   "Security misconfigurations expose users to attacks and data breaches"
@@ -811,7 +922,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 5: I/O & RESOURCES
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 5; then
+if should_run 5; then
 print_header "5. I/O & RESOURCES"
 print_category "Detects: missing charset, blocking reads in loops, delete() unchecked" \
   "I/O patterns that cause correctness or performance issues"
@@ -837,7 +948,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 6: LOGGING & DEBUGGING
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 6; then
+if should_run 6; then
 print_header "6. LOGGING & DEBUGGING"
 print_category "Detects: System.out/err.println, printStackTrace, TODO/FIXME/HACK markers" \
   "Debug code left in production affects performance and leaks info"
@@ -863,12 +974,18 @@ elif [ "$total_markers" -gt 0 ]; then
 else
   print_finding "good" "No technical debt markers"
 fi
+
+print_subheader "String concatenation inside logging calls"
+log_concat_ast=$(ast_search '$L.debug($A + $B)' || echo 0)
+log_concat_rg=$("${GREP_RN[@]}" -e "(logger|LOG|log)\.(trace|debug|info|warn|error)\s*\([^)]*\+[^)]*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+log_concat_total=$(( log_concat_ast + log_concat_rg ))
+if [ "$log_concat_total" -gt 0 ]; then print_finding "info" "$log_concat_total" "Logging concatenation - prefer parameterized logging"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 7: REGEX & STRING PITFALLS
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 7; then
+if should_run 7; then
 print_header "7. REGEX & STRING PITFALLS"
 print_category "Detects: ReDoS patterns, Pattern.compile with variables, toLowerCase/equals" \
   "String/regex bugs cause performance issues and subtle mismatches"
@@ -889,7 +1006,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 8: COLLECTIONS & GENERICS
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 8; then
+if should_run 8; then
 print_header "8. COLLECTIONS & GENERICS"
 print_category "Detects: raw types, legacy Vector/Hashtable, remove in foreach" \
   "Raw types and mutation during iteration cause runtime errors"
@@ -911,7 +1028,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 9: SWITCH & CONTROL FLOW
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 9; then
+if should_run 9; then
 print_header "9. SWITCH & CONTROL FLOW"
 print_category "Detects: fall-through (classic switch), switch without default" \
   "Control flow bugs cause unexpected behavior"
@@ -936,7 +1053,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 10: STREAMS & PERFORMANCE
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 10; then
+if should_run 10; then
 print_header "10. STREAMS & PERFORMANCE"
 print_category "Detects: parallel().forEach, String concatenation in loops" \
   "Performance pitfalls that scale poorly"
@@ -954,7 +1071,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 11: SERIALIZATION & COMPATIBILITY
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 11; then
+if should_run 11; then
 print_header "11. SERIALIZATION & COMPATIBILITY"
 print_category "Detects: implements Serializable, readObject/writeObject" \
   "Serialization hazards and maintenance burdens"
@@ -971,7 +1088,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 12: JAVA 21 FEATURES (INFO)
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 12; then
+if should_run 12; then
 print_header "12. JAVA 21 FEATURES (INFO)"
 print_category "Detects: Virtual Threads, Structured Concurrency, Sequenced Collections" \
   "Inventory of modern APIs to guide reviews for correct usage"
@@ -988,7 +1105,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 13: SQL CONSTRUCTION (HEURISTICS)
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 13; then
+if should_run 13; then
 print_header "13. SQL CONSTRUCTION (HEURISTICS)"
 print_category "Detects: string-concatenated SQL, Statement.executeQuery with + operator" \
   "Prefer prepared statements with parameters to avoid injection"
@@ -1005,7 +1122,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 14: ANNOTATIONS & NULLNESS (HEURISTICS)
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 14; then
+if should_run 14; then
 print_header "14. ANNOTATIONS & NULLNESS (HEURISTICS)"
 print_category "Detects: @Nullable without guard (approx), @Deprecated usages" \
   "Annotation-driven contracts must be respected"
@@ -1022,7 +1139,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 15: AST-GREP RULE PACK FINDINGS (JSON/SARIF passthrough)
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 15; then
+if should_run 15; then
 print_header "15. AST-GREP RULE PACK FINDINGS"
 if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
   run_ast_rules || true
@@ -1038,7 +1155,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 16: BUILD HEALTH (Maven/Gradle best-effort)
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 16; then
+if should_run 16; then
 print_header "16. BUILD HEALTH (Maven/Gradle)"
 print_category "Runs: compile/test-compile tasks; optional lint tasks if configured" \
   "Ensures the project compiles; inventories warnings/errors"
@@ -1087,6 +1204,7 @@ if [[ "$RUN_BUILD" -eq 1 ]]; then
     fi
   fi
 else
+  # Preserve informational output for parity with other sections
   print_finding "info" 1 "Build checks disabled (--no-build)"
 fi
 fi
@@ -1094,7 +1212,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 17: META STATISTICS & INVENTORY
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 17; then
+if should_run 17; then
 print_header "17. META STATISTICS & INVENTORY"
 print_category "Detects: project type (Maven/Gradle), Java version" \
   "High-level overview of the project"
@@ -1108,7 +1226,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 18: MISC API MISUSE
 # ═══════════════════════════════════════════════════════════════════════════
-if should_skip 18; then
+if should_run 18; then
 print_header "18. MISC API MISUSE"
 print_category "Detects: System.runFinalizersOnExit, Thread.stop, setAccessible(true)" \
   "Legacy and unsafe APIs"
@@ -1120,6 +1238,73 @@ set_access=$("${GREP_RN[@]}" -e "\.setAccessible\(\s*true\s*\)" "$PROJECT_DIR" 2
 if [ "$finalizers" -gt 0 ]; then print_finding "critical" "$finalizers" "System.runFinalizersOnExit used - do not use"; fi
 if [ "$thread_stop" -gt 0 ]; then print_finding "critical" "$thread_stop" "Thread.stop/suspend/resume used - unsafe"; fi
 if [ "$set_access" -gt 0 ]; then print_finding "info" "$set_access" "setAccessible(true) used - restrict usage"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 19: RESOURCE SAFETY & TRY-WITH-RESOURCES (heuristics)
+# ═══════════════════════════════════════════════════════════════════════════
+if should_run 19; then
+print_header "19. RESOURCE SAFETY & TRY-WITH-RESOURCES"
+print_category "Detects: stream/reader/writer creation; nudge toward try-with-resources" \
+  "Prefer try-with-resources to ensure deterministic close()"
+
+print_subheader "I/O stream/reader/writer instantiations (audit for try-with-resources)"
+io_ctor=$("${GREP_RN[@]}" -e "new[[:space:]]+(File(Input|Output)Stream|FileReader|FileWriter|Buffered(Input|Output)Stream|Buffered(Reader|Writer)|InputStreamReader|OutputStreamWriter|PrintWriter|Scanner)\s*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$io_ctor" -gt 0 ]; then
+  print_finding "info" "$io_ctor" "I/O constructors present - ensure try-with-resources"
+  show_detailed_finding "new[[:space:]]+(File(Input|Output)Stream|FileReader|FileWriter|Buffered(Input|Output)Stream|Buffered(Reader|Writer)|InputStreamReader|OutputStreamWriter|PrintWriter|Scanner)\s*\(" 5
+else
+  print_finding "good" "No I/O constructors detected"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 20: PATH HANDLING & FILESYSTEM
+# ═══════════════════════════════════════════════════════════════════════════
+if should_run 20; then
+print_header "20. PATH HANDLING & FILESYSTEM"
+print_category "Detects: Paths.get with '+', unchecked delete(), risky temp file patterns" \
+  "Use platform-safe composition and verify filesystem effects"
+
+print_subheader "Paths.get with '+' concatenation"
+paths_plus=$(( $(ast_search 'java.nio.file.Paths.get($A + $B)' || echo 0) + $("${GREP_RN[@]}" -e "Paths\.get\([^)]*\+[^)]*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+if [ "$paths_plus" -gt 0 ]; then print_finding "info" "$paths_plus" "Paths.get with '+' - prefer resolve()/varargs"; fi
+
+print_subheader "Unchecked File.delete()"
+del_unchecked=$("${GREP_RN[@]}" -e "\.delete\(\)\s*;" "$PROJECT_DIR" 2>/dev/null | (grep -vE "if\s*\(|assert|check|ensure" || true) | count_lines)
+if [ "$del_unchecked" -gt 0 ]; then print_finding "info" "$del_unchecked" "File.delete() return value not checked"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 21: HARD-CODED SECRETS (heuristics)
+# ═══════════════════════════════════════════════════════════════════════════
+if should_run 21; then
+print_header "21. HARD-CODED SECRETS (HEURISTICS)"
+print_category "Detects: string literals bound to secret-like identifiers" \
+  "Avoid storing secrets in source; prefer env/secret manager"
+
+print_subheader "Probable hard-coded secrets"
+secrets_ast=$(ast_search 'String $K = $V;' || echo 0)
+secrets_rg=$("${GREP_RNI[@]}" -e "(password|passwd|pwd|secret|token|api[_-]?key|auth|credential)[[:space:]]*=" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+secrets_total=$(( secrets_ast + secrets_rg ))
+if [ "$secrets_total" -gt 0 ]; then print_finding "warning" "$secrets_total" "Potential hard-coded secrets found"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 22: LOGGING BEST PRACTICES (SLF4J-style)
+# ═══════════════════════════════════════════════════════════════════════════
+if should_run 22; then
+print_header "22. LOGGING BEST PRACTICES"
+print_category "Detects: concatenation in logger calls, Throwable lost at end" \
+  "Prefer parameterized logging; include Throwable as last argument"
+
+print_subheader "Logger calls with concatenation (extended)"
+log_concat_more=$("${GREP_RN[@]}" -e "\.(trace|debug|info|warn|error)\s*\([^)]*\+[^)]*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$log_concat_more" -gt 0 ]; then print_finding "info" "$log_concat_more" "Concatenation in log calls - use placeholders"; fi
+
+print_subheader "Logger calls with Throwable not last (heuristic)"
+log_throwable_pos=$("${GREP_RN[@]}" -e "\.(trace|debug|info|warn|error)\s*\(.*Throwable[[:space:]]*,[[:space:]]*[^)]*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$log_throwable_pos" -gt 0 ]; then print_finding "info" "$log_throwable_pos" "Throwable not last in logger call"; fi
 fi
 
 # restore pipefail
@@ -1160,7 +1345,8 @@ if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$WARNING_COUNT" -eq 0 ]; then
 fi
 
 echo ""
-say "${DIM}Scan completed at: $(eval "$DATE_CMD")${RESET}"
+END_TS="$(eval "$DATE_CMD")"
+say "${DIM}Scan completed at: ${END_TS}${RESET}"
 
 if [[ -n "$OUTPUT_FILE" ]]; then
   say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
@@ -1172,6 +1358,11 @@ if [ "$VERBOSE" -eq 0 ]; then
 fi
 say "${DIM}Add to CI: ./ubs --ci --fail-on-warning . > java-bug-scan.txt${RESET}"
 echo ""
+
+if [[ "$FORMAT" == "json" ]]; then
+  # Emit a compact JSON footer with summary stats
+  emit_json_summary
+fi
 
 EXIT_CODE=0
 if [ "$CRITICAL_COUNT" -gt 0 ]; then EXIT_CODE=1; fi

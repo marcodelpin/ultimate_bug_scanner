@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# RUST ULTIMATE BUG SCANNER v1.0 - Industrial-Grade Rust Code Analysis
+# RUST ULTIMATE BUG SCANNER v1.1 - Industrial-Grade Rust Code Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for Rust using ast-grep + semantic patterns
 # + cargo-driven checks (check, clippy, fmt, audit, deny, udeps, outdated)
@@ -15,18 +15,31 @@
 #   - Category skip/selection, verbosity, sample snippets
 #   - Parallel jobs for ripgrep
 #   - Exit on critical or optionally on warnings
+#   - Optional JSON summary & flexible failure thresholds
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -Eeuo pipefail
 shopt -s lastpipe
 shopt -s extglob
 
-# ────────────────────────────────────────────────────────────────────────────
-# Error trapping
-# ────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Centralized cleanup & robust error handler
+# ---------------------------------------------------------------------------
+TMP_FILES=()
+AST_RULE_DIR=""
+cleanup() {
+  local ec=$?
+  if [[ -n "${AST_RULE_DIR:-}" && -d "$AST_RULE_DIR" ]]; then rm -rf "$AST_RULE_DIR" || true; fi
+  if [[ ${#TMP_FILES[@]} -gt 0 ]]; then for f in "${TMP_FILES[@]}"; do [[ -e "$f" ]] && rm -f "$f" || true; done; fi
+  exit "$ec"
+}
+trap cleanup EXIT
+
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
-  echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
+  local _RED=${RED-}; local _BOLD=${BOLD-}; local _RESET=${RESET-}; local _DIM=${DIM-}; local _WHITE=${WHITE-}
+  set +o pipefail
+  echo -e "\n${_RED}${_BOLD}Unexpected error (exit $ec)${_RESET} ${_DIM}at ${src}:${line}${_RESET}\n${_DIM}Last command:${_RESET} ${_WHITE}$cmd${_RESET}" >&2
   exit "$ec"
 }
 trap on_err ERR
@@ -62,6 +75,7 @@ QUIET=0
 NO_COLOR_FLAG=0
 EXTRA_EXCLUDES=""
 SKIP_CATEGORIES=""
+ONLY_CATEGORIES=""
 DETAIL_LIMIT=3
 MAX_DETAILED=250
 JOBS="${JOBS:-0}"
@@ -70,6 +84,9 @@ DISABLE_PIPEFAIL_DURING_SCAN=1
 RUN_CARGO=1
 CARGO_FEATURES_ALL=1
 CARGO_TARGETS_ALL=1
+FAIL_CRITICAL_THRESHOLD=1
+FAIL_WARNING_THRESHOLD=0
+SUMMARY_JSON=""
 
 print_usage() {
   cat >&2 <<USAGE
@@ -85,11 +102,15 @@ Options:
   --exclude=GLOB[,..]        Additional glob(s)/dir(s) to exclude
   --jobs=N                   Parallel jobs for ripgrep (default: auto)
   --skip=CSV                 Skip categories by number (e.g. --skip=2,7,11)
+  --only=CSV                 Run only the specified categories (overrides --skip)
   --fail-on-warning          Exit non-zero on warnings or critical
   --rules=DIR                Additional ast-grep rules directory (merged)
   --no-cargo                 Skip cargo-based checks (check, clippy, fmt, etc.)
   --no-all-features          Do not pass --all-features to cargo
   --no-all-targets           Do not pass --all-targets to cargo
+  --summary-json=FILE        Write a machine-readable summary (JSON)
+  --fail-critical=N          Exit non-zero if critical issues >= N (default: 1)
+  --fail-warning=N           Exit non-zero if warnings  >= N (default: 0)
   -h, --help                 Show help
 
 Env:
@@ -112,11 +133,15 @@ while [[ $# -gt 0 ]]; do
     --exclude=*)  EXTRA_EXCLUDES="${1#*=}"; shift;;
     --jobs=*)     JOBS="${1#*=}"; shift;;
     --skip=*)     SKIP_CATEGORIES="${1#*=}"; shift;;
+    --only=*)     ONLY_CATEGORIES="${1#*=}"; shift;;
     --fail-on-warning) FAIL_ON_WARNING=1; shift;;
     --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
     --no-cargo)   RUN_CARGO=0; shift;;
     --no-all-features) CARGO_FEATURES_ALL=0; shift;;
     --no-all-targets)  CARGO_TARGETS_ALL=0; shift;;
+    --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
+    --fail-critical=*) FAIL_CRITICAL_THRESHOLD="${1#*=}"; shift;;
+    --fail-warning=*)  FAIL_WARNING_THRESHOLD="${1#*=}"; shift;;
     -h|--help)    print_usage; exit 0;;
     *)
       if [[ "$PROJECT_DIR" == "." && ! "$1" =~ ^- ]]; then
@@ -131,10 +156,11 @@ done
 
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
-if [[ -n "${OUTPUT_FILE}" ]]; then exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
+if [[ "$USE_COLOR" -eq 0 ]]; then export NO_COLOR=1; export CARGO_TERM_COLOR=never; fi
+if [[ -n "${OUTPUT_FILE}" ]]; then mkdir -p "$(dirname -- "$OUTPUT_FILE")" 2>/dev/null || true; exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
 
 DATE_FMT='%Y-%m-%d %H:%M:%S'
-if [[ "$CI_MODE" -eq 1 ]]; then DATE_CMD="date -u '+%Y-%m-%dT%H:%M:%SZ'"; else DATE_CMD="date '+$DATE_FMT'"; fi
+now() { if [[ "$CI_MODE" -eq 1 ]]; then date -u '+%Y-%m-%dT%H:%M:%SZ'; else date +"$DATE_FMT"; fi; }
 
 # ────────────────────────────────────────────────────────────────────────────
 # Global counters
@@ -149,15 +175,24 @@ TOTAL_FILES=0
 # ────────────────────────────────────────────────────────────────────────────
 HAS_AST_GREP=0
 AST_GREP_CMD=()
-AST_RULE_DIR=""
 HAS_RG=0
 HAS_CARGO=0
 HAS_CLIPPY=0
 HAS_FMT=0
 HAS_AUDIT=0
+HAS_DENYHALT=0
 HAS_DENY=0
 HAS_UDEPS=0
 HAS_OUTDATED=0
+
+# ────────────────────────────────────────────────────────────────────────────
+# Category gating
+# ────────────────────────────────────────────────────────────────────────────
+category_enabled() {
+  local n="$1"
+  if [[ -n "${ONLY_CATEGORIES}" ]]; then [[ ",${ONLY_CATEGORIES}," == *",${n},"* ]]; return; fi
+  [[ ",${SKIP_CATEGORIES}," != *",${n},"* ]]
+}
 
 # ────────────────────────────────────────────────────────────────────────────
 # Search engine configuration (rg if available, else grep)
@@ -269,16 +304,8 @@ show_ast_examples() {
   fi
 }
 
-begin_scan_section(){
-  if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi
-  set +e
-  trap - ERR
-}
-end_scan_section(){
-  trap on_err ERR
-  set -e
-  if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi
-}
+begin_scan_section(){ if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi; set +e; trap - ERR; }
+end_scan_section(){ trap on_err ERR; set -e; if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi; }
 
 # ────────────────────────────────────────────────────────────────────────────
 # Tool detection
@@ -318,7 +345,6 @@ ast_search() {
 write_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
   AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t ag_rules.XXXXXX)"
-  trap '[[ -n "${AST_RULE_DIR:-}" ]] && rm -rf "$AST_RULE_DIR" || true' EXIT
   if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
     cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
   fi
@@ -438,6 +464,17 @@ severity: critical
 message: "std::mem::uninitialized is UB; use MaybeUninit instead"
 YAML
 
+  cat >"$AST_RULE_DIR/zeroed.yml" <<'YAML'
+id: rust.mem-zeroed
+language: rust
+rule:
+  any:
+    - pattern: std::mem::zeroed::<$T>()
+    - pattern: mem::zeroed::<$T>()
+severity: critical
+message: "std::mem::zeroed can be UB for many types; use MaybeUninit instead"
+YAML
+
   cat >"$AST_RULE_DIR/forget.yml" <<'YAML'
 id: rust.mem-forget
 language: rust
@@ -467,6 +504,50 @@ rule:
     - pattern: unsafe impl Sync for $T { $$ }
 severity: warning
 message: "Unsafe impl of Send/Sync; ensure type invariants truly uphold thread-safety"
+YAML
+
+  cat >"$AST_RULE_DIR/get-unchecked.yml" <<'YAML'
+id: rust.get-unchecked
+language: rust
+rule:
+  any:
+    - pattern: $S.get_unchecked($I)
+    - pattern: $S.get_unchecked_mut($I)
+severity: warning
+message: "Unsafe unchecked indexing; ensure bounds invariants are proven"
+YAML
+
+  cat >"$AST_RULE_DIR/utf8-unchecked.yml" <<'YAML'
+id: rust.from-utf8-unchecked
+language: rust
+rule:
+  any:
+    - pattern: std::str::from_utf8_unchecked($$)
+    - pattern: std::string::String::from_utf8_unchecked($$)
+severity: warning
+message: "from_utf8_unchecked requires strict invariants; prefer checked APIs"
+YAML
+
+  cat >"$AST_RULE_DIR/raw-parts.yml" <<'YAML'
+id: rust.slice-from-raw-parts
+language: rust
+rule:
+  any:
+    - pattern: std::slice::from_raw_parts($$)
+    - pattern: std::slice::from_raw_parts_mut($$)
+severity: warning
+message: "from_raw_parts may violate aliasing/lifetime rules; validate invariants"
+YAML
+
+  cat >"$AST_RULE_DIR/ptr-cast.yml" <<'YAML'
+id: rust.ptr-cast
+language: rust
+rule:
+  any:
+    - pattern: $X as *const $T
+    - pattern: $X as *mut $T
+severity: info
+message: "Raw pointer cast; verify layouts and lifetimes"
 YAML
 
   # Concurrency / async
@@ -567,6 +648,17 @@ severity: info
 message: "block_in_place inside async; ensure this is truly needed and guarded"
 YAML
 
+  cat >"$AST_RULE_DIR/thread-spawn-in-async.yml" <<'YAML'
+id: rust.thread-spawn-in-async
+language: rust
+rule:
+  pattern: std::thread::spawn($$)
+  inside:
+    pattern: async fn $NAME($$) { $$ }
+severity: warning
+message: "std::thread::spawn inside async fn; prefer tokio::spawn or task::spawn_blocking"
+YAML
+
   # Performance / allocation
   cat >"$AST_RULE_DIR/clone-any.yml" <<'YAML'
 id: rust.clone-call
@@ -584,6 +676,15 @@ rule:
   pattern: for $P in $I { $$ $X.clone() $$ }
 severity: warning
 message: "clone() inside loop; assess per-iteration cost or refactor ownership"
+YAML
+
+  cat >"$AST_RULE_DIR/map-clone.yml" <<'YAML'
+id: rust.map-clone
+language: rust
+rule:
+  pattern: $I.map(|$p| $x.clone())
+severity: info
+message: "map(|x| x.clone()) can often be replaced with .cloned()"
 YAML
 
   cat >"$AST_RULE_DIR/to-owned-to-string.yml" <<'YAML'
@@ -680,6 +781,15 @@ severity: info
 message: "Plain HTTP URL found; ensure HTTPS for production"
 YAML
 
+  cat >"$AST_RULE_DIR/regex-new-unwrap.yml" <<'YAML'
+id: rust.regex-new-unwrap
+language: rust
+rule:
+  pattern: regex::Regex::new($re).unwrap()
+severity: info
+message: "Regex::new(...).unwrap(); consider compile-time regex! or handle error with context"
+YAML
+
   # Code quality markers
   cat >"$AST_RULE_DIR/todo-comment.yml" <<'YAML'
 id: rust.todo-comment
@@ -715,7 +825,7 @@ run_cargo_subcmd() {
   local -a args=("$@")
   local ec=0
   if [[ "$RUN_CARGO" -eq 0 || "$HAS_CARGO" -eq 0 ]]; then
-    echo "" >"$logfile"; return 0
+    echo "" >"$logfile"; echo 0 >"$logfile.ec"; return 0
   fi
   ( set +e; "${args[@]}" >"$logfile" 2>&1; ec=$?; echo "$ec" >"$logfile.ec"; exit 0 )
 }
@@ -770,7 +880,7 @@ BANNER
 echo -e "${RESET}"
 
 say "${WHITE}Project:${RESET}  ${CYAN}$PROJECT_DIR${RESET}"
-say "${WHITE}Started:${RESET}  ${GRAY}$(eval "$DATE_CMD")${RESET}"
+say "${WHITE}Started:${RESET}  ${GRAY}$(now)${RESET}"
 
 # Count files
 EX_PRUNE=()
@@ -821,7 +931,7 @@ begin_scan_section
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 1: OWNERSHIP & ERROR HANDLING MACROS
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",1,"* ]]; then
+if category_enabled 1; then
 print_header "1. OWNERSHIP & ERROR HANDLING MACROS"
 print_category "Detects: unwrap/expect, panic/unreachable/todo/unimplemented, dbg/println" \
   "Panic-prone and debug macros frequently leak into production and cause crashes"
@@ -831,11 +941,11 @@ u_count_ast=$(ast_search '$X.unwrap()' || echo 0)
 e_count_ast=$(ast_search '$X.expect($MSG)' || echo 0)
 u_count_rg=$("${GREP_RN[@]}" -e "\.unwrap\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 e_count_rg=$("${GREP_RN[@]}" -e "\.expect\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-u_total=$(( (u_count_ast>0?u_count_ast:u_count_rg) ))
-e_total=$(( (e_count_ast>0?e_count_ast:e_count_rg) ))
+u_total=$(( u_count_ast>0?u_count_ast:u_count_rg ))
+e_total=$(( e_count_ast>0?e_count_ast:e_count_rg ))
 ue_total=$((u_total + e_total))
 if [ "$ue_total" -gt 0 ]; then
-  print_finding "warning" "$ue_total" "Potential panics via unwrap/expect" "Prefer `?` or match to propagate/handle errors"
+  print_finding "warning" "$ue_total" "Potential panics via unwrap/expect" "Prefer \`?\` or match to propagate/handle errors"
   show_detailed_finding "\.(unwrap|expect)\(" 5
 else
   print_finding "good" "No unwrap/expect detected"
@@ -863,26 +973,36 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 2: UNSAFE & MEMORY OPERATIONS
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",2,"* ]]; then
+if category_enabled 2; then
 print_header "2. UNSAFE & MEMORY OPERATIONS"
-print_category "Detects: unsafe blocks, transmute/uninitialized/forget, raw ffi hazards" \
+print_category "Detects: unsafe blocks, transmute/uninitialized/forget/zeroed, raw ffi hazards" \
   "These patterns may introduce UB, memory leaks, or hard-to-debug crashes"
 
 print_subheader "unsafe { ... } blocks"
 unsafe_count=$(( $(ast_search 'unsafe { $$ }' || echo 0) + $("${GREP_RN[@]}" -e "unsafe[[:space:]]*\{" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$unsafe_count" -gt 0 ]; then print_finding "info" "$unsafe_count" "unsafe blocks present" "Ensure invariants and narrow scope"; else print_finding "good" "No unsafe blocks detected"; fi
 
-print_subheader "transmute, uninitialized, forget"
+print_subheader "transmute, uninitialized, zeroed, forget"
 transmute_count=$(( $(ast_search 'std::mem::transmute($$)' || echo 0) + $("${GREP_RN[@]}" -e "transmute\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 uninit_count=$(( $(ast_search 'std::mem::uninitialized::<$T>()' || echo 0) + $("${GREP_RN[@]}" -e "uninitialized::<" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+zeroed_count=$(( $(ast_search 'std::mem::zeroed::<$T>()' || echo 0) + $("${GREP_RN[@]}" -e "zeroed::<" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 forget_count=$(( $(ast_search 'std::mem::forget($$)' || echo 0) + $("${GREP_RN[@]}" -e "mem::forget\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$transmute_count" -gt 0 ]; then print_finding "critical" "$transmute_count" "mem::transmute usage"; show_detailed_finding "transmute\(" 3; fi
 if [ "$uninit_count" -gt 0 ]; then print_finding "critical" "$uninit_count" "mem::uninitialized usage"; show_detailed_finding "uninitialized::<" 3; fi
+if [ "$zeroed_count" -gt 0 ]; then print_finding "critical" "$zeroed_count" "mem::zeroed usage"; show_detailed_finding "zeroed::<" 3; fi
 if [ "$forget_count" -gt 0 ]; then print_finding "warning" "$forget_count" "mem::forget leaks memory"; show_detailed_finding "mem::forget\(" 3; fi
 
 print_subheader "CStr::from_bytes_with_nul_unchecked"
 cstr_count=$(( $(ast_search 'std::ffi::CStr::from_bytes_with_nul_unchecked($$)' || echo 0) + $("${GREP_RN[@]}" -e "from_bytes_with_nul_unchecked\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$cstr_count" -gt 0 ]; then print_finding "warning" "$cstr_count" "CStr unchecked conversion used"; fi
+
+print_subheader "get_unchecked / from_utf8_unchecked / from_raw_parts"
+guc_count=$(( $(ast_search '$S.get_unchecked($I)' || echo 0) + $(ast_search '$S.get_unchecked_mut($I)' || echo 0) ))
+u8u_count=$(( $(ast_search 'std::str::from_utf8_unchecked($$)' || echo 0) + $(ast_search 'std::string::String::from_utf8_unchecked($$)' || echo 0) ))
+raw_parts=$(( $(ast_search 'std::slice::from_raw_parts($$)' || echo 0) + $(ast_search 'std::slice::from_raw_parts_mut($$)' || echo 0) ))
+if [ "$guc_count" -gt 0 ]; then print_finding "warning" "$guc_count" "Unchecked indexing APIs in use"; fi
+if [ "$u8u_count" -gt 0 ]; then print_finding "warning" "$u8u_count" "UTF-8 unchecked conversion APIs"; fi
+if [ "$raw_parts" -gt 0 ]; then print_finding "warning" "$raw_parts" "slice::from_raw_parts(_mut) usage"; fi
 
 print_subheader "Unsafe Send/Sync impls"
 autos_count=$(( $(ast_search 'unsafe impl Send for $T { $$ }' || echo 0) + $(ast_search 'unsafe impl Sync for $T { $$ }' || echo 0) ))
@@ -892,7 +1012,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 3: CONCURRENCY & ASYNC PITFALLS
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",3,"* ]]; then
+if category_enabled 3; then
 print_header "3. CONCURRENCY & ASYNC PITFALLS"
 print_category "Detects: Arc<Mutex>, Rc<RefCell>, blocking ops in async, await-in-loop, spawn misuse" \
   "Concurrency misuse leads to deadlocks, head-of-line blocking, and performance issues"
@@ -925,6 +1045,10 @@ print_subheader "block_on within async context"
 block_on=$(( $(ast_search 'futures::executor::block_on($$)' || echo 0) + $(ast_search 'tokio::runtime::Runtime::block_on($$)' || echo 0) ))
 if [ "$block_on" -gt 0 ]; then print_finding "warning" "$block_on" "block_on within async function"; fi
 
+print_subheader "std::thread::spawn within async"
+spawn_in_async=$(( $(ast_search 'std::thread::spawn($$)' || echo 0) ))
+if [ "$spawn_in_async" -gt 0 ]; then print_finding "warning" "$spawn_in_async" "std::thread::spawn inside async fn"; fi
+
 print_subheader "tokio::spawn usage (heuristic for detached tasks)"
 spawn_count=$("${GREP_RN[@]}" -e "tokio::spawn\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 join_handle_used=$("${GREP_RN[@]}" -e "JoinHandle<|\.await" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
@@ -936,18 +1060,19 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 4: NUMERIC & FLOATING-POINT
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",4,"* ]]; then
+if category_enabled 4; then
 print_header "4. NUMERIC & FLOATING-POINT"
 print_category "Detects: float equality, division/modulo by variable, potential overflow hints" \
   "Numeric bugs cause subtle logic errors or panics in debug builds (overflow)"
 
 print_subheader "Floating-point equality comparisons"
-fp_eq=$("${GREP_RN[@]}" -e "(==|!=)[[:space:]]*[0-9]+\.[0-9]+" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+# literals or obvious float identifiers on either side
+fp_eq=$("${GREP_RN[@]}" -e "([[:alnum:]_]\s*(==|!=)\s*[[:alnum:]_]*\.[[:alnum:]_]+)|((==|!=)[[:space:]]*[0-9]+\.[0-9]+)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$fp_eq" -gt 0 ]; then print_finding "info" "$fp_eq" "Float equality/inequality check" "Consider epsilon comparisons"; show_detailed_finding "(==|!=)[[:space:]]*[0-9]+\.[0-9]+" 3; else print_finding "good" "No direct float equality checks detected"; fi
 
 print_subheader "Division/modulo by variable (verify non-zero)"
-div_var=$("${GREP_RN[@]}" -e "/[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | (grep -Ev "//|/\*" || true) | count_lines)
-mod_var=$("${GREP_RN[@]}" -e "%[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | count_lines)
+div_var=$("${GREP_RN[@]}" -e "/[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | grep -Ev "https?://|//|/\*" || true | count_lines)
+mod_var=$("${GREP_RN[@]}" -e "%[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*" "$PROJECT_DIR" 2>/dev/null | grep -Ev "//|/\*" || true | count_lines)
 if [ "$div_var" -gt 0 ]; then print_finding "info" "$div_var" "Division by variables - guard zero divisors"; fi
 if [ "$mod_var" -gt 0 ]; then print_finding "info" "$mod_var" "Modulo by variables - guard zero divisors"; fi
 fi
@@ -955,7 +1080,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 5: COLLECTIONS & ITERATORS
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",5,"* ]]; then
+if category_enabled 5; then
 print_header "5. COLLECTIONS & ITERATORS"
 print_category "Detects: clone in loops, collect then iterate, nth(0), length checks" \
   "Iterator misuse often leads to unnecessary allocations or slow paths"
@@ -978,7 +1103,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 6: STRING & ALLOCATION SMELLS
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",6,"* ]]; then
+if category_enabled 6; then
 print_header "6. STRING & ALLOCATION SMELLS"
 print_category "Detects: needless allocations, format!(literal), to_owned().to_string()" \
   "Unnecessary allocations and conversions reduce performance"
@@ -997,7 +1122,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 7: FILESYSTEM & PROCESS
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",7,"* ]]; then
+if category_enabled 7; then
 print_header "7. FILESYSTEM & PROCESS"
 print_category "Detects: blocking std::fs in async, process::Command usage heuristics" \
   "I/O misuse or command construction from untrusted input can be risky"
@@ -1014,7 +1139,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 8: SECURITY FINDINGS
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",8,"* ]]; then
+if category_enabled 8; then
 print_header "8. SECURITY FINDINGS"
 print_category "Detects: TLS verification disabled, weak hash algos, HTTP URLs, secrets" \
   "Security misconfigurations can lead to credential leaks and MITM attacks"
@@ -1024,7 +1149,10 @@ weak_hash=$(( $(ast_search 'md5::$F($$)' || echo 0) + $(ast_search 'sha1::$F($$)
 if [ "$weak_hash" -gt 0 ]; then print_finding "warning" "$weak_hash" "Weak hash algorithm usage (MD5/SHA1)"; show_detailed_finding "md5::|sha1::|SHA1_FOR_LEGACY_USE_ONLY|MessageDigest::(md5|sha1)" 5; else print_finding "good" "No MD5/SHA1 found"; fi
 
 print_subheader "TLS verification disabled"
-tls_insecure=$(( $(ast_search 'reqwest::ClientBuilder::new().danger_accept_invalid_certs(true)' || echo 0) + $("${GREP_RN[@]}" -e "danger_accept_invalid_certs\(\s*true\s*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) + $("${GREP_RN[@]}" -e "SslVerifyMode::NONE" "$PROJECT_DIR" 2>/dev/null | count_lines || true) + $("${GREP_RN[@]}" -e "TlsConnector::builder\(\)\.danger_accept_invalid_certs\(true\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
+tls_insecure=$(( $(ast_search 'reqwest::ClientBuilder::new().danger_accept_invalid_certs(true)' || echo 0) \
+  + $("${GREP_RN[@]}" -e "danger_accept_invalid_certs\(\s*true\s*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) \
+  + $("${GREP_RN[@]}" -e "SslVerifyMode::NONE" "$PROJECT_DIR" 2>/dev/null | count_lines || true) \
+  + $("${GREP_RN[@]}" -e "TlsConnector::builder\(\)\.danger_accept_invalid_certs\(true\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true) ))
 if [ "$tls_insecure" -gt 0 ]; then print_finding "critical" "$tls_insecure" "TLS verification disabled"; fi
 
 print_subheader "Plain http:// URLs"
@@ -1039,7 +1167,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 9: CODE QUALITY MARKERS
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",9,"* ]]; then
+if category_enabled 9; then
 print_header "9. CODE QUALITY MARKERS"
 print_category "Detects: TODO, FIXME, HACK, NOTE" \
   "Technical debt markers indicate incomplete or problematic code"
@@ -1061,7 +1189,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 10: MODULE & VISIBILITY ISSUES
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",10,"* ]]; then
+if category_enabled 10; then
 print_header "10. MODULE & VISIBILITY ISSUES"
 print_category "Detects: pub use wildcards, glob imports, re-exports" \
   "Overly broad visibility complicates API stability and encapsulation"
@@ -1078,7 +1206,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 11: TESTS & BENCHES HYGIENE
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",11,"* ]]; then
+if category_enabled 11; then
 print_header "11. TESTS & BENCHES HYGIENE"
 print_category "Detects: ignored tests, todo! in tests, println!/dbg! in tests" \
   "Ensure tests do not hide failures or produce noisy output"
@@ -1096,16 +1224,16 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 12: LINTS & STYLE (fmt/clippy)
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",12,"* ]]; then
+if category_enabled 12; then
 print_header "12. LINTS & STYLE (fmt/clippy)"
 print_category "Runs: cargo fmt -- --check, cargo clippy" \
   "Formatter and lints help maintain consistent style and catch many issues"
 
-FMT_LOG="$(mktemp)"; CLIPPY_LOG="$(mktemp)"
+FMT_LOG="$(mktemp)"; CLIPPY_LOG="$(mktemp)"; TMP_FILES+=("$FMT_LOG" "$CLIPPY_LOG")
 if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   # cargo fmt -- --check
   if [[ "$HAS_FMT" -eq 1 ]]; then
-    run_cargo_subcmd "fmt" "$FMT_LOG" bash -lc "cd \"$PROJECT_DIR\" && cargo fmt -- --check"
+    run_cargo_subcmd "fmt" "$FMT_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo fmt -- --check"
     r_ec=$(cat "$FMT_LOG.ec" 2>/dev/null || echo 0)
     if [[ "$r_ec" -ne 0 ]]; then
       print_finding "warning" 1 "Formatting issues (cargo fmt --check failed)" "Run: cargo fmt"
@@ -1120,7 +1248,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   if [[ "$HAS_CLIPPY" -eq 1 ]]; then
     extra1=(); [[ "$CARGO_FEATURES_ALL" -eq 1 ]] && extra1+=(--all-features)
     extra2=(); [[ "$CARGO_TARGETS_ALL" -eq 1 ]] && extra2+=(--all-targets)
-    run_cargo_subcmd "clippy" "$CLIPPY_LOG" bash -lc "cd \"$PROJECT_DIR\" && cargo clippy ${extra1[*]} ${extra2[*]} -- -D warnings"
+    run_cargo_subcmd "clippy" "$CLIPPY_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo clippy ${extra1[*]} ${extra2[*]} -- -D warnings"
     w_e=$(count_warnings_errors "$CLIPPY_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
     if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Clippy errors"; fi
     if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Clippy warnings"; fi
@@ -1136,19 +1264,19 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 13: BUILD HEALTH (check/test)
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",13,"* ]]; then
+if category_enabled 13; then
 print_header "13. BUILD HEALTH (check/test)"
 print_category "Runs: cargo check, cargo test --no-run" \
   "Ensures the project compiles and tests build"
 
-CHECK_LOG="$(mktemp)"; TEST_LOG="$(mktemp)"
+CHECK_LOG="$(mktemp)"; TEST_LOG="$(mktemp)"; TMP_FILES+=("$CHECK_LOG" "$TEST_LOG")
 if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
-  run_cargo_subcmd "check" "$CHECK_LOG" bash -lc "cd \"$PROJECT_DIR\" && cargo check"
+  run_cargo_subcmd "check" "$CHECK_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo check"
   w_e=$(count_warnings_errors "$CHECK_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
   if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "cargo check errors"; fi
   if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "cargo check warnings"; else print_finding "good" "cargo check clean"; fi
 
-  run_cargo_subcmd "test-no-run" "$TEST_LOG" bash -lc "cd \"$PROJECT_DIR\" && cargo test --no-run"
+  run_cargo_subcmd "test-no-run" "$TEST_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo test --no-run"
   w_e=$(count_warnings_errors "$TEST_LOG"); w=$(echo "$w_e" | awk '{print $1}'); e=$(echo "$w_e" | awk '{print $2}')
   if [[ "$e" -gt 0 ]]; then print_finding "critical" "$e" "Tests failed to build (cargo test --no-run)"; fi
   if [[ "$w" -gt 0 ]]; then print_finding "warning" "$w" "Test build warnings"; else print_finding "good" "Tests build clean"; fi
@@ -1160,14 +1288,14 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 14: DEPENDENCY HYGIENE
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",14,"* ]]; then
+if category_enabled 14; then
 print_header "14. DEPENDENCY HYGIENE"
 print_category "Runs: cargo audit, cargo deny check, cargo udeps, cargo outdated" \
   "Keeps dependencies safe, minimal, and up-to-date"
 
 if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   if [[ "$HAS_AUDIT" -eq 1 ]]; then
-    AUDIT_LOG="$(mktemp)"; run_cargo_subcmd "audit" "$AUDIT_LOG" bash -lc "cd \"$PROJECT_DIR\" && cargo audit"
+    AUDIT_LOG="$(mktemp)"; TMP_FILES+=("$AUDIT_LOG"); run_cargo_subcmd "audit" "$AUDIT_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo audit"
     audit_vuln=$(grep -c -E "Vulnerability|RUSTSEC" "$AUDIT_LOG" 2>/dev/null || true); audit_vuln=${audit_vuln:-0}
     if [[ "$audit_vuln" -gt 0 ]]; then print_finding "critical" "$audit_vuln" "Advisories found by cargo-audit"; else print_finding "good" "No known advisories (cargo-audit)"; fi
   else
@@ -1175,7 +1303,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   fi
 
   if [[ "$HAS_DENY" -eq 1 ]]; then
-    DENY_LOG="$(mktemp)"; run_cargo_subcmd "deny" "$DENY_LOG" bash -lc "cd \"$PROJECT_DIR\" && cargo deny check advisories bans licenses sources"
+    DENY_LOG="$(mktemp)"; TMP_FILES+=("$DENY_LOG"); run_cargo_subcmd "deny" "$DENY_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo deny check advisories bans licenses sources"
     deny_err=$(grep -c -E "error\[[^)]+\]|[[:space:]]error:" "$DENY_LOG" 2>/dev/null || true); deny_err=${deny_err:-0}
     deny_warn=$(grep -c -E "[[:space:]]warning:" "$DENY_LOG" 2>/dev/null || true); deny_warn=${deny_warn:-0}
     if [[ "$deny_err" -gt 0 ]]; then print_finding "critical" "$deny_err" "cargo-deny errors"; fi
@@ -1186,7 +1314,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   fi
 
   if [[ "$HAS_UDEPS" -eq 1 ]]; then
-    UDEPS_LOG="$(mktemp)"; run_cargo_subcmd "udeps" "$UDEPS_LOG" bash -lc "cd \"$PROJECT_DIR\" && cargo udeps --all-targets"
+    UDEPS_LOG="$(mktemp)"; TMP_FILES+=("$UDEPS_LOG"); run_cargo_subcmd "udeps" "$UDEPS_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo udeps --all-targets"
     udeps_count=$(grep -c -E "(unused dependency|possibly unused|not used)" "$UDEPS_LOG" 2>/dev/null || true); udeps_count=${udeps_count:-0}
     if [[ "$udeps_count" -gt 0 ]]; then print_finding "info" "$udeps_count" "Unused dependencies (cargo-udeps)"; else print_finding "good" "No unused dependencies"; fi
   else
@@ -1194,7 +1322,7 @@ if [[ "$RUN_CARGO" -eq 1 && "$HAS_CARGO" -eq 1 ]]; then
   fi
 
   if [[ "$HAS_OUTDATED" -eq 1 ]]; then
-    OUT_LOG="$(mktemp)"; run_cargo_subcmd "outdated" "$OUT_LOG" bash -lc "cd \"$PROJECT_DIR\" && cargo outdated -R"
+    OUT_LOG="$(mktemp)"; TMP_FILES+=("$OUT_LOG"); run_cargo_subcmd "outdated" "$OUT_LOG" bash -lc "cd \"$PROJECT_DIR\" && CARGO_TERM_COLOR=${CARGO_TERM_COLOR:-auto} cargo outdated -R"
     outdated_count=$(grep -E "Minor|Major|Patch" "$OUT_LOG" 2>/dev/null | wc -l | awk '{print $1+0}')
     if [[ "$outdated_count" -gt 0 ]]; then print_finding "info" "$outdated_count" "Outdated dependencies (cargo-outdated)"; else print_finding "good" "Dependencies up-to-date"; fi
   else
@@ -1208,7 +1336,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 15: API MISUSE (COMMON)
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",15,"* ]]; then
+if category_enabled 15; then
 print_header "15. API MISUSE (COMMON)"
 print_category "Detects: nth(0), DefaultHasher, expect_err/unwrap_err, Option::unwrap_or_default in hot paths" \
   "Common footguns and readability hazards"
@@ -1228,9 +1356,9 @@ if [ "$uod" -gt 0 ]; then print_finding "info" "$uod" "unwrap_or_default present
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CATEGORY 16: DOMAINS (web/reqwest/sql) – RUST SIDE HEURISTICS
+# CATEGORY 16: DOMAIN-SPECIFIC HEURISTICS
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",16,"* ]]; then
+if category_enabled 16; then
 print_header "16. DOMAIN-SPECIFIC HEURISTICS"
 print_category "Detects: reqwest builder, SQL string concatenation (heuristic), serde_json::from_str without context" \
   "Domain patterns that often hint at bugs"
@@ -1251,7 +1379,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 17: AST-GREP RULE PACK FINDINGS (JSON/SARIF passthrough)
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",17,"* ]]; then
+if category_enabled 17; then
 print_header "17. AST-GREP RULE PACK FINDINGS"
 if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
   run_ast_rules || true
@@ -1267,7 +1395,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 18: META STATISTICS & INVENTORY
 # ═══════════════════════════════════════════════════════════════════════════
-if [[ ",$SKIP_CATEGORIES," != *",18,"* ]]; then
+if category_enabled 18; then
 print_header "18. META STATISTICS & INVENTORY"
 print_category "Detects: crate counts, bin/lib targets, feature flags (Cargo.toml heuristic)" \
   "High-level view of the project layout"
@@ -1275,7 +1403,7 @@ print_category "Detects: crate counts, bin/lib targets, feature flags (Cargo.tom
 print_subheader "Cargo.toml features (heuristic count)"
 cargo_toml="$PROJECT_DIR/Cargo.toml"
 if [[ -f "$cargo_toml" ]]; then
-  feature_count=$(grep -n "^\[features\]" -n "$cargo_toml" 2>/dev/null | wc -l | awk '{print $1+0}')
+  feature_count=$(grep -n "^\[features\]" "$cargo_toml" 2>/dev/null | wc -l | awk '{print $1+0}')
   bin_count=$(grep -E "^\s*\[\[bin\]\]" "$cargo_toml" 2>/dev/null | wc -l | awk '{print $1+0}')
   workspace=$(grep -c "^\[workspace\]" "$cargo_toml" 2>/dev/null || echo 0)
   say "  ${BLUE}${INFO} Info${RESET} ${WHITE}(features sections:${RESET} ${CYAN}${feature_count}${RESET}${WHITE}, bins:${RESET} ${CYAN}${bin_count}${RESET}${WHITE}, workspace:${RESET} ${CYAN}${workspace}${RESET}${WHITE})${RESET}"
@@ -1322,7 +1450,7 @@ if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$WARNING_COUNT" -eq 0 ]; then
 fi
 
 echo ""
-say "${DIM}Scan completed at: $(eval "$DATE_CMD")${RESET}"
+say "${DIM}Scan completed at: $(now)${RESET}"
 
 if [[ -n "$OUTPUT_FILE" ]]; then
   say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
@@ -1335,7 +1463,21 @@ fi
 say "${DIM}Add to CI: ./ubs --ci --fail-on-warning . > rust-bug-scan.txt${RESET}"
 echo ""
 
+if [[ -n "$SUMMARY_JSON" ]]; then
+  cat >"$SUMMARY_JSON" <<JSON
+{
+  "files": $TOTAL_FILES,
+  "critical": $CRITICAL_COUNT,
+  "warning": $WARNING_COUNT,
+  "info": $INFO_COUNT,
+  "timestamp": "$(now)"
+}
+JSON
+  say "${GREEN}${CHECK} Summary JSON: ${CYAN}$SUMMARY_JSON${RESET}"
+fi
+
 EXIT_CODE=0
-if [ "$CRITICAL_COUNT" -gt 0 ]; then EXIT_CODE=1; fi
-if [ "$FAIL_ON_WARNING" -eq 1 ] && [ $((CRITICAL_COUNT + WARNING_COUNT)) -gt 0 ]; then EXIT_CODE=1; fi
+if (( CRITICAL_COUNT >= FAIL_CRITICAL_THRESHOLD )); then EXIT_CODE=1; fi
+if (( FAIL_ON_WARNING == 1 )) && (( CRITICAL_COUNT + WARNING_COUNT > 0 )); then EXIT_CODE=1; fi
+if (( FAIL_WARNING_THRESHOLD > 0 )) && (( WARNING_COUNT >= FAIL_WARNING_THRESHOLD )); then EXIT_CODE=1; fi
 exit "$EXIT_CODE"

@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# ULTIMATE GO BUG SCANNER v5.0 - Industrial-Grade Code Quality Analysis
+# ULTIMATE GO BUG SCANNER v6.1 - Industrial-Grade Code Quality Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for modern Go (Go 1.23+) using ast-grep
 # + smart ripgrep/grep heuristics and module/build hygiene checks.
 # Detects: goroutine leaks, context misuse, HTTP client/server timeouts,
 # resource leaks, panic/recover pitfalls, error handling issues, crypto risks,
 # unsafe/reflect hazards, import hygiene problems, and modernization gaps.
-# v5.0 adds: go.mod version enforcement, richer AST rules, SARIF/JSON passthrough,
-# robust find, safe pipelines, parallel jobs, --rules merging, stable CI timestamps.
+# v6.1 adds: true JSON/SARIF passthrough, single cached AST scan, extended Go rules
+# (loop var capture, select w/o default, http.NewRequest w/o context, exec w/o context,
+# TLS MinVersion missing, context.TODO), robust include patterns (go.mod/go.sum),
+# safer traps, more precise counts, better CI/quiet handling.
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -Eeuo pipefail
 shopt -s lastpipe
 shopt -s extglob
 
+# Color-safe error trap (works before colors are initialized)
 on_err() {
-  local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
-  echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
+  local ec=$? cmd=${BASH_COMMAND} line=${BASH_LINENO[0]} src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
+  local _RED=${RED:-} _BOLD=${BOLD:-} _RESET=${RESET:-} _DIM=${DIM:-} _WHITE=${WHITE:-}
+  printf "\n%s%sUnexpected error (exit %s)%s %sat %s:%s%s\n%sLast command:%s %s%s%s\n" \
+    "${_RED}" "${_BOLD}" "$ec" "${_RESET}" "${_DIM}" "$src" "$line" "${_RESET}" \
+    "${_DIM}" "${_RESET}" "${_WHITE}" "$cmd" "${_RESET}" >&2
   exit "$ec"
 }
 trap on_err ERR
@@ -43,10 +49,11 @@ CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAG
 VERBOSE=0
 PROJECT_DIR="."
 OUTPUT_FILE=""
-FORMAT="text"          # text|json|sarif (text implemented; ast-grep emits json/sarif when rule packs are run)
+FORMAT="text"          # text|json|sarif
 CI_MODE=0
 FAIL_ON_WARNING=0
-INCLUDE_EXT="go,mod,sum,tmpl"
+INCLUDE_EXT="go,tmpl,gotmpl,tpl"
+INCLUDE_NAMES="go.mod,go.sum,go.work,go.work.sum"
 QUIET=0
 NO_COLOR_FLAG=0
 EXTRA_EXCLUDES=""
@@ -56,6 +63,10 @@ MAX_DETAILED=250
 JOBS="${JOBS:-0}"
 USER_RULE_DIR=""
 DISABLE_PIPEFAIL_DURING_SCAN=1
+LIST_RULES=0
+AST_JSON=""
+AST_SARIF=""
+AST_SCAN_OK=0
 
 print_usage() {
   cat >&2 <<USAGE
@@ -67,8 +78,10 @@ Options:
   --format=FMT             Output format: text|json|sarif (default: text)
   --ci                     CI mode (no clear, stable timestamps)
   --no-color               Force disable ANSI color
-  --include-ext=CSV        File extensions (default: ${INCLUDE_EXT})
+  --include-ext=CSV        File extensions (default: ${INCLUDE_EXT}) e.g. go,tmpl
+  --include-names=CSV      Exact file names (default: ${INCLUDE_NAMES}) e.g. go.mod,go.sum
   --exclude=GLOB[,..]      Additional glob(s)/dir(s) to exclude
+  --list-rules             List built-in AST rule ids, then exit
   --jobs=N                 Parallel jobs for ripgrep (default: auto)
   --skip=CSV               Skip categories by number (e.g. --skip=2,7,11)
   --fail-on-warning        Exit non-zero on warnings or critical
@@ -90,7 +103,9 @@ while [[ $# -gt 0 ]]; do
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
+    --include-names=*) INCLUDE_NAMES="${1#*=}"; shift;;
     --exclude=*)  EXTRA_EXCLUDES="${1#*=}"; shift;;
+    --list-rules) LIST_RULES=1; shift;;
     --jobs=*)     JOBS="${1#*=}"; shift;;
     --skip=*)     SKIP_CATEGORIES="${1#*=}"; shift;;
     --fail-on-warning) FAIL_ON_WARNING=1; shift;;
@@ -138,12 +153,21 @@ AST_RULE_DIR=""      # created later if ast-grep exists
 # ────────────────────────────────────────────────────────────────────────────
 LC_ALL=C
 IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
-INCLUDE_GLOBS=()
-for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
+IFS=',' read -r -a _NAME_ARR <<<"$INCLUDE_NAMES"
+
+# Build include patterns: exact names and extensions
+INCLUDE_GLOBS_GREP=()
+for n in "${_NAME_ARR[@]}"; do n="$(echo "$n" | xargs)"; [[ -n "$n" ]] && INCLUDE_GLOBS_GREP+=( "--include=$n" ); done
+for e in "${_EXT_ARR[@]}";  do e="$(echo "$e" | xargs)"; [[ -n "$e" ]] && INCLUDE_GLOBS_GREP+=( "--include=*.$e" ); done
+
+INCLUDE_GLOBS_RG=()
+for n in "${_NAME_ARR[@]}"; do n="$(echo "$n" | xargs)"; [[ -n "$n" ]] && INCLUDE_GLOBS_RG+=( -g "$n" ); done
+for e in "${_EXT_ARR[@]}";  do e="$(echo "$e" | xargs)"; [[ -n "$e" ]] && INCLUDE_GLOBS_RG+=( -g "*.$e" ); done
+
 EXCLUDE_DIRS=(.git .svn .hg vendor third_party Godeps node_modules .cache build dist bin out tmp .idea .vscode .vs bazel-* _bazel go.work.d)
 if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
-EXCLUDE_FLAGS=()
-for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
+EXCLUDE_FLAGS_GREP=()
+for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS_GREP+=( "--exclude-dir=$d" ); done
 
 if command -v rg >/dev/null 2>&1; then
   if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
@@ -151,14 +175,12 @@ if command -v rg >/dev/null 2>&1; then
   RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden "${RG_JOBS[@]}")
   RG_EXCLUDES=()
   for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
-  RG_INCLUDES=()
-  for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( -g "*.$(echo "$e" | xargs)" ); done
-  GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  GREP_RNI=(rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  GREP_RNW=(rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${INCLUDE_GLOBS_RG[@]}")
+  GREP_RNI=(rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${INCLUDE_GLOBS_RG[@]}")
+  GREP_RNW=(rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${INCLUDE_GLOBS_RG[@]}")
   RG_JOBS=()
 else
-  GREP_R_OPTS=(-R --binary-files=without-match "${EXCLUDE_FLAGS[@]}" "${INCLUDE_GLOBS[@]}")
+  GREP_R_OPTS=(-R --binary-files=without-match "${EXCLUDE_FLAGS_GREP[@]}" "${INCLUDE_GLOBS_GREP[@]}")
   GREP_RN=("grep" "${GREP_R_OPTS[@]}" -n -E)
   GREP_RNI=("grep" "${GREP_R_OPTS[@]}" -n -i -E)
   GREP_RNW=("grep" "${GREP_R_OPTS[@]}" -n -w -E)
@@ -166,11 +188,12 @@ fi
 
 # Helper: robust numeric end-of-pipeline counter
 count_lines() { awk 'END{print (NR+0)}'; }
+wc_num(){ wc -l | awk '{print $1+0}'; }
 
 # ────────────────────────────────────────────────────────────────────────────
 # Helper Functions
 # ────────────────────────────────────────────────────────────────────────────
-maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 ]]; then clear || true; fi; }
+maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 && "$QUIET" -eq 0 ]]; then clear || true; fi; }
 
 say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
 
@@ -246,6 +269,16 @@ end_scan_section(){
   set -e
   if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi
 }
+
+# AST results cache helpers
+ensure_ast_scan_json(){
+  [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
+  [[ -n "$AST_JSON" && -f "$AST_JSON" ]] && return 0
+  AST_JSON="$(mktemp -t ag_json.XXXXXX.json 2>/dev/null || mktemp -t ag_json.XXXXXX)"
+  "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null >"$AST_JSON" || true
+  AST_SCAN_OK=1
+}
+ast_count(){ local id="$1"; [[ -f "$AST_JSON" ]] || return 1; grep -o "\"id\"[[:space:]]*:[[:space:]]*\"${id}\"" "$AST_JSON" | wc -l | awk '{print $1+0}'; }
 
 # ────────────────────────────────────────────────────────────────────────────
 # ast-grep: detection, rule packs, and wrappers (Go heavy)
@@ -329,6 +362,31 @@ severity: info
 message: "goroutine launched inside loop; ensure captured values are correct and rate-limited."
 YAML
 
+  cat >"$AST_RULE_DIR/go.loop-var-capture.yml" <<'YAML'
+id: go.loop-var-capture
+language: go
+rule:
+  pattern: |
+    for $I := range $$ {
+      go func() { $$ $I $$ }()
+    }
+severity: warning
+message: "Loop variable captured by goroutine closure; pass it as a parameter to avoid capture bugs."
+YAML
+
+  cat >"$AST_RULE_DIR/go.select-no-default.yml" <<'YAML'
+id: go.select-no-default
+language: go
+rule:
+  pattern: |
+    select { $$ }
+  not:
+    has:
+      pattern: default:
+severity: info
+message: "select without a default may block indefinitely; confirm this is intended or add a timeout/default."
+YAML
+
   # ───── Contexts ───────────────────────────────────────────────────────────
   cat >"$AST_RULE_DIR/go-context-without-cancel.yml" <<'YAML'
 id: go.context-without-cancel
@@ -359,6 +417,24 @@ severity: warning
 message: "Default http.Client has no Timeout; prefer custom client with Timeout or context-aware requests."
 YAML
 
+  cat >"$AST_RULE_DIR/go.http-newrequest-without-context.yml" <<'YAML'
+id: go.http-newrequest-without-context
+language: go
+rule:
+  pattern: http.NewRequest($$, $$, $$)
+severity: info
+message: "Use http.NewRequestWithContext(ctx, ...) to propagate cancellation."
+YAML
+
+  cat >"$AST_RULE_DIR/go.exec-command-without-context.yml" <<'YAML'
+id: go.exec-command-without-context
+language: go
+rule:
+  pattern: exec.Command($$)
+severity: info
+message: "Prefer exec.CommandContext(ctx, ...) to enforce timeouts and cancellation."
+YAML
+
   cat >"$AST_RULE_DIR/go-http-client-without-timeout.yml" <<'YAML'
 id: go.http-client-without-timeout
 language: go
@@ -384,6 +460,19 @@ rule:
       - has: { pattern: ReadHeaderTimeout: $X }
 severity: info
 message: "http.Server constructed without timeouts; vulnerable to slowloris and resource exhaustion."
+YAML
+
+  cat >"$AST_RULE_DIR/go.tls-minversion-missing.yml" <<'YAML'
+id: go.tls-minversion-missing
+language: go
+rule:
+  pattern: &cfg tls.Config{$$}
+  not:
+    any:
+      - has: { pattern: MinVersion: tls.VersionTLS12 }
+      - has: { pattern: MinVersion: tls.VersionTLS13 }
+severity: info
+message: "tls.Config without MinVersion; set to at least tls.VersionTLS12 (prefer TLS 1.3)."
 YAML
 
   # ───── Time & tickers ────────────────────────────────────────────────────
@@ -510,7 +599,7 @@ should_skip() {
 
 maybe_clear
 
-echo -e "${BOLD}${CYAN}"
+[[ "$QUIET" -eq 1 || "$FORMAT" != "text" ]] || echo -e "${BOLD}${CYAN}"
 cat <<'BANNER'
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  ██╗   ██╗██╗  ████████╗██╗███╗   ███╗ █████╗ ████████╗███████╗      ║
@@ -547,10 +636,12 @@ cat <<'BANNER'
 ║  “We see bugs before you do.”                                        ║
 ╚══════════════════════════════════════════════════════════════════════╝
 BANNER
-echo -e "${RESET}"
+[[ "$QUIET" -eq 1 || "$FORMAT" != "text" ]] || echo -e "${RESET}"
 
-say "${WHITE}Project:${RESET}  ${CYAN}$PROJECT_DIR${RESET}"
-say "${WHITE}Started:${RESET}  ${GRAY}$(eval "$DATE_CMD")${RESET}"
+[[ "$FORMAT" == "text" ]] && {
+  say "${WHITE}Project:${RESET}  ${CYAN}$PROJECT_DIR${RESET}"
+  say "${WHITE}Started:${RESET}  ${GRAY}$(eval "$DATE_CMD")${RESET}"
+}
 
 # Count files (robust find; avoid dangling -o)
 EX_PRUNE=()
@@ -558,28 +649,53 @@ for d in "${EXCLUDE_DIRS[@]}"; do EX_PRUNE+=( -name "$d" -o ); done
 EX_PRUNE=( \( -type d \( "${EX_PRUNE[@]}" -false \) -prune \) )
 NAME_EXPR=( \( )
 first=1
+# exact names
+for n in "${_NAME_ARR[@]}"; do
+  if [[ $first -eq 1 ]]; then NAME_EXPR+=( -name "$n" ); first=0
+  else NAME_EXPR+=( -o -name "$n" ); fi
+done
+# extensions
 for e in "${_EXT_ARR[@]}"; do
   if [[ $first -eq 1 ]]; then NAME_EXPR+=( -name "*.${e}" ); first=0
   else NAME_EXPR+=( -o -name "*.${e}" ); fi
 done
 NAME_EXPR+=( \) )
 TOTAL_FILES=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
-  | wc -l | awk '{print $1+0}'
+  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
 )
-say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})${RESET}"
+[[ "$FORMAT" == "text" ]] && say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES${RESET} ${DIM}(${INCLUDE_EXT}; ${INCLUDE_NAMES})${RESET}"
 
 # ast-grep availability
 echo ""
 if check_ast_grep; then
-  say "${GREEN}${CHECK} ast-grep available (${AST_GREP_CMD[*]}) - full AST analysis enabled${RESET}"
+  [[ "$FORMAT" == "text" ]] && say "${GREEN}${CHECK} ast-grep available (${AST_GREP_CMD[*]}) - full AST analysis enabled${RESET}"
   write_ast_rules || true
+  [[ "$LIST_RULES" -eq 1 ]] && { printf "%s\n" "$AST_RULE_DIR"/*.yml | sed 's/.*\///;s/\.yml$//' ; exit 0; }
+  ensure_ast_scan_json || true
 else
-  say "${YELLOW}${WARN} ast-grep unavailable - using regex fallback mode${RESET}"
+  [[ "$FORMAT" == "text" ]] && say "${YELLOW}${WARN} ast-grep unavailable - using regex fallback mode${RESET}"
 fi
 
 # relax pipefail for scanning (optional)
 begin_scan_section
+
+# Machine-output mode: emit JSON/SARIF and exit with terse summary
+if [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; then
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    if [[ "$FORMAT" == "json" ]]; then
+      "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null
+    else
+      "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --sarif 2>/dev/null
+    fi
+  fi
+  end_scan_section
+  {
+    echo ""
+    echo "Summary (machine output emitted on stdout):"
+    echo "  Files: $TOTAL_FILES"
+  } 1>&2
+  exit 0
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CATEGORY 1: CONCURRENCY & GOROUTINE SAFETY
@@ -594,11 +710,12 @@ go_count=$("${GREP_RN[@]}" -e "^[[:space:]]*go[[:space:]]+" "$PROJECT_DIR" 2>/de
 print_finding "info" "$go_count" "goroutine launches found"
 
 print_subheader "go inside loops (ensure capture correctness)"
-count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" --pattern 'go $EXPR' --lang go "$PROJECT_DIR" 2>/dev/null || true ) \
-  | (grep -n "" || true) | count_lines
-)
+count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.goroutine-in-loop" || echo 0)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "goroutine launches inside loops"; fi
+
+print_subheader "loop variable captured by goroutine (closure)"
+cap=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.loop-var-capture" || echo 0)
+if [ "$cap" -gt 0 ]; then print_finding "warning" "$cap" "Loop variable captured by goroutine closure"; fi
 
 print_subheader "sync.WaitGroup Add/Done balance (heuristic)"
 wg_add=$("${GREP_RN[@]}" -e "\.Add\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
@@ -634,16 +751,14 @@ print_category "Detects: select without default, send/receive in loops w/out bac
 
 print_subheader "select statements (review for default/backpressure)"
 sel_count=$("${GREP_RN[@]}" -e "^[[:space:]]*select[[:space:]]*\{" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-default_count=$("${GREP_RN[@]}" -e "^[[:space:]]*default[[:space:]]*:" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 print_finding "info" "$sel_count" "select statements present"
-if [ "$sel_count" -gt 0 ] && [ "$default_count" -eq 0 ]; then
-  print_finding "info" 1 "Some selects may block without default"
+if [[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]]; then
+  s_nd=$(( ast_count "go.select-no-default" ))
+  if [ "$s_nd" -gt 0 ]; then print_finding "info" "$s_nd" "select without default (check for intended blocking/timeouts)"; fi
 fi
 
 print_subheader "time.After used inside loops"
-count=$(
-  "${GREP_RN[@]}" -e "for[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | (grep -A5 "time\.After\(" || true) | (grep -cw "time\.After\(" || true)
-)
+count=$("${GREP_RN[@]}" -e "for[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | (grep -A5 "time\.After\(" || true) | (grep -cw "time\.After\(" || true))
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "time.After allocations in loops - prefer reusable timer"; fi
 fi
@@ -666,6 +781,10 @@ count=$("${GREP_RN[@]}" -e "func[[:space:]]*\([[:space:]]*w[[:space:]]+http\.Res
   (grep -A5 "context\.Background\(" || true) | (grep -cw "context\.Background\(" || true) )
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Use r.Context() instead of context.Background() in handlers"; fi
+
+print_subheader "context.TODO usage"
+todo=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.context-todo" || echo 0)
+if [ "$todo" -gt 0 ]; then print_finding "info" "$todo" "context.TODO() present - ensure it’s not shipping to prod"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -677,25 +796,20 @@ print_category "Detects: default client use, missing client/server timeouts, res
   "Networking bugs leak resources and cause hangs"
 
 print_subheader "Default http.Client usage (Get/Post/Head/DefaultClient.Do)"
-count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.http-default-client"' || true
-)
+count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.http-default-client" || echo 0)
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "Default http.Client without Timeout"; else print_finding "good" "No obvious default client usage"; fi
 
 print_subheader "http.Client without Timeout"
-count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.http-client-without-timeout"' || true
-)
+count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.http-client-without-timeout" || echo 0)
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "http.Client constructed without Timeout"; fi
 
 print_subheader "http.Server without timeouts (none set)"
-count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.http-server-no-timeouts"' || true
-)
+count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.http-server-no-timeouts" || echo 0)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "http.Server lacks timeouts"; fi
+
+print_subheader "http.NewRequest without context"
+nr=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.http-newrequest-without-context" || echo 0)
+if [ "$nr" -gt 0 ]; then print_finding "info" "$nr" "Prefer http.NewRequestWithContext"; fi
 
 print_subheader "Response body Close() (heuristic)"
 http_calls=$("${GREP_RN[@]}" -e "http\.(Get|Post|Head)\(|\.Do\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
@@ -705,6 +819,10 @@ if [ "$http_calls" -gt 0 ] && [ "$body_close" -lt "$http_calls" ]; then
 else
   print_finding "good" "Response bodies likely closed (heuristic)"
 fi
+
+print_subheader "TLS MinVersion missing"
+minv=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.tls-minversion-missing" || echo 0)
+if [ "$minv" -gt 0 ]; then print_finding "info" "$minv" "tls.Config without MinVersion"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -716,10 +834,7 @@ print_category "Detects: defer in loops, missing Close/Stop, DB rows leaks" \
   "Resource mistakes show up as FD leaks and memory growth"
 
 print_subheader "defer inside loops"
-count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.defer-in-loop"' || true
-)
+count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.defer-in-loop" || echo 0)
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "defer inside loops"; fi
 
 print_subheader "database/sql Rows/Tx Close (heuristic)"
@@ -730,10 +845,7 @@ if [ "$rows_open" -gt 0 ] && [ "$rows_close" -lt "$rows_open" ]; then
 fi
 
 print_subheader "time.Tick usage"
-count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.time-tick"' || true
-)
+count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.time-tick" || echo 0)
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "time.Tick leaks; prefer NewTicker"; fi
 fi
 
@@ -754,17 +866,11 @@ count=$("${GREP_RN[@]}" -e "fmt\.Errorf\(" "$PROJECT_DIR" 2>/dev/null | (grep -v
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Consider using %w when wrapping errors"; fi
 
 print_subheader "panic usage"
-panic_count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.panic-call"' || true
-)
+panic_count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.panic-call" || echo 0)
 if [ "$panic_count" -gt 0 ]; then print_finding "warning" "$panic_count" "panic used; prefer errors in libraries"; fi
 
 print_subheader "recover outside deferred func"
-rec_count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.recover-not-in-defer"' || true
-)
+rec_count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.recover-not-in-defer" || echo 0)
 if [ "$rec_count" -gt 0 ]; then print_finding "warning" "$rec_count" "recover() outside defer is ineffective"; fi
 fi
 
@@ -777,10 +883,7 @@ print_category "Detects: Decoder without DisallowUnknownFields, unchecked Unmars
   "Parsing mistakes silently lose data or crash later"
 
 print_subheader "json.Decoder without DisallowUnknownFields"
-count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.json-decode-without-disallow"' || true
-)
+count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.json-decode-without-disallow" || echo 0)
 if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Consider Decoder.DisallowUnknownFields()"; fi
 
 print_subheader "json.Unmarshal calls"
@@ -797,10 +900,7 @@ print_category "Detects: ioutil (deprecated), ReadAll on bodies, Close leaks" \
   "I/O mistakes cause memory spikes and descriptor leaks"
 
 print_subheader "ioutil package usage (deprecated)"
-ioutil_count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.ioutil-deprecated"' || true
-)
+ioutil_count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.ioutil-deprecated" || echo 0)
 if [ "$ioutil_count" -gt 0 ]; then print_finding "info" "$ioutil_count" "Replace ioutil.* with io/os equivalents"; fi
 
 print_subheader "io.ReadAll usage"
@@ -832,24 +932,22 @@ rand_count=$("${GREP_RN[@]}" -e "\bmath/rand\b|\brand\.Seed\(|\brand\.Read\(" "$
 if [ "$rand_count" -gt 0 ]; then print_finding "info" "$rand_count" "math/rand present - avoid for secrets; prefer crypto/rand"; fi
 
 print_subheader "TLS InsecureSkipVerify=true"
-count=0
-if [ "$HAS_AST_GREP" -eq 1 ]; then
-  count=$("${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null | grep -c '"id"[ ]*:[ ]*"go.tls-insecure-skip"' || true)
-fi
-if [ "$count" -eq 0 ]; then
-  count=$(rg --no-config --no-messages -n "InsecureSkipVerify:[[:space:]]*true" "$PROJECT_DIR" 2>/dev/null | wc -l | awk '{print $1+0}')
+count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.tls-insecure-skip" || echo 0)
+if [ "$count" -eq 0 ] && command -v rg >/dev/null 2>&1; then
+  count=$(rg --no-config --no-messages -n "InsecureSkipVerify:[[:space:]]*true" "$PROJECT_DIR" 2>/dev/null | wc_num)
 fi
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "InsecureSkipVerify enabled"; fi
 
 print_subheader "exec sh -c (command injection risk)"
-count=0
-if [ "$HAS_AST_GREP" -eq 1 ]; then
-  count=$("${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null | grep -c '"id"[ ]*:[ ]*"go.exec-sh-c"' || true)
-fi
+count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.exec-sh-c" || echo 0)
 if [ "$count" -eq 0 ]; then
   count=$(rg --no-config --no-messages -n 'exec\.Command(Context)?\(\s*"(sh|bash)"\s*,\s*"-?c"' "$PROJECT_DIR" 2>/dev/null | wc -l | awk '{print $1+0}')
 fi
 if [ "$count" -gt 0 ]; then print_finding "critical" "$count" "exec.Command(*, \"sh\", \"-c\", ...) detected"; fi
+
+print_subheader "exec without context"
+cmdctx=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.exec-command-without-context" || echo 0)
+if [ "$cmdctx" -gt 0 ]; then print_finding "info" "$cmdctx" "Prefer exec.CommandContext(ctx, ...)"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -878,17 +976,11 @@ print_category "Detects: dot-imports, blank imports, duplicate module trees" \
   "Clean imports improve readability and safety"
 
 print_subheader "dot-imports"
-dot_count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.dot-import"' || true
-)
+dot_count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.dot-import" || echo 0)
 if [ "$dot_count" -gt 0 ]; then print_finding "warning" "$dot_count" "dot-imports found"; fi
 
 print_subheader "blank imports"
-blank_count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.blank-import"' || true
-)
+blank_count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.blank-import" || echo 0)
 if [ "$blank_count" -gt 0 ]; then print_finding "info" "$blank_count" "blank imports present"; fi
 fi
 
@@ -969,10 +1061,7 @@ print_category "Detects: interface{} vs any, dot-imports, context parameter posi
   "Modern idioms reduce boilerplate and mistakes"
 
 print_subheader "interface{} occurrences"
-iface_count=$(
-  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || true ) \
-  | grep -c '"id"[ ]*:[ ]*"go.interface-empty"' || true
-)
+iface_count=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.interface-empty" || echo 0)
 if [ "$iface_count" -gt 0 ]; then print_finding "info" "$iface_count" "Prefer 'any' over 'interface{}'"; fi
 
 print_subheader "context.Context parameter not first (heuristic)"
@@ -991,19 +1080,20 @@ print_category "AST-detected: panic(), recover outside defer, time.Tick, time.Af
 
 # Summarize AST rule counts (if any)
 if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
-  tmp_json="$(mktemp)"
-  if run_ast_rules >"$tmp_json"; then
-    say "${DIM}${INFO} ast-grep produced structured matches. Tally by rule id:${RESET}"
-    ids=$(grep -o '"id"[:][ ]*"[^"]*"' "$tmp_json" | sed -E 's/.*"id"[ ]*:[ ]*"([^"]*)".*/\1/' || true)
-    if [[ -n "$ids" ]]; then
-      printf "%s\n" "$ids" | sort | uniq -c | awk '{printf "  • %-40s %5d\n",$2,$1}'
-    else
-      say "  (no matches)"
-    fi
+  ensure_ast_scan_json || true
+  if [[ -f "$AST_JSON" ]]; then
+    tmp_json="$AST_JSON"
   else
-    say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
+    tmp_json="$(mktemp)"
+    run_ast_rules >"$tmp_json" || true
   fi
-  rm -f "$tmp_json" || true
+  say "${DIM}${INFO} ast-grep produced structured matches. Tally by rule id:${RESET}"
+  ids=$(grep -o '"id"[:][ ]*"[^"]*"' "$tmp_json" | sed -E 's/.*"id"[ ]*:[ ]*"([^"]*)".*/\1/' || true)
+  if [[ -n "$ids" ]]; then
+    printf "%s\n" "$ids" | sort | uniq -c | awk '{printf "  • %-40s %5d\n",$2,$1}'
+  else
+    say "  (no matches)"
+  fi
 else
   say "${YELLOW}${WARN} ast-grep not available; AST categories summarized via regex only.${RESET}"
 fi

@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# PYTHON ULTIMATE BUG SCANNER v1.0 (Bash) - Industrial-Grade Code Analysis
+# PYTHON ULTIMATE BUG SCANNER v2.0 (Bash) - Industrial-Grade Code Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for modern Python (3.13+) using:
 #   • ast-grep (rule packs; language: python)
 #   • ripgrep/grep heuristics for fast code smells
 #   • optional uv-powered extra analyzers (ruff, bandit, pip-audit)
+#   • optional mypy/pyright (if installed) for type-checking touchpoints
+#   • optional safety / detect-secrets if available
 #
 # Focus:
 #   • None/defensive checks   • exceptions & error handling
@@ -18,10 +20,13 @@
 #   --format text|json|sarif (ast-grep passthrough for json/sarif)
 #   --rules DIR   (merge user ast-grep rules)
 #   --fail-on-warning, --skip, --jobs, --include-ext, --exclude, --ci, --no-color
-#   CI-friendly timestamps, robust find, safe pipelines, auto parallel jobs
+#   --summary-json FILE  (machine-readable run summary)
+#   --max-detailed N     (cap detailed code samples)
 #
+# CI-friendly timestamps, robust find, safe pipelines, auto parallel jobs.
 # Heavily leverages ast-grep for Python via rule packs; complements with rg.
 # Integrates uv (if installed) to run ruff/bandit/pip-audit without setup.
+# Adds portable timeout resolution (timeout/gtimeout) and UTF‑8-safe output.
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -Eeuo pipefail
@@ -48,6 +53,12 @@ else
   BOLD=''; DIM=''; RESET=''
 fi
 
+# Symbols (ensure UTF-8 output; run grep under LC_ALL=C separately)
+SAFE_LOCALE="C"
+if locale -a 2>/dev/null | grep -qi '^C\.UTF-8$'; then SAFE_LOCALE="C.UTF-8"; fi
+export LC_CTYPE="$SAFE_LOCALE"
+export LC_MESSAGES="$SAFE_LOCALE"
+
 CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAGNIFY="🔍"; BUG="🐛"; FIRE="🔥"; SPARKLE="✨"; SHIELD="🛡"; ROCKET="🚀"
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -56,7 +67,7 @@ CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAG
 VERBOSE=0
 PROJECT_DIR="."
 OUTPUT_FILE=""
-FORMAT="text"          # text|json|sarif (text implemented; ast-grep emits json/sarif when rule packs are run)
+FORMAT="text"          # text|json|sarif
 CI_MODE=0
 FAIL_ON_WARNING=0
 INCLUDE_EXT="py,pyi,pyx,pxd,pxi,ipynb"
@@ -69,9 +80,12 @@ MAX_DETAILED=250
 JOBS="${JOBS:-0}"
 USER_RULE_DIR=""
 DISABLE_PIPEFAIL_DURING_SCAN=1
-ENABLE_UV_TOOLS=1           # try uv integrations by default
-UV_TOOLS="ruff,bandit,pip-audit"  # subset via --uv-tools=
-UV_TIMEOUT="${UV_TIMEOUT:-1200}"  # generous time budget per tool
+ENABLE_UV_TOOLS=1                     # try uv integrations by default
+UV_TOOLS="ruff,bandit,pip-audit"      # subset via --uv-tools=
+UV_TIMEOUT="${UV_TIMEOUT:-1200}"      # generous time budget per tool
+ENABLE_EXTRA_TOOLS=1                  # mypy/pyright/safety/detect-secrets if present
+SUMMARY_JSON=""
+TIMEOUT_CMD=""                        # resolved later
 
 print_usage() {
   cat >&2 <<USAGE
@@ -91,6 +105,8 @@ Options:
   --rules=DIR              Additional ast-grep rules directory (merged)
   --no-uv                  Disable uv-powered extra analyzers
   --uv-tools=CSV           Which uv tools to run (default: $UV_TOOLS)
+  --summary-json=FILE      Also write machine-readable summary JSON
+  --max-detailed=N         Cap number of detailed code samples (default: $MAX_DETAILED)
   -h, --help               Show help
 Env:
   JOBS, NO_COLOR, CI, UV_TIMEOUT
@@ -115,6 +131,8 @@ while [[ $# -gt 0 ]]; do
     --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
     --no-uv)      ENABLE_UV_TOOLS=0; shift;;
     --uv-tools=*) UV_TOOLS="${1#*=}"; shift;;
+    --summary-json=*) SUMMARY_JSON="${1#*=}"; shift;;
+    --max-detailed=*) MAX_DETAILED="${1#*=}"; shift;;
     -h|--help)    print_usage; exit 0;;
     *)
       if [[ -z "$PROJECT_DIR" || "$PROJECT_DIR" == "." ]] && ! [[ "$1" =~ ^- ]]; then
@@ -153,13 +171,15 @@ HAS_AST_GREP=0
 AST_GREP_CMD=()      # array-safe
 AST_RULE_DIR=""      # created later if ast-grep exists
 HAS_RIPGREP=0
-UVX_CMD=()           # (uvx -q) if available
+UVX_CMD=()           # (uvx -q or uv -qx) if available
 HAS_UV=0
 
 # ────────────────────────────────────────────────────────────────────────────
 # Search engine configuration (rg if available, else grep) + include/exclude
 # ────────────────────────────────────────────────────────────────────────────
-LC_ALL=C
+# Keep printing UTF-8 while running grep in C-locale
+GREP_ENV=(env LC_ALL=C)
+
 IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
 INCLUDE_GLOBS=()
 for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
@@ -178,18 +198,17 @@ if command -v rg >/dev/null 2>&1; then
   for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
   RG_INCLUDES=()
   for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( -g "*.$(echo "$e" | xargs)" ); done
-  GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  GREP_RNI=(rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  GREP_RNW=(rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  RG_JOBS=()
+  GREP_RN=("${GREP_ENV[@]}" rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  GREP_RNI=("${GREP_ENV[@]}" rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  GREP_RNW=("${GREP_ENV[@]}" rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
 else
   GREP_R_OPTS=(-R --binary-files=without-match "${EXCLUDE_FLAGS[@]}" "${INCLUDE_GLOBS[@]}")
-  GREP_RN=("grep" "${GREP_R_OPTS[@]}" -n -E)
-  GREP_RNI=("grep" "${GREP_R_OPTS[@]}" -n -i -E)
-  GREP_RNW=("grep" "${GREP_R_OPTS[@]}" -n -w -E)
+  GREP_RN=("${GREP_ENV[@]}" grep "${GREP_R_OPTS[@]}" -n -E)
+  GREP_RNI=("${GREP_ENV[@]}" grep "${GREP_R_OPTS[@]}" -n -i -E)
+  GREP_RNW=("${GREP_ENV[@]}" grep "${GREP_R_OPTS[@]}" -n -w -E)
 fi
 
-# Helper: robust numeric end-of-pipeline counter; never emits 0\n0
+# Helper: robust numeric end-of-pipeline counter
 count_lines() { awk 'END{print (NR+0)}'; }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -324,13 +343,14 @@ analyze_py_attr_guards() {
   tmp_attrs="$(mktemp -t ubs-py-attrs.XXXXXX 2>/dev/null || mktemp -t ubs-py-attrs)"
   tmp_ifs="$(mktemp -t ubs-py-ifs.XXXXXX 2>/dev/null || mktemp -t ubs-py-ifs)"
 
-  ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern '$OBJ.$P1.$P2.$P3' --lang python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_attrs"
+  # Attribute chains of depth >= 4
+  ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern '$A.$B.$C.$D' --lang python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_attrs"
+  # Capture BODY region (root-cause fix: previously captured COND)
   ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern $'if $COND:\n    $BODY' --lang python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_ifs"
 
   result=$(python3 - "$tmp_attrs" "$tmp_ifs" "$limit" <<'PYHELP'
 import json, sys
 from collections import defaultdict
-
 
 def load_stream(path):
     data = []
@@ -353,36 +373,32 @@ limit = int(limit_raw)
 matches = load_stream(matches_path)
 guards = load_stream(guards_path)
 
-
 def as_pos(node):
     return (node.get('line', 0), node.get('column', 0))
-
 
 def ge(a, b):
     return a[0] > b[0] or (a[0] == b[0] and a[1] >= b[1])
 
-
 def le(a, b):
     return a[0] < b[0] or (a[0] == b[0] and a[1] <= b[1])
-
 
 def within(target, region):
     start, end = target
     rs, re = region
     return ge(start, rs) and le(end, re)
 
-
-guards_by_file = defaultdict(list)
+# Store BODY ranges per file
+bodies_by_file = defaultdict(list)
 for guard in guards:
     file_path = guard.get('file')
-    cond = guard.get('metaVariables', {}).get('single', {}).get('COND')
-    if not file_path or not cond:
+    body = guard.get('metaVariables', {}).get('single', {}).get('BODY')
+    if not file_path or not body:
         continue
-    rng = cond.get('range') or {}
+    rng = body.get('range') or {}
     start = rng.get('start'); end = rng.get('end')
     if not start or not end:
         continue
-    guards_by_file[file_path].append((as_pos(start), as_pos(end)))
+    bodies_by_file[file_path].append((as_pos(start), as_pos(end)))
 
 unguarded = 0
 guarded = 0
@@ -395,8 +411,8 @@ for match in matches:
     if not file_path or not start or not end:
         continue
     start_pos = as_pos(start); end_pos = as_pos(end)
-    guard_regions = guards_by_file.get(file_path, [])
-    if any(within((start_pos, end_pos), region) for region in guard_regions):
+    regions = bodies_by_file.get(file_path, [])
+    if any(within((start_pos, end_pos), region) for region in regions):
         guarded += 1
         continue
     unguarded += 1
@@ -560,7 +576,10 @@ YAML
 id: py.requests-verify
 language: python
 rule:
-  pattern: requests.$M($URL, $$, verify=False)
+  any:
+    - pattern: requests.$M($URL, $$, verify=False)
+    - pattern: requests.$M($URL, verify=False, $$)
+    - pattern: requests.$M($URL, verify = False, $$)
 severity: warning
 message: "requests with verify=False disables TLS verification"
 YAML
@@ -612,6 +631,9 @@ rule:
   not:
     has:
       pattern: encoding=$ENC
+  not:
+    has:
+      pattern: "mode='b'"
 severity: info
 message: "open() without encoding=... may be non-deterministic across locales"
 YAML
@@ -708,7 +730,7 @@ YAML
 id: py.sql-fstring
 language: python
 rule:
-  pattern: f"SELECT $X"
+  regex: 'f"\\s*SELECT\\s+.*"'
 severity: warning
 message: "Interpolated SQL; prefer parameterized queries"
 YAML
@@ -738,11 +760,57 @@ id: py.re-catastrophic
 language: python
 rule:
   any:
-    - pattern: re.compile("($A+)+")
-    - pattern: re.compile("($A*)+")
-    - pattern: re.compile("(.*)+")
+    - regex: 're\\.compile\\("(.+\\+)+.+"\\)'
+    - regex: 're\\.compile\\("(.\\*)\\+"\\)'
 severity: warning
 message: "Potential catastrophic backtracking; check regex"
+YAML
+
+  # Additional high-value rules
+  cat >"$AST_RULE_DIR/subprocess-no-check.yml" <<'YAML'
+id: py.subprocess-no-check
+language: python
+rule:
+  pattern: subprocess.run($ARGS)
+  not:
+    has:
+      pattern: check=$C
+severity: info
+message: "subprocess.run without check=... may silently ignore failures; consider check=True"
+YAML
+
+  cat >"$AST_RULE_DIR/logging-secrets.yml" <<'YAML'
+id: py.logging-secrets
+language: python
+rule:
+  pattern: logging.$L($MSG)
+  has:
+    any:
+      - regex: "(?i)(password|token|secret|apikey|api_key|authorization|bearer)"
+severity: warning
+message: "Sensitive-looking value referenced in logging call; mask or avoid"
+YAML
+
+  cat >"$AST_RULE_DIR/path-join-plus.yml" <<'YAML'
+id: py.path-join-plus
+language: python
+rule:
+  pattern: "$BASE + '/' + $NAME"
+severity: info
+message: "Use os.path.join or pathlib.Path instead of string concatenation for paths"
+YAML
+
+  cat >"$AST_RULE_DIR/floating-task.yml" <<'YAML'
+id: py.floating-task
+language: python
+rule:
+  pattern: asyncio.create_task($CALL)
+  not:
+    inside:
+      pattern: |
+        $VAR = asyncio.create_task($CALL)
+severity: warning
+message: "create_task() result unused; keep a reference and handle exceptions"
 YAML
 
   # Done writing rules
@@ -759,20 +827,36 @@ run_ast_rules() {
 }
 
 # ────────────────────────────────────────────────────────────────────────────
-# uv integrations (ruff, bandit, pip-audit) if available
+# uv integrations & timeout resolution
 # ────────────────────────────────────────────────────────────────────────────
 check_uv() {
   if command -v uvx >/dev/null 2>&1; then UVX_CMD=(uvx -q); HAS_UV=1; return 0; fi
-  if command -v uv >/dev/null 2>&1;  then UVX_CMD=(uvx -q); HAS_UV=1; return 0; fi
+  if command -v uv  >/dev/null 2>&1; then UVX_CMD=(uv -qx); HAS_UV=1; return 0; fi
   HAS_UV=0; return 1
+}
+
+resolve_timeout() {
+  if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD="timeout"; return 0; fi
+  if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD="gtimeout"; return 0; fi
+  TIMEOUT_CMD=""
 }
 
 run_uv_tool_text() {
   local tool="$1"; shift
   if [[ "$HAS_UV" -eq 1 ]]; then
-    ( set +o pipefail; timeout "$UV_TIMEOUT" "${UVX_CMD[@]}" "$tool" "$@" || true )
+    if [[ -n "$TIMEOUT_CMD" ]]; then
+      ( set +o pipefail; "$TIMEOUT_CMD" "$UV_TIMEOUT" "${UVX_CMD[@]}" "$tool" "$@" || true )
+    else
+      ( set +o pipefail; "${UVX_CMD[@]}" "$tool" "$@" || true )
+    fi
   else
-    if command -v "$tool" >/dev/null 2>&1; then ( set +o pipefail; timeout "$UV_TIMEOUT" "$tool" "$@" || true ); fi
+    if command -v "$tool" >/dev/null 2>&1; then
+      if [[ -n "$TIMEOUT_CMD" ]]; then
+        ( set +o pipefail; "$TIMEOUT_CMD" "$UV_TIMEOUT" "$tool" "$@" || true )
+      else
+        ( set +o pipefail; "$tool" "$@" || true )
+      fi
+    fi
   fi
 }
 
@@ -832,6 +916,15 @@ echo -e "${RESET}"
 
 say "${WHITE}Project:${RESET}  ${CYAN}$PROJECT_DIR${RESET}"
 say "${WHITE}Started:${RESET}  ${GRAY}$(eval "$DATE_CMD")${RESET}"
+
+# Validate project dir
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  echo -e "${RED}${BOLD}Project directory not found:${RESET} ${WHITE}$PROJECT_DIR${RESET}" >&2
+  exit 2
+fi
+
+# Resolve portable timeout
+resolve_timeout || true
 
 # Count files with robust find
 EX_PRUNE=()
@@ -999,8 +1092,12 @@ elif [ "$count" -gt 0 ]; then
 fi
 
 print_subheader "Mutation during iteration"
-count=$("${GREP_RN[@]}" -e "for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -A3 -E "\1\.(append|extend|insert|remove|pop|clear)" || true) | (grep -c -E "(append|extend|insert|remove|pop|clear)" || true) )
+if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+  # High-level heuristic: count loops; detailed evidence shown elsewhere
+  count=$("${AST_GREP_CMD[@]}" --lang python --pattern $'for $I in $C:\n    $B' "$PROJECT_DIR" --json=stream 2>/dev/null | grep -c . || true)
+else
+  count=$("${GREP_RN[@]}" -e "for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]]+[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+fi
 count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
 if [ "$count" -gt 5 ]; then
   print_finding "warning" "$count" "Possible mutation during iteration" "Copy or iterate over snapshot"
@@ -1235,8 +1332,8 @@ if [ "$count" -gt "$trycatch_count" ]; then
 fi
 
 print_subheader "String concatenation with + adjacent to digits (possible type mix)"
-count=$(( $("${GREP_RN[@]}" -e "\+[[:space:]]*['\"]|['\"][[:space:]]*\+" "$PROJECT_DIR" 2>/dev/null || true | \
-  grep -v -E "\+\+|[+\-]=" || true | wc -l | awk '{print $1+0}') ))
+count=$("${GREP_RN[@]}" -e "\+[[:space:]]*['\"]|['\"][[:space:]]*\+" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -v -E "\+\+|[+\-]=" || true) | wc -l | awk '{print $1+0}')
 if [ "$count" -gt 5 ]; then
   print_finding "info" "$count" "String concatenation with +" "Use f-strings"
 fi
@@ -1512,18 +1609,15 @@ if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
     case "$TOOL" in
       ruff)
         print_subheader "ruff (lint)"
-        if run_uv_tool_text ruff check "$PROJECT_DIR" --quiet; then
-          # best-effort count
-          ruff_count=$("${GREP_RN[@]}" -e "error|warning" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-          if [ "$ruff_count" -gt 0 ]; then print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"; else print_finding "good" "Ruff clean"; fi
-        else
-          say "  ${GRAY}${INFO} ruff not executed${RESET}"
-        fi
+        # Use ruff's counting mode to quantify diagnostics, also emit JSON for context
+        run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=json || true
+        ruff_count=$(run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=count | tail -n1 | awk '{print $1+0}')
+        if [ "${ruff_count:-0}" -gt 0 ]; then print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"; else print_finding "good" "Ruff clean"; fi
         ;;
       bandit)
         print_subheader "bandit (security)"
-        if run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "$(IFS=,; echo "${EXCLUDE_DIRS[*]}")"; then
-          # Can't reliably count; provide info item
+        _EXC=""; for d in "${EXCLUDE_DIRS[@]}"; do _EXC="${_EXC:+$_EXC,}$d"; done
+        if run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "$_EXC"; then
           print_finding "info" 0 "Bandit scan completed" "See output above"
         else
           say "  ${GRAY}${INFO} bandit not executed${RESET}"
@@ -1531,7 +1625,6 @@ if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
         ;;
       pip-audit)
         print_subheader "pip-audit (dependencies)"
-        # Try lock/req files if present
         if [ -f "$PROJECT_DIR/requirements.txt" ]; then
           run_uv_tool_text pip-audit -r "$PROJECT_DIR/requirements.txt" || true
         elif [ -f "$PROJECT_DIR/pyproject.toml" ]; then
@@ -1589,6 +1682,23 @@ if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$WARNING_COUNT" -eq 0 ]; then
   say "\n  ${GREEN}${BOLD}${SPARKLE} EXCELLENT! No critical or warning issues found ${SPARKLE}${RESET}"
 fi
 
+# Optional machine-readable summary
+if [[ -n "$SUMMARY_JSON" ]]; then
+  {
+    printf '{'
+    printf '"project":"%s",' "$(printf %s "$PROJECT_DIR" | sed 's/"/\\"/g')"
+    printf '"files":%s,' "$TOTAL_FILES"
+    printf '"critical":%s,' "$CRITICAL_COUNT"
+    printf '"warning":%s,' "$WARNING_COUNT"
+    printf '"info":%s,' "$INFO_COUNT"
+    printf '"timestamp":"%s",' "$(eval "$DATE_CMD")"
+    printf '"format":"%s",' "$FORMAT"
+    printf '"uv_tools":"%s"' "$(printf %s "$UV_TOOLS" | sed 's/"/\\"/g')"
+    printf '}\n'
+  } > "$SUMMARY_JSON" 2>/dev/null || true
+  say "${DIM}Summary JSON written to: ${SUMMARY_JSON}${RESET}"
+fi
+
 echo ""
 say "${DIM}Scan completed at: $(eval "$DATE_CMD")${RESET}"
 
@@ -1600,7 +1710,7 @@ echo ""
 if [ "$VERBOSE" -eq 0 ]; then
   say "${DIM}Tip: Run with -v/--verbose for more code samples per finding.${RESET}"
 fi
-say "${DIM}Add to pre-commit: ./ubs --ci --fail-on-warning . > py-bug-scan-report.txt${RESET}"
+say "${DIM}Add to pre-commit: ./ubs --ci --fail-on-warning --summary-json=.ubs-summary.json . > py-bug-scan-report.txt${RESET}"
 echo ""
 
 EXIT_CODE=0
