@@ -25,6 +25,8 @@ You're coding faster than ever with Claude Code, Codex, Cursor, and other AI cod
 
 ### **Even the best AI makes these mistakes:**
 
+**JavaScript/TypeScript example** *(similar patterns exist in Python, Go, Rust, Java, C++, Ruby)*:
+
 ```javascript
 // ❌ CRITICAL BUG #1: Null pointer crash waiting to happen
 const submitButton = document.getElementById('submit');
@@ -50,7 +52,7 @@ if (calculatedValue === NaN) {  // 💥 This NEVER works (always false)
 const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (octal!)
 ```
 
-**Each of these bugs could cost 3-6 hours to debug in production.** You've probably hit all of them.
+**Each of these bugs could cost 3-6 hours to debug in production.** Similar issues plague every language: unguarded null access, missing `await`, security holes from `eval()`, buffer overflows from `strcpy()`, `.unwrap()` panics, goroutine leaks... **You've probably hit all of them.**
 
 ---
 
@@ -198,6 +200,8 @@ Unlike traditional linters that fight AI-generated code, this scanner **embraces
 ---
 
 ## 🎬 **See It In Action**
+
+*Examples show JavaScript output; each language has equivalent detections (Python: None checks, Go: nil guards, Rust: Option handling, etc.)*
 
 ### **Example 1: Catching a Null Pointer Bug**
 
@@ -548,7 +552,8 @@ Total time: 12 minutes (vs. 6 hours debugging in production)
 Train your AI agent to use this decision tree:
 
 ```
-Did I modify .js/.ts/.jsx/.tsx files?
+Did I modify code in any supported language?
+(JS/TS, Python, Go, Rust, Java, C++, Ruby)
          │
          ↓ YES
 Changed more than 50 lines?
@@ -573,6 +578,8 @@ Critical issues found? ────┤ YES
 ---
 
 ## 📋 **What It Detects (The Complete Arsenal)**
+
+*Each language module has specialized detections. Examples below are representative (JavaScript shown; Python has `eval()`, Go has goroutine leaks, Rust has `.unwrap()` panics, C++ has buffer overflows, etc.)*
 
 ### 🔴 **Critical Issues (Production Blockers)**
 
@@ -643,8 +650,10 @@ Output Control:
   OUTPUT_FILE              Save report to file (auto-tees to stdout)
 
 File Selection:
-  --include-ext=CSV        File extensions (default: js,jsx,ts,tsx,mjs,cjs)
-                           Example: --include-ext=js,ts,vue,svelte
+  --include-ext=CSV        File extensions (default: auto-detect by language)
+                           JS: js,jsx,ts,tsx,mjs,cjs | Python: py,pyi,pyx
+                           Go: go | Rust: rs | Java: java | C++: cpp,cc,cxx,c,h
+                           Ruby: rb,rake,ru | Custom: --include-ext=js,ts,vue
   --exclude=GLOB[,...]     Additional paths to exclude (comma-separated)
                            Example: --exclude=vendor,third-party,legacy
 
@@ -930,11 +939,11 @@ Layer 4: STATISTICAL (Insightful)  │
 
 ### **Version 4.5 (Q1 2025)**
 
-- [ ] **SARIF Output** - Native GitHub integration (security tab)
-- [ ] **JSON Output** - Programmatic consumption
 - [ ] **Custom Severity Thresholds** - Configure via `.ubsrc` file
-- [ ] **React Hooks Linting** - Advanced hooks patterns
-- [ ] **Vue.js Support** - Template + script analysis
+- [ ] **Framework-Specific Rules** - Advanced React hooks, Vue templates, Django patterns
+- [ ] **Watch Mode** - Continuous scanning during development
+- [ ] **Metrics Dashboard** - Track bug trends over time
+- [ ] **Language-Specific Enhancements** - Deeper analysis for each supported language
 
 ### **Community Requests**
 
@@ -963,9 +972,9 @@ This project wouldn't exist without:
 
 - **[ast-grep](https://ast-grep.github.io/)** by Herrington Darkholme - Revolutionary AST tooling that makes semantic analysis accessible
 - **[ripgrep](https://github.com/BurntSushi/ripgrep)** by Andrew Gallant - The fastest search tool ever built
-- **JavaScript Community** - For documenting thousands of bug patterns over decades
+- **Open Source Communities** - JavaScript, Python, Rust, Go, Java, C++, and Ruby communities for documenting thousands of bug patterns and anti-patterns over decades
 - **AI Coding Tools** - Claude, GPT-4, Cursor, Copilot for inspiring this tool and making development faster
-- **Every developer** who's ever spent hours debugging a null pointer exception at 2 AM
+- **Every developer** who's ever spent hours debugging a null pointer exception, race condition, or memory leak at 2 AM
 
 ---
 
