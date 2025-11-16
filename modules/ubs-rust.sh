@@ -1,7 +1,3 @@
-Got it – I’ve updated the task to focus on scanning Rust code while keeping the Bash script approach.
-
-
-```bash
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
 # RUST ULTIMATE BUG SCANNER v1.0 - Industrial-Grade Rust Code Analysis
@@ -1335,4 +1331,3 @@ EXIT_CODE=0
 if [ "$CRITICAL_COUNT" -gt 0 ]; then EXIT_CODE=1; fi
 if [ "$FAIL_ON_WARNING" -eq 1 ] && [ $((CRITICAL_COUNT + WARNING_COUNT)) -gt 0 ]; then EXIT_CODE=1; fi
 exit "$EXIT_CODE"
-```
