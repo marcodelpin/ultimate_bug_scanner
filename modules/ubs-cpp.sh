@@ -1,0 +1,1148 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════
+# ULTIMATE C++ BUG SCANNER v5.0 - Industrial-Grade Code Quality Analysis
+# ═══════════════════════════════════════════════════════════════════════════
+# Comprehensive static analysis for modern C++ (C++20+) using ast-grep
+# + smart regex/ripgrep heuristics and CMake build hygiene checks.
+# Detects: RAII violations, lifetime bugs, exception pitfalls, concurrency
+# hazards, UB-prone code, preprocessor traps, modernization gaps, and more.
+# v5.0 adds: module/headers checks, CMake policy validation, sanitizer hints,
+# SARIF/JSON passthrough, --rules merging, robust find, safe pipelines, jobs.
+# ═══════════════════════════════════════════════════════════════════════════
+
+set -Eeuo pipefail
+shopt -s lastpipe
+shopt -s extglob
+
+on_err() {
+  local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
+  echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
+  exit "$ec"
+}
+trap on_err ERR
+
+# Honor NO_COLOR and non-tty
+USE_COLOR=1
+if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
+
+if [[ "$USE_COLOR" -eq 1 ]]; then
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+  BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+  BOLD=''; DIM=''; RESET=''
+fi
+
+CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAGNIFY="🔍"; BUG="🐛"; FIRE="🔥"; SPARKLE="✨"; HAMMER="🔧"
+
+# ────────────────────────────────────────────────────────────────────────────
+# CLI Parsing & Configuration
+# ────────────────────────────────────────────────────────────────────────────
+VERBOSE=0
+PROJECT_DIR="."
+OUTPUT_FILE=""
+FORMAT="text"          # text|json|sarif
+CI_MODE=0
+FAIL_ON_WARNING=0
+INCLUDE_EXT="cpp,cc,cxx,cppm,mpp,ixx,h,hpp,hxx,hh,ipp,tpp"
+QUIET=0
+NO_COLOR_FLAG=0
+EXTRA_EXCLUDES=""
+SKIP_CATEGORIES=""
+DETAIL_LIMIT=3
+MAX_DETAILED=250
+JOBS="${JOBS:-0}"
+USER_RULE_DIR=""
+DISABLE_PIPEFAIL_DURING_SCAN=1
+
+print_usage() {
+  cat >&2 <<USAGE
+Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
+
+Options:
+  -v, --verbose            More code samples per finding (DETAIL=10)
+  -q, --quiet              Reduce non-essential output
+  --format=FMT             Output format: text|json|sarif (default: text)
+  --ci                     CI mode (no clear, stable timestamps)
+  --no-color               Force disable ANSI color
+  --include-ext=CSV        File extensions (default: ${INCLUDE_EXT})
+  --exclude=GLOB[,..]      Additional glob(s)/dir(s) to exclude
+  --jobs=N                 Parallel jobs for ripgrep (default: auto)
+  --skip=CSV               Skip categories by number (e.g. --skip=2,7,11)
+  --fail-on-warning        Exit non-zero on warnings or critical
+  --rules=DIR              Additional ast-grep rules directory (merged)
+  -h, --help               Show help
+Env:
+  JOBS, NO_COLOR, CI
+Args:
+  PROJECT_DIR              Directory to scan (default: ".")
+  OUTPUT_FILE              File to save the report (optional)
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
+    -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
+    --format=*)   FORMAT="${1#*=}"; shift;;
+    --ci)         CI_MODE=1; shift;;
+    --no-color)   NO_COLOR_FLAG=1; shift;;
+    --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
+    --exclude=*)  EXTRA_EXCLUDES="${1#*=}"; shift;;
+    --jobs=*)     JOBS="${1#*=}"; shift;;
+    --skip=*)     SKIP_CATEGORIES="${1#*=}"; shift;;
+    --fail-on-warning) FAIL_ON_WARNING=1; shift;;
+    --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
+    -h|--help)    print_usage; exit 0;;
+    *)
+      if [[ -z "$PROJECT_DIR" || "$PROJECT_DIR" == "." ]] && ! [[ "$1" =~ ^- ]]; then
+        PROJECT_DIR="$1"; shift
+      elif [[ -z "$OUTPUT_FILE" ]] && ! [[ "$1" =~ ^- ]]; then
+        OUTPUT_FILE="$1"; shift
+      else
+        echo "Unexpected argument: $1" >&2; exit 2
+      fi
+      ;;
+  esac
+done
+
+# CI auto-detect + color override
+if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
+if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
+
+# Redirect output early to capture everything
+if [[ -n "${OUTPUT_FILE}" ]]; then exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
+
+DATE_FMT='%Y-%m-%d %H:%M:%S'
+if [[ "$CI_MODE" -eq 1 ]]; then DATE_CMD="date -u '+%Y-%m-%dT%H:%M:%SZ'"; else DATE_CMD="date '+$DATE_FMT'"; fi
+
+# ────────────────────────────────────────────────────────────────────────────
+# Global Counters
+# ────────────────────────────────────────────────────────────────────────────
+CRITICAL_COUNT=0
+WARNING_COUNT=0
+INFO_COUNT=0
+TOTAL_FILES=0
+
+# ────────────────────────────────────────────────────────────────────────────
+# Global State
+# ────────────────────────────────────────────────────────────────────────────
+HAS_AST_GREP=0
+AST_GREP_CMD=()      # array-safe
+AST_RULE_DIR=""      # created later if ast-grep exists
+
+# ────────────────────────────────────────────────────────────────────────────
+# Search engine configuration (rg if available, else grep) + include/exclude
+# ────────────────────────────────────────────────────────────────────────────
+LC_ALL=C
+IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
+INCLUDE_GLOBS=()
+for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
+EXCLUDE_DIRS=(.git .svn .hg build cmake-build-* out dist bin lib obj target .vscode .vs .cache .idea _deps third_party vendor bazel-*)
+if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
+EXCLUDE_FLAGS=()
+for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
+
+if command -v rg >/dev/null 2>&1; then
+  if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
+  RG_JOBS=(); if [[ "${JOBS}" -gt 0 ]]; then RG_JOBS=(-j "$JOBS"); fi
+  RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden "${RG_JOBS[@]}")
+  RG_EXCLUDES=()
+  for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
+  RG_INCLUDES=()
+  for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( -g "*.$(echo "$e" | xargs)" ); done
+  GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  GREP_RNI=(rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  GREP_RNW=(rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  RG_JOBS=()
+else
+  GREP_R_OPTS=(-R --binary-files=without-match "${EXCLUDE_FLAGS[@]}" "${INCLUDE_GLOBS[@]}")
+  GREP_RN=("grep" "${GREP_R_OPTS[@]}" -n -E)
+  GREP_RNI=("grep" "${GREP_R_OPTS[@]}" -n -i -E)
+  GREP_RNW=("grep" "${GREP_R_OPTS[@]}" -n -w -E)
+fi
+
+# Helper: robust numeric end-of-pipeline counter
+count_lines() { awk 'END{print (NR+0)}'; }
+
+# ────────────────────────────────────────────────────────────────────────────
+# Helper Functions
+# ────────────────────────────────────────────────────────────────────────────
+maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 ]]; then clear || true; fi; }
+
+say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
+
+print_header() {
+  say "\n${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+  say "${WHITE}${BOLD}$1${RESET}"
+  say "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+}
+
+print_category() {
+  say "\n${MAGENTA}${BOLD}▓▓▓ $1${RESET}"
+  say "${DIM}$2${RESET}"
+}
+
+print_subheader() { say "\n${YELLOW}${BOLD}$BULLET $1${RESET}"; }
+
+print_finding() {
+  local severity=$1
+  case $severity in
+    good)
+      local title=$2
+      say "  ${GREEN}${CHECK} OK${RESET} ${DIM}$title${RESET}"
+      ;;
+    *)
+      local raw_count=$2; local title=$3; local description="${4:-}"
+      local count; count=$(printf '%s\n' "$raw_count" | awk 'END{print $0+0}')
+      case $severity in
+        critical)
+          CRITICAL_COUNT=$((CRITICAL_COUNT + count))
+          say "  ${RED}${BOLD}${FIRE} CRITICAL${RESET} ${WHITE}($count found)${RESET}"
+          say "    ${RED}${BOLD}$title${RESET}"
+          [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
+          ;;
+        warning)
+          WARNING_COUNT=$((WARNING_COUNT + count))
+          say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"
+          say "    ${YELLOW}$title${RESET}"
+          [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
+          ;;
+        info)
+          INFO_COUNT=$((INFO_COUNT + count))
+          say "  ${BLUE}${INFO} Info${RESET} ${WHITE}($count found)${RESET}"
+          say "    ${BLUE}$title${RESET}"
+          [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
+          ;;
+      esac
+      ;;
+  esac
+}
+
+print_code_sample() {
+  local file=$1; local line=$2; local code=$3
+  say "${GRAY}      $file:$line${RESET}"
+  say "${WHITE}      $code${RESET}"
+}
+
+show_detailed_finding() {
+  local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
+  while IFS=: read -r file line code; do
+    print_code_sample "$file" "$line" "$code"; printed=$((printed+1))
+    [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+  done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
+}
+
+# Temporarily relax pipefail for grep-heavy scans
+begin_scan_section(){ if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi; }
+end_scan_section(){ if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi; }
+
+# ────────────────────────────────────────────────────────────────────────────
+# ast-grep: detection, rule packs, and wrappers (C++ heavy)
+# ────────────────────────────────────────────────────────────────────────────
+
+check_ast_grep() {
+  if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; return 0; fi
+  if command -v sg       >/dev/null 2>&1; then AST_GREP_CMD=(sg);       HAS_AST_GREP=1; return 0; fi
+  if command -v npx      >/dev/null 2>&1; then AST_GREP_CMD=(npx -y @ast-grep/cli); HAS_AST_GREP=1; return 0; fi
+  say "${YELLOW}${WARN} ast-grep not found. Advanced AST checks will be skipped.${RESET}"
+  say "${DIM}Tip: npm i -g @ast-grep/cli  or  cargo install ast-grep${RESET}"
+  HAS_AST_GREP=0; return 1
+}
+
+ast_search() {
+  local pattern=$1
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern "$pattern" --lang cpp "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
+  else
+    return 1
+  fi
+}
+
+ast_search_with_context() {
+  local pattern=$1; local limit=${2:-$DETAIL_LIMIT}
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern "$pattern" --lang cpp "$PROJECT_DIR" --json 2>/dev/null || true ) \
+      | head -n "$limit" || true
+  fi
+}
+
+write_ast_rules() {
+  [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
+  AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t cpp_ag_rules.XXXXXX)"
+  trap '[[ -n "${AST_RULE_DIR:-}" ]] && rm -rf "$AST_RULE_DIR" || true' EXIT
+  if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
+    cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
+  fi
+
+  # ───── Memory & RAII ──────────────────────────────────────────────────────
+  cat >"$AST_RULE_DIR/cpp-raw-new.yml" <<'YAML'
+id: cpp.raw-new
+language: cpp
+rule:
+  any:
+    - pattern: new $T($$)
+    - pattern: new $T
+severity: warning
+message: "Raw new detected; prefer std::make_unique/make_shared (RAII)."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-raw-delete.yml" <<'YAML'
+id: cpp.raw-delete
+language: cpp
+rule:
+  pattern: delete $X
+severity: critical
+message: "Manual delete; prefer smart pointers or RAII to avoid leaks/UB."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-malloc-free.yml" <<'YAML'
+id: cpp.malloc-free
+language: cpp
+rule:
+  any:
+    - pattern: malloc($$)
+    - pattern: free($$)
+severity: warning
+message: "C allocation APIs in C++ code; prefer new/smart pointers or containers."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-cstyle-cast.yml" <<'YAML'
+id: cpp.cstyle-cast
+language: cpp
+rule:
+  pattern: ( $EXPR )
+  inside:
+    kind: cast_expression
+severity: warning
+message: "C-style cast; prefer static_cast/reinterpret_cast/const_cast as appropriate."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-reinterpret-cast.yml" <<'YAML'
+id: cpp.reinterpret-cast
+language: cpp
+rule:
+  pattern: reinterpret_cast<$T>($EXPR)
+severity: warning
+message: "reinterpret_cast is dangerous; verify strict aliasing and lifetime."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-const-cast.yml" <<'YAML'
+id: cpp.const-cast
+language: cpp
+rule:
+  pattern: const_cast<$T>($EXPR)
+severity: warning
+message: "const_cast can lead to UB if original object wasn't non-const."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-null-vs-nullptr.yml" <<'YAML'
+id: cpp.null-macro
+language: cpp
+rule:
+  any:
+    - pattern: NULL
+    - pattern: 0
+  inside:
+    kind: pointer_declaration
+severity: info
+message: "Use nullptr instead of NULL/0 for pointer initialization."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-array-new-delete-mismatch.yml" <<'YAML'
+id: cpp.array-new-del-mismatch
+language: cpp
+rule:
+  any:
+    - pattern: delete $X
+    - pattern: delete $X[]
+severity: warning
+message: "Check delete[] vs delete for array allocations."
+YAML
+
+  # ───── Exceptions & error handling ────────────────────────────────────────
+  cat >"$AST_RULE_DIR/cpp-throw-in-dtor.yml" <<'YAML'
+id: cpp.throw-in-destructor
+language: cpp
+rule:
+  pattern: throw $EX
+  inside:
+    pattern: "~$C($$) { $$ }"
+severity: critical
+message: "Throwing in destructor can call std::terminate during stack unwinding."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-catch-by-value.yml" <<'YAML'
+id: cpp.catch-by-value
+language: cpp
+rule:
+  pattern: catch ($T $E)
+  not:
+    has:
+      regex: '&'
+severity: warning
+message: "Catch exceptions by const reference to avoid slicing and copies."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-exception-spec-dynamic.yml" <<'YAML'
+id: cpp.dynamic-exception-spec
+language: cpp
+rule:
+  pattern: "throw($$)"
+severity: warning
+message: "Deprecated dynamic exception specification; use noexcept."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-bad-exception-base.yml" <<'YAML'
+id: cpp.throw-non-std-exception
+language: cpp
+rule:
+  pattern: throw $EX
+severity: info
+message: "Ensure thrown types derive from std::exception for interoperability."
+YAML
+
+  # ───── Concurrency & atomics ─────────────────────────────────────────────
+  cat >"$AST_RULE_DIR/cpp-mutex-lock-unlock.yml" <<'YAML'
+id: cpp.manual-mutex-lock
+language: cpp
+rule:
+  any:
+    - pattern: $M.lock()
+    - pattern: $M.unlock()
+severity: warning
+message: "Manual lock/unlock; prefer std::lock_guard/std::unique_lock (RAII)."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-async-no-policy.yml" <<'YAML'
+id: cpp.async-without-policy
+language: cpp
+rule:
+  pattern: std::async($$)
+  not:
+    has:
+      regex: "std::launch::(async|deferred)"
+severity: info
+message: "std::async without explicit launch policy can be surprising."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-atomic-relaxed.yml" <<'YAML'
+id: cpp.atomic-relaxed
+language: cpp
+rule:
+  any:
+    - pattern: std::memory_order_relaxed
+    - pattern: std::memory_order_consume
+severity: info
+message: "Weak memory order; ensure correctness with happens-before."
+YAML
+
+  # ───── Modernization & best practices ─────────────────────────────────────
+  cat >"$AST_RULE_DIR/cpp-using-namespace-std-header.yml" <<'YAML'
+id: cpp.using-namespace-std-in-header
+language: cpp
+rule:
+  pattern: using namespace std;
+severity: warning
+message: "Avoid 'using namespace std' especially in headers."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-auto-ptr.yml" <<'YAML'
+id: cpp.auto_ptr
+language: cpp
+rule:
+  pattern: std::auto_ptr<$T>
+severity: critical
+message: "std::auto_ptr is removed; use std::unique_ptr."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-bind.yml" <<'YAML'
+id: cpp.std-bind
+language: cpp
+rule:
+  pattern: std::bind($$)
+severity: info
+message: "Prefer lambdas over std::bind for clarity and type safety."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-string-view-from-temporary.yml" <<'YAML'
+id: cpp.string_view-from-temporary
+language: cpp
+rule:
+  pattern: std::string_view($X)
+severity: warning
+message: "Ensure argument outlives string_view to avoid dangling references."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-move-const.yml" <<'YAML'
+id: cpp.move-of-const
+language: cpp
+rule:
+  pattern: std::move($X)
+  has:
+    regex: "const"
+severity: warning
+message: "std::move on const object does not move; results in a copy."
+YAML
+
+  # ───── C APIs & unsafe functions ─────────────────────────────────────────
+  cat >"$AST_RULE_DIR/cpp-unsafe-c-apis.yml" <<'YAML'
+id: cpp.unsafe-c-apis
+language: cpp
+rule:
+  any:
+    - pattern: gets($$)
+    - pattern: strcpy($$)
+    - pattern: strcat($$)
+    - pattern: sprintf($$)
+    - pattern: scanf($$)
+severity: critical
+message: "Unsafe C APIs; prefer safer alternatives (snprintf, strlcpy, std::string, streams, fmt)."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-rand.yml" <<'YAML'
+id: cpp.rand
+language: cpp
+rule:
+  any:
+    - pattern: rand()
+    - pattern: srand($$)
+severity: info
+message: "Prefer <random> facilities; rand() has poor quality and shared state."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-cstdio-includes.yml" <<'YAML'
+id: cpp.c-headers-in-cpp
+language: cpp
+rule:
+  any:
+    - pattern: #include <stdio.h>
+    - pattern: #include <stdlib.h>
+    - pattern: #include <string.h>
+    - pattern: #include <math.h>
+severity: info
+message: "Prefer <cstdio>/<cstdlib>/<cstring>/<cmath> in C++."
+YAML
+
+  # ───── Lifetime & iterator safety (heuristics) ───────────────────────────
+  cat >"$AST_RULE_DIR/cpp-iterator-invalidated-erase.yml" <<'YAML'
+id: cpp.erase-in-loop-iterator-use
+language: cpp
+rule:
+  any:
+    - pattern: $C.erase($IT)
+    - pattern: $C.erase($B, $E)
+severity: info
+message: "Erasing invalidates iterators; verify loop iteration is safe."
+YAML
+
+  cat >"$AST_RULE_DIR/cpp-return-local-ref.yml" <<'YAML'
+id: cpp.return-local-reference
+language: cpp
+rule:
+  pattern: return $X;
+  inside:
+    kind: function_definition
+  # Note: heuristic; real lifetime analysis requires deeper tooling.
+severity: warning
+message: "Returning reference to local or temporary can dangle (heuristic)."
+YAML
+
+  # ───── Formatting & logging ──────────────────────────────────────────────
+  cat >"$AST_RULE_DIR/cpp-printf-in-cpp.yml" <<'YAML'
+id: cpp.printf-in-cpp
+language: cpp
+rule:
+  any:
+    - pattern: printf($$)
+    - pattern: fprintf($$)
+    - pattern: std::printf($$)
+severity: info
+message: "Prefer std::format/fmt::format or type-safe streams."
+YAML
+
+  # ───── Modules (C++20) & headers ─────────────────────────────────────────
+  cat >"$AST_RULE_DIR/cpp-module-global-fragment-include.yml" <<'YAML'
+id: cpp.module-global-fragment-include
+language: cpp
+rule:
+  pattern: module;
+severity: info
+message: "Global module fragment present; ensure correct include hygiene."
+YAML
+
+  # ───── Misc robustness ───────────────────────────────────────────────────
+  cat >"$AST_RULE_DIR/cpp-non-virtual-dtor-polymorphic.yml" <<'YAML'
+id: cpp.non-virtual-dtor-heuristic
+language: cpp
+rule:
+  pattern: class $C { $$ };
+severity: info
+message: "If class is polymorphic, ensure virtual destructor (heuristic)."
+YAML
+}
+
+run_ast_rules() {
+  [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
+  local outfmt="--json"; [[ "$FORMAT" == "sarif" ]] && outfmt="--sarif"
+  if "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" $outfmt 2>/dev/null; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Category skipping helper
+# ────────────────────────────────────────────────────────────────────────────
+should_skip() {
+  local cat="$1"
+  if [[ -z "$SKIP_CATEGORIES" ]]; then return 0; fi
+  IFS=',' read -r -a arr <<<"$SKIP_CATEGORIES"
+  for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done
+  return 0
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Main Scan Logic
+# ────────────────────────────────────────────────────────────────────────────
+
+maybe_clear
+
+echo -e "${BOLD}${CYAN}"
+cat << 'BANNER'
+╔══════════════════════════════════════════════════════════════════════╗
+║                                                                      ║
+║   ██████╗ ██████╗ ██████╗      ███████╗██████╗  ██████╗              ║
+║  ██╔════╝██╔═══██╗██╔══██╗     ██╔════╝██╔══██╗██╔════╝              ║
+║  ██║     ██║   ██║██████╔╝     █████╗  ██████╔╝██║  ███╗             ║
+║  ██║     ██║   ██║██╔══██╗     ██╔══╝  ██╔══██╗██║   ██║             ║
+║  ╚██████╗╚██████╔╝██████╔╝     ███████╗██║  ██║╚██████╔╝             ║
+║   ╚═════╝ ╚═════╝ ╚═════╝      ╚══════╝╚═╝  ╚═╝ ╚═════╝              ║
+║                                                                      ║
+BANNER
+echo -e "║     ${BOLD}${GREEN}🔬 C++ BUG SCANNER${RESET}${BOLD}${CYAN} v5.0 ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━${CYAN}        ║"
+cat << 'BANNER'
+║                                                                      ║
+║      🎯 Industrial-Grade C++20+ Analysis (AST-Grep + Heuristics)     ║
+║             Catch 1000+ Bug Patterns Before Production               ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+BANNER
+echo -e "${RESET}"
+
+say "${WHITE}Project:${RESET}  ${CYAN}$PROJECT_DIR${RESET}"
+say "${WHITE}Started:${RESET}  ${GRAY}$(eval "$DATE_CMD")${RESET}"
+
+# Count files (robust find; avoid dangling -o)
+EX_PRUNE=()
+for d in "${EXCLUDE_DIRS[@]}"; do EX_PRUNE+=( -name "$d" -o ); done
+EX_PRUNE=( \( -type d \( "${EX_PRUNE[@]}" -false \) -prune \) )
+NAME_EXPR=( \( )
+first=1
+for e in "${_EXT_ARR[@]}"; do
+  if [[ $first -eq 1 ]]; then NAME_EXPR+=( -name "*.${e}" ); first=0
+  else NAME_EXPR+=( -o -name "*.${e}" ); fi
+done
+NAME_EXPR+=( \) )
+TOTAL_FILES=$(
+  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
+  | wc -l | awk '{print $1+0}'
+)
+say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})${RESET}"
+
+# ast-grep availability
+echo ""
+if check_ast_grep; then
+  say "${GREEN}${CHECK} ast-grep available (${AST_GREP_CMD[*]}) - full AST analysis enabled${RESET}"
+  write_ast_rules || true
+else
+  say "${YELLOW}${WARN} ast-grep unavailable - using regex fallback mode${RESET}"
+fi
+
+# relax pipefail for scanning (optional)
+begin_scan_section
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 1: MEMORY & RAII
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 1; then
+print_header "1. MEMORY & RAII"
+print_category "Detects: raw new/delete, C-style casts, const_cast, nullptr misuse, delete[] vs delete" \
+  "Manual memory and unsafe casts are primary sources of UB and leaks"
+
+print_subheader "Raw new allocations (prefer make_unique/make_shared)"
+count=$(
+  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" --pattern "new $T($$)" --lang cpp "$PROJECT_DIR" 2>/dev/null || true ) \
+  | count_lines
+)
+count2=$(
+  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" --pattern "new $T" --lang cpp "$PROJECT_DIR" 2>/dev/null || true ) \
+  | count_lines
+)
+total=$((count + count2))
+if [ "$total" -gt 0 ]; then
+  print_finding "warning" "$total" "Raw new found" "Use std::make_unique / std::make_shared"
+  show_detailed_finding "\bnew[[:space:]]+[A-Za-z_:][A-Za-z0-9_:<>]*" 5
+else
+  print_finding "good" "No raw new detected"
+fi
+
+print_subheader "Manual delete (leaks/double free risk)"
+count=$("${GREP_RN[@]}" -e "delete[[:space:]]*(\[?\]?)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "Manual delete/delete[] present" "Prefer RAII via smart pointers or containers"
+  show_detailed_finding "\bdelete(\[\])?" 5
+else
+  print_finding "good" "No delete/delete[] detected"
+fi
+
+print_subheader "C-style casts"
+count=$("${GREP_RN[@]}" -e "\([[:space:]]*[A-Za-z_][A-Za-z0-9_:<>]*[[:space:]]*\)[[:space:]]*[A-Za-z_\(]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 10 ]; then
+  print_finding "warning" "$count" "C-style casts used" "Use static_cast/dynamic_cast/reinterpret_cast/const_cast"
+  show_detailed_finding "\([[:space:]]*[A-Za-z_][A-Za-z0-9_:<>]*[[:space:]]*\)" 5
+fi
+
+print_subheader "const_cast/reinterpret_cast (dangerous)"
+count=$("${GREP_RN[@]}" -e "const_cast<|reinterpret_cast<" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "Dangerous casts present" "Verify lifetime/aliasing"; fi
+
+print_subheader "NULL/0 used instead of nullptr"
+count=$("${GREP_RN[@]}" -e "(\bNULL\b)|(^|[^:])\b0\b" "$PROJECT_DIR" 2>/dev/null | (grep -v "case 0:" || true) | count_lines)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Use nullptr in C++ code"; fi
+
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 2: EXCEPTIONS & ERROR HANDLING
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 2; then
+print_header "2. EXCEPTIONS & ERROR HANDLING"
+print_category "Detects: throw in destructor, catch by value, deprecated specs, generic throws" \
+  "Exception safety errors cause terminate(), leaks, and slicing"
+
+print_subheader "Throw in destructor"
+count=$(
+  ( [[ "$HAS_AST_GREP" -eq 1 ]] && "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json -r-id cpp.throw-in-destructor 2>/dev/null || true ) | count_lines
+)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "Throwing in destructor" "May call std::terminate during unwinding"
+else
+  print_finding "good" "No throws in destructors"
+fi
+
+print_subheader "Catch by value (prefer const&)"
+count=$("${GREP_RN[@]}" -e "catch[[:space:]]*\([[:space:]]*[A-Za-z_:][A-Za-z0-9_:<>]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\)" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -v "&" || true) | count_lines)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "Catching exceptions by value" "Use 'catch(const T& e)'"
+  show_detailed_finding "catch[[:space:]]*\([^)]+\)" 5
+fi
+
+print_subheader "Deprecated dynamic exception specification"
+count=$("${GREP_RN[@]}" -e "throw[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "Deprecated 'throw(...)' found" "Use noexcept"; fi
+
+print_subheader "Generic throw types"
+count=$("${GREP_RN[@]}" -e "throw[[:space:]]+['\"]|throw[[:space:]]+0|throw[[:space:]]+;?" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Throwing raw values/strings"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 3: CONCURRENCY & ATOMICS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 3; then
+print_header "3. CONCURRENCY & ATOMICS"
+print_category "Detects: manual lock/unlock, async without policy, weak memory orders" \
+  "Concurrency bugs are catastrophic under load and hard to reproduce"
+
+print_subheader "Manual mutex lock/unlock (prefer RAII)"
+lock_count=$("${GREP_RN[@]}" -e "\.lock\(|\.unlock\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$lock_count" -gt 0 ]; then
+  print_finding "warning" "$lock_count" "Manual lock/unlock usage" "Use std::lock_guard/std::unique_lock"
+  show_detailed_finding "\.lock\(|\.unlock\(" 5
+else
+  print_finding "good" "No manual lock/unlock"
+fi
+
+print_subheader "std::async without explicit launch policy"
+count=$("${GREP_RN[@]}" -e "std::async[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -v "std::launch::" || true) | count_lines)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Async without policy (behavior may vary)"; fi
+
+print_subheader "Weak memory-order usage"
+count=$("${GREP_RN[@]}" -e "memory_order_relaxed|memory_order_consume" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Weak memory order in atomics - verify correctness"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 4: MODERNIZATION (C++20+)
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 4; then
+print_header "4. MODERNIZATION (C++20+)"
+print_category "Detects: using-namespace in headers, removed types, bind, nullptr, modules" \
+  "Keeps codebase aligned with modern idioms & readability"
+
+print_subheader "'using namespace std;' especially in headers"
+count=$("${GREP_RN[@]}" -e "using[[:space:]]+namespace[[:space:]]+std" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "using namespace std found" "Avoid polluting global namespace"
+  show_detailed_finding "using[[:space:]]+namespace[[:space:]]+std" 5
+fi
+
+print_subheader "Removed/legacy types: std::auto_ptr"
+count=$("${GREP_RN[@]}" -e "std::auto_ptr<" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "critical" "$count" "std::auto_ptr used (removed)"; fi
+
+print_subheader "std::bind (prefer lambdas)"
+count=$("${GREP_RN[@]}" -e "std::bind[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "std::bind present - lambdas are clearer"; fi
+
+print_subheader "Modules/global module fragment presence"
+count=$("${GREP_RN[@]}" -e "^[[:space:]]*module;|^[[:space:]]*export[[:space:]]+module" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "C++20 Modules in use - verify partition & BMI strategy"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 5: POINTER & LIFETIME HAZARDS (Heuristics)
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 5; then
+print_header "5. POINTER & LIFETIME HAZARDS"
+print_category "Detects: string_view from temporary, return local ref, move-of-const" \
+  "Lifetime bugs compile fine and explode at runtime"
+
+print_subheader "std::string_view from temporary"
+count=$("${GREP_RN[@]}" -e "std::string_view[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -v "&" || true) | count_lines)
+if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "Potential dangling string_view (heuristic)"; fi
+
+print_subheader "Returning reference/value risks (heuristic)"
+count=$("${GREP_RN[@]}" -e "return[[:space:]]*&[[:space:]]*[A-Za-z_]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "Return by reference - verify lifetime"; fi
+
+print_subheader "std::move on const"
+count=$("${GREP_RN[@]}" -e "std::move[[:space:]]*\([^)]*\bconst\b" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "std::move(const T) is a copy, not a move"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 6: NUMERIC & ARITHMETIC PITFALLS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 6; then
+print_header "6. NUMERIC & ARITHMETIC PITFALLS"
+print_category "Detects: division by variable, integer overflow-prone code, fp equality" \
+  "Silent overflows/fp comparisons trigger logic bugs and UB"
+
+print_subheader "Division by variable (check non-zero)"
+count=$("${GREP_RN[@]}" -e "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -Ev "/[[:space:]]*(2|10|100|1000)\b|//|/\*" || true) | count_lines)
+if [ "$count" -gt 15 ]; then
+  print_finding "warning" "$count" "Division by variable - add guards"
+  show_detailed_finding "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" 5
+fi
+
+print_subheader "Floating-point equality checks"
+count=$("${GREP_RN[@]}" -e "(==|===)[[:space:]]*[0-9]+\.[0-9]+" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 3 ]; then print_finding "info" "$count" "Floating-point equality - prefer epsilon comparison"; fi
+
+print_subheader "Modulo by variable"
+count=$("${GREP_RN[@]}" -e "%[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 10 ]; then print_finding "info" "$count" "Modulo by variable - ensure non-zero"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 7: UNDEFINED BEHAVIOR RISK ZONE
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 7; then
+print_header "7. UNDEFINED BEHAVIOR RISK ZONE"
+print_category "Detects: dangerous casts, unsafe C APIs, dangling, delete mismatch" \
+  "UB can pass tests and still crash in production"
+
+print_subheader "Dangerous functions (strcpy/gets/scanf/sprintf)"
+count=$("${GREP_RN[@]}" -e "\b(gets|strcpy|strcat|sprintf|scanf)\s*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "Unsafe C APIs present" "Use safer std/fmt equivalents"
+  show_detailed_finding "\b(gets|strcpy|strcat|sprintf|scanf)\s*\(" 5
+else
+  print_finding "good" "No unsafe C APIs found"
+fi
+
+print_subheader "reinterpret_cast/const_cast occurrences"
+count=$("${GREP_RN[@]}" -e "reinterpret_cast<|const_cast<" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 5 ]; then print_finding "warning" "$count" "Many low-level casts - scrutinize for UB"; fi
+
+print_subheader "delete vs delete[] mismatch (heuristic)"
+count=$("${GREP_RN[@]}" -e "delete\s*\[?\]?\s*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 2 ]; then print_finding "info" "$count" "Verify delete/delete[] matches allocation form"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 8: HEADER & INCLUDE HYGIENE
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 8; then
+print_header "8. HEADER & INCLUDE HYGIENE"
+print_category "Detects: using-namespace in headers, C headers, excessive includes, pragma once" \
+  "Header hygiene prevents ODR violations and compile-time blow-ups"
+
+print_subheader "Header guards or #pragma once missing (heuristic)"
+count=$(
+  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.hh" -o -name "*.hxx" \) -print \) | \
+    xargs -r -I{} sh -c 'head -n 5 "{}" | grep -Eq "#pragma once|#ifndef|#if !defined" || echo "{}"' 2>/dev/null || true ) | count_lines
+)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "Headers missing guard/#pragma once (heuristic)"
+fi
+
+print_subheader "C headers included in C++"
+count=$("${GREP_RN[@]}" -e "#include[[:space:]]*<stdio.h>|<stdlib.h>|<string.h>|<math.h>" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Prefer <cstdio>/<cstdlib>/<cstring>/<cmath>"; fi
+
+print_subheader "using namespace std in headers"
+count=$(
+  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.hh" -o -name "*.hxx" \) -print \) | \
+    xargs -r "${GREP_RN[@]}" -e "using[[:space:]]+namespace[[:space:]]+std" 2>/dev/null || true ) | count_lines
+)
+if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "using namespace std in headers is harmful"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 9: STL & ALGORITHMS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 9; then
+print_header "9. STL & ALGORITHMS"
+print_category "Detects: erase invalidation, std::move misuse, std::bind, raw loops" \
+  "Make idiomatic use of algorithms to reduce bugs"
+
+print_subheader "erase while iterating (invalidates iterators)"
+count=$("${GREP_RN[@]}" -e "\.erase\([[:space:]]*[A-Za-z_]|\.erase\([[:space:]]*begin|\.erase\([[:space:]]*end" "$PROJECT_DIR" 2>/dev/null | count_lines)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Verify loop structure when erasing from containers"; fi
+
+print_subheader "Manual loops where algorithm fits (heuristic)"
+count=$("${GREP_RN[@]}" -e "for[[:space:]]*\([^)]+;[^^:]*;[^\)]+\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 20 ]; then print_finding "info" "$count" "Consider ranges/algorithms instead of index loops"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 10: STRING & I/O SAFETY
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 10; then
+print_header "10. STRING & I/O SAFETY"
+print_category "Detects: printf-family, dangerous scanf formats, fmt migration" \
+  "Type-safety and format correctness prevent latent crashes"
+
+print_subheader "printf/scanf/sprintf family usage"
+count=$("${GREP_RN[@]}" -e "\b(printf|fprintf|sprintf|snprintf|scanf|sscanf)\s*\(" "$PROJECT_DIR" 2>/dev/null | count_lines)
+if [ "$count" -gt 0 ]; then
+  print_finding "info" "$count" "C-format APIs in C++" "Prefer std::format/fmt for type-safe formatting"
+  show_detailed_finding "\b(printf|fprintf|sprintf|snprintf|scanf|sscanf)\s*\(" 5
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 11: MACROS & PREPROCESSOR TRAPS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 11; then
+print_header "11. MACROS & PREPROCESSOR TRAPS"
+print_category "Detects: min/max macros, debug leftovers, macro side effects" \
+  "Macros can silently rewrite code and cause ODR/symbol issues"
+
+print_subheader "min/max macro definitions"
+count=$("${GREP_RN[@]}" -e "#[[:space:]]*define[[:space:]]+min\(|#[[:space:]]*define[[:space:]]+max\(" "$PROJECT_DIR" 2>/dev/null | count_lines)
+if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "min/max macros detected - conflict with std::min/std::max"; fi
+
+print_subheader "DEBUG/TRACE macros enabled (heuristic)"
+count=$("${GREP_RN[@]}" -e "#[[:space:]]*define[[:space:]]+(DEBUG|TRACE|VERBOSE)" "$PROJECT_DIR" 2>/dev/null | count_lines)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Debug macros enabled"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 12: CMAKE & BUILD HYGIENE
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 12; then
+print_header "12. CMAKE & BUILD HYGIENE"
+print_category "Detects: non-C++20 standard settings, missing warnings, no sanitizers, RTTI/exceptions flags" \
+  "Build settings are part of correctness and performance"
+
+print_subheader "CMAKE_CXX_STANDARD and target_compile_features"
+cxxstd=$("${GREP_RN[@]}" -e "CMAKE_CXX_STANDARD|target_compile_features" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$cxxstd" -eq 0 ]; then
+  print_finding "warning" 1 "CMake lacks explicit C++ standard settings" "Set CMAKE_CXX_STANDARD 20 and/or target_compile_features(... cxx_std_20)"
+else
+  print_finding "info" "$cxxstd" "C++ standard declarations present"
+fi
+
+print_subheader "Warnings enabled (-Wall -Wextra -Wpedantic)"
+warns=$("${GREP_RN[@]}" -e "(-Wall|-Wextra|-Wpedantic)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$warns" -eq 0 ]; then print_finding "info" 1 "No common warnings in CMake found"; else print_finding "good" "Common warnings appear enabled"; fi
+
+print_subheader "Sanitizers configured (ASan/UBSan)"
+san=$("${GREP_RN[@]}" -e "fsanitize=address|fsanitize=undefined" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$san" -eq 0 ]; then print_finding "info" 1 "No sanitizers detected in CMake"; else print_finding "good" "Sanitizers appear configured"; fi
+
+print_subheader "Exceptions/RTTI disabled?"
+flags=$("${GREP_RN[@]}" -e "fno-exceptions|fno-rtti" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$flags" -gt 0 ]; then print_finding "info" "$flags" "fno-exceptions/RTTI used - verify library requirements"; fi
+
+print_subheader "Position Independent Code and LTO (optional)"
+pic=$("${GREP_RN[@]}" -e "POSITION_INDEPENDENT_CODE|-fPIC" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+lto=$("${GREP_RN[@]}" -e "INTERPROCEDURAL_OPTIMIZATION|flto" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$pic" -eq 0 ]; then print_finding "info" 1 "PIC not detected (fine for static, check for shared libs)"; fi
+if [ "$lto" -eq 0 ]; then print_finding "info" 1 "LTO not detected (optional)"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 13: CODE QUALITY MARKERS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 13; then
+print_header "13. CODE QUALITY MARKERS"
+print_category "Detects: TODO, FIXME, HACK, XXX comments" \
+  "Technical debt markers indicate areas needing attention"
+
+todo_count=$("${GREP_RNI[@]}" "TODO" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+fixme_count=$("${GREP_RNI[@]}" "FIXME" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+hack_count=$("${GREP_RNI[@]}" "HACK" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+xxx_count=$("${GREP_RNI[@]}" "XXX" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+note_count=$("${GREP_RNI[@]}" "NOTE" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+
+total_markers=$((todo_count + fixme_count + hack_count + xxx_count))
+if [ "$total_markers" -gt 20 ]; then
+  print_finding "warning" "$total_markers" "Significant technical debt" "Create tracking tickets"
+elif [ "$total_markers" -gt 10 ]; then
+  print_finding "info" "$total_markers" "Moderate technical debt"
+elif [ "$total_markers" -gt 0 ]; then
+  print_finding "info" "$total_markers" "Minimal technical debt"
+else
+  print_finding "good" "No technical debt markers"
+fi
+if [ "$total_markers" -gt 0 ]; then
+  say "\n  ${DIM}Breakdown:${RESET}"
+  [ "$todo_count" -gt 0 ] && say "    ${YELLOW}TODO:${RESET}  $todo_count"
+  [ "$fixme_count" -gt 0 ] && say "    ${RED}FIXME:${RESET} $fixme_count"
+  [ "$hack_count" -gt 0 ] && say "    ${MAGENTA}HACK:${RESET}  $hack_count"
+  [ "$xxx_count" -gt 0 ] && say "    ${RED}XXX:${RESET}   $xxx_count"
+  [ "$note_count" -gt 0 ] && say "    ${BLUE}NOTE:${RESET}  $note_count"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 14: PERFORMANCE & ALLOCATION PRESSURE
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 14; then
+print_header "14. PERFORMANCE & ALLOCATION PRESSURE"
+print_category "Detects: tight-loop string concatenation, many small allocations, I/O in loops" \
+  "Performance bugs degrade latency and throughput"
+
+print_subheader "String concatenation in tight loops (+=)"
+count=$("${GREP_RN[@]}" -e "for|while" "$PROJECT_DIR" 2>/dev/null | (grep -A3 "\+=" || true) | (grep -cw "\+=" || true))
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 8 ]; then print_finding "info" "$count" "String += in loops - consider reserve/ostringstream/fmt::memory_buffer"; fi
+
+print_subheader "I/O in loops (heuristic)"
+count=$("${GREP_RN[@]}" -e "for|while" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A5 "std::cout|std::cerr|printf|fprintf|std::printf" || true) | (grep -c -E "cout|cerr|printf" || true))
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 5 ]; then print_finding "info" "$count" "I/O inside loops - buffer or batch"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 15: TEST/DEBUG LEFTOVERS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 15; then
+print_header "15. TEST/DEBUG LEFTOVERS"
+print_category "Detects: assert/abort left enabled, debug prints" \
+  "Debug artifacts can affect performance and user experience"
+
+print_subheader "assert/abort present"
+count=$("${GREP_RN[@]}" -e "\bassert\s*\(|\babort\s*\(" "$PROJECT_DIR" 2>/dev/null | count_lines)
+if [ "$count" -gt 50 ]; then print_finding "warning" "$count" "Many asserts/abort calls - ensure controlled by NDEBUG"; fi
+
+print_subheader "Debug prints (std::cout/cerr)"
+cout_count=$("${GREP_RN[@]}" -e "std::cout|std::cerr" "$PROJECT_DIR" 2>/dev/null | count_lines)
+if [ "$cout_count" -gt 50 ]; then print_finding "info" "$cout_count" "Many std::cout/cerr statements - consider a logging library"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AST-GREP RULE PACK FINDINGS (JSON/SARIF passthrough)
+# ═══════════════════════════════════════════════════════════════════════════
+if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
+  print_header "AST-GREP RULE PACK FINDINGS"
+  if [[ "$FORMAT" == "json" || "$FORMAT" == "sarif" ]]; then
+    run_ast_rules || say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
+    say "${DIM}${INFO} Above lines are ast-grep matches (id, message, severity, file/pos).${RESET}"
+  else
+    # Show short textual summary by running JSON and summarizing counts by id.
+    tmp_json="$(mktemp)"
+    if run_ast_rules >"$tmp_json"; then
+      say "${DIM}${INFO} ast-grep produced structured matches. Showing brief tally by rule id:${RESET}"
+      # naive tally (jq-free): extract "id":"...".
+      ids=$(grep -o '"id"[:][ ]*"[^"]*"' "$tmp_json" | sed -E 's/.*"id"[ ]*:[ ]*"([^"]*)".*/\1/' || true)
+      if [[ -n "$ids" ]]; then
+        printf "%s\n" "$ids" | sort | uniq -c | awk '{printf "  • %-40s %5d\n",$2,$1}'
+      else
+        say "  (no matches)"
+      fi
+    else
+      say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
+    fi
+    rm -f "$tmp_json" || true
+  fi
+fi
+
+# restore pipefail if we relaxed it
+end_scan_section
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
+say "${BOLD}${CYAN}                    🎯 SCAN COMPLETE 🎯                                  ${RESET}"
+say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
+echo ""
+
+say "${WHITE}${BOLD}Summary Statistics:${RESET}"
+say "  ${WHITE}Files scanned:${RESET}    ${CYAN}$TOTAL_FILES${RESET}"
+say "  ${RED}${BOLD}Critical issues:${RESET}  ${RED}$CRITICAL_COUNT${RESET}"
+say "  ${YELLOW}Warning issues:${RESET}   ${YELLOW}$WARNING_COUNT${RESET}"
+say "  ${BLUE}Info items:${RESET}       ${BLUE}$INFO_COUNT${RESET}"
+echo ""
+
+say "${BOLD}${WHITE}Priority Actions:${RESET}"
+if [ "$CRITICAL_COUNT" -gt 0 ]; then
+  say "  ${RED}${FIRE} ${BOLD}FIX CRITICAL ISSUES IMMEDIATELY${RESET}"
+  say "  ${DIM}These cause crashes, security vulnerabilities, or data corruption${RESET}"
+fi
+if [ "$WARNING_COUNT" -gt 0 ]; then
+  say "  ${YELLOW}${WARN} ${BOLD}Review and fix WARNING items${RESET}"
+  say "  ${DIM}These cause bugs, performance issues, or maintenance problems${RESET}"
+fi
+if [ "$INFO_COUNT" -gt 0 ]; then
+  say "  ${BLUE}${INFO} ${BOLD}Consider INFO suggestions${RESET}"
+  say "  ${DIM}Code quality improvements and best practices${RESET}"
+fi
+
+if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$WARNING_COUNT" -eq 0 ]; then
+  say "\n  ${GREEN}${BOLD}${SPARKLE} EXCELLENT! No critical or warning issues found ${SPARKLE}${RESET}"
+fi
+
+echo ""
+say "${DIM}Scan completed at: $(eval "$DATE_CMD")${RESET}"
+
+if [[ -n "$OUTPUT_FILE" ]]; then
+  say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
+fi
+
+echo ""
+if [ "$VERBOSE" -eq 0 ]; then
+  say "${DIM}Tip: Run with -v/--verbose for more code samples per finding.${RESET}"
+fi
+say "${DIM}Add to pre-commit: ./cpp-bug-scanner.sh --ci --fail-on-warning . > cpp-scan-report.txt${RESET}"
+echo ""
+
+EXIT_CODE=0
+if [ "$CRITICAL_COUNT" -gt 0 ]; then EXIT_CODE=1; fi
+if [ "$FAIL_ON_WARNING" -eq 1 ] && [ $((CRITICAL_COUNT + WARNING_COUNT)) -gt 0 ]; then EXIT_CODE=1; fi
+exit "$EXIT_CODE"

@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# UBS Meta-Runner (v1.0)
+# Unified dispatcher for Ultimate Bug Scanner across JS/TS, Python, C++, Rust
+# - Detects languages
+# - Ensures modules (lazy download)
+# - Runs modules concurrently
+# - Merges outputs (text/json/sarif) with jq
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -Eeuo pipefail
+shopt -s lastpipe || true
+trap '' SIGPIPE 2>/dev/null || true
+
+UBS_VERSION="1.0"
+REPO_RAW="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main"
+MODULE_PATH_TEMPLATE="$REPO_RAW/modules/ubs-%s.sh"
+
+# Colors (respect NO_COLOR or non-tty)
+if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then
+  RED= GREEN= YELLOW= BLUE= MAGENTA= CYAN= WHITE= GRAY= BOLD= DIM= RESET=
+else
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+  BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+fi
+CHECK="✓"; WARN="⚠"; INFO="ℹ"; X="✗"
+say(){ echo -e "$*"; }
+
+on_err(){ local ec=$? ln=${BASH_LINENO[0]:-?} cmd=${BASH_COMMAND:-?}; say "${RED}${BOLD}Error${RESET}${DIM} (exit $ec)${RESET} ${WHITE}line $ln:${RESET} $cmd"; exit $ec; }
+trap on_err ERR
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+PROJECT_DIR="."
+FORMAT="text"              # text|json|sarif
+CI_MODE=0
+FAIL_ON_WARNING=0
+VERBOSE=0
+ONLY_LANGS=""              # csv: js,python,cpp,rust
+EXCLUDE_LANGS=""           # csv
+MODULE_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
+MODULE_DIR="$MODULE_DIR_DEFAULT"
+UPDATE_MODULES=0
+JOBS="${JOBS:-0}"
+
+usage() {
+  cat <<USAGE >&2
+Usage: ubs [options] [PROJECT_DIR]
+
+Options:
+  --format=FMT            text|json|sarif (default: text)
+  --ci                    CI mode (stable timestamps)
+  --fail-on-warning       Exit non-zero if warnings or critical exist
+  -v, --verbose           Pass -v to child scanners (if supported)
+  --only=CSV              Restrict to languages: js,python,cpp,rust
+  --exclude=CSV           Exclude languages
+  --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
+  --update-modules        Force re-download of modules before run
+  --jobs=N                Parallelism hint (passed to children if supported)
+  -h, --help              Show this help
+
+Examples:
+  ubs .                       # auto-detect languages and scan
+  ubs --format=json --ci .    # machine-readable combined JSON
+  ubs --only=js,python .      # restrict language set
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --format=*) FORMAT="${1#*=}"; shift;;
+    --ci) CI_MODE=1; shift;;
+    --fail-on-warning) FAIL_ON_WARNING=1; shift;;
+    -v|--verbose) VERBOSE=1; shift;;
+    --only=*) ONLY_LANGS="${1#*=}"; shift;;
+    --exclude=*) EXCLUDE_LANGS="${1#*=}"; shift;;
+    --module-dir=*) MODULE_DIR="${1#*=}"; shift;;
+    --update-modules) UPDATE_MODULES=1; shift;;
+    --jobs=*) JOBS="${1#*=}"; shift;;
+    -h|--help) usage; exit 0;;
+    *)
+      if [[ "$PROJECT_DIR" == "." ]]; then PROJECT_DIR="$1"; else usage; exit 2; fi
+      shift;;
+  esac
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Capabilities & helpers
+# ─────────────────────────────────────────────────────────────────────────────
+need_cmd(){ command -v "$1" >/dev/null 2>&1; }
+date_iso(){ if [[ "$CI_MODE" -eq 1 ]]; then date -u '+%Y-%m-%dT%H:%M:%SZ'; else date '+%Y-%m-%d %H:%M:%S'; fi; }
+
+ensure_dir(){ mkdir -p "$1" 2>/dev/null || { say "${RED}$X cannot create $1${RESET}"; exit 1; }; }
+
+script_dir(){ local src="${BASH_SOURCE[0]}"; while [ -h "$src" ]; do src="$(readlink "$src")"; done; cd -P "$(dirname "$src")" && pwd; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Language catalog
+# ─────────────────────────────────────────────────────────────────────────────
+ALL_LANGS=(js python cpp rust)
+
+# Detectors (fast ripgrep if available, else find)
+detect_lang(){
+  local lang="$1" found=1
+  case "$lang" in
+    js)
+      if need_cmd rg; then
+        rg -q --hidden -g '!node_modules/**' -g '!dist/**' -g '!build/**' -g '!coverage/**' -g '!*.min.*' \
+           -g '*.{js,jsx,ts,tsx,mjs,cjs}' -g 'package.json' . "$PROJECT_DIR" 2>/dev/null && found=0
+      else
+        find "$PROJECT_DIR" \( -name node_modules -o -name dist -o -name build -o -name coverage -o -name .git \) -prune -o \
+          -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' -o -name '*.mjs' -o -name '*.cjs' -o -name 'package.json' \) -print -quit 2>/dev/null | grep -q . && found=0
+      fi
+      ;;
+    python)
+      if need_cmd rg; then
+        rg -q --hidden -g '!venv/**' -g '!**/__pycache__/**' -g '!build/**' -g '!dist/**' \
+           -g '*.py' -g 'pyproject.toml' -g 'requirements.txt' -g 'setup.py' . "$PROJECT_DIR" 2>/dev/null && found=0
+      else
+        find "$PROJECT_DIR" \( -name venv -o -name __pycache__ -o -name build -o -name dist -o -name .git \) -prune -o \
+          -type f \( -name '*.py' -o -name 'pyproject.toml' -o -name 'requirements.txt' -o -name 'setup.py' \) -print -quit 2>/dev/null | grep -q . && found=0
+      fi
+      ;;
+    cpp)
+      if need_cmd rg; then
+        rg -q --hidden -g '!build/**' -g '!out/**' -g '!**/.cache/**' \
+           -g '*.{c,cc,cpp,cxx,h,hh,hpp,hxx}' -g 'CMakeLists.txt' -g 'compile_commands.json' . "$PROJECT_DIR" 2>/dev/null && found=0
+      else
+        find "$PROJECT_DIR" \( -name build -o -name out -o -name .cache -o -name .git \) -prune -o \
+          -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.h' -o -name '*.hh' -o -name '*.hpp' -o -name '*.hxx' -o -name 'CMakeLists.txt' -o -name 'compile_commands.json' \) -print -quit 2>/dev/null | grep -q . && found=0
+      fi
+      ;;
+    rust)
+      if need_cmd rg; then
+        rg -q --hidden -g '!target/**' -g '!**/.cargo/**' -g '*.rs' -g 'Cargo.toml' . "$PROJECT_DIR" 2>/dev/null && found=0
+      else
+        find "$PROJECT_DIR" \( -name target -o -name .cargo -o -name .git \) -prune -o \
+          -type f \( -name '*.rs' -o -name 'Cargo.toml' \) -print -quit 2>/dev/null | grep -q . && found=0
+      fi
+      ;;
+  esac
+  return $found
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module resolution & download
+# ─────────────────────────────────────────────────────────────────────────────
+resolve_module_path(){
+  local lang="$1"
+  local base="ubs-$lang"
+  local sd md
+  sd="$(script_dir)"
+  md="$MODULE_DIR"
+  # Priority: PATH → local modules/ → XDG module dir
+  if command -v "$base" >/dev/null 2>&1; then echo "$(command -v "$base")"; return 0; fi
+  if [ -x "$sd/modules/$base.sh" ]; then echo "$sd/modules/$base.sh"; return 0; fi
+  if [ -x "$md/$base.sh" ]; then echo "$md/$base.sh"; return 0; fi
+  echo "$md/$base.sh"
+}
+
+download_module(){
+  local lang="$1" path="$2"
+  ensure_dir "$(dirname "$path")"
+  local url; url=$(printf "$MODULE_PATH_TEMPLATE" "$lang")
+  say "${BLUE}${INFO}${RESET} fetching module ${BOLD}$lang${RESET} → ${DIM}$path${RESET}"
+  if need_cmd curl; then
+    curl -fsSL "$url" -o "$path"
+  elif need_cmd wget; then
+    wget -q "$url" -O "$path"
+  else
+    say "${RED}$X neither curl nor wget available${RESET}"; return 1
+  fi
+  # sanity checks
+  if [ ! -s "$path" ]; then say "${RED}$X empty module file for $lang${RESET}"; return 1; fi
+  local head; head="$(head -n 1 "$path" | tr -d '\r')"
+  if [[ ! "$head" =~ ^#! ]]; then say "${RED}$X module missing shebang (lang=$lang)${RESET}"; return 1; fi
+  chmod +x "$path" || true
+  return 0
+}
+
+ensure_module(){
+  local lang="$1" path="$2"
+  if [ "$UPDATE_MODULES" -eq 1 ] || [ ! -x "$path" ]; then
+    download_module "$lang" "$path" || return 1
+  fi
+  return 0
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Execution / aggregation
+# ─────────────────────────────────────────────────────────────────────────────
+TMPDIR_RUN="$(mktemp -d 2>/dev/null || mktemp -d -t ubsrun.XXXXXX)"
+cleanup(){ rm -rf "$TMPDIR_RUN" || true; }
+trap cleanup EXIT
+
+# Build selected language set
+select_langs(){
+  local detected=()
+  for L in "${ALL_LANGS[@]}"; do
+    detect_lang "$L" && detected+=("$L")
+  done
+  # apply --only / --exclude
+  local filtered=() i
+  if [[ -n "$ONLY_LANGS" ]]; then
+    IFS=',' read -r -a want <<<"$ONLY_LANGS"
+    for i in "${detected[@]}"; do
+      for w in "${want[@]}"; do [[ "$i" == "$w" ]] && filtered+=("$i"); done
+    done
+  else
+    filtered=("${detected[@]}")
+  fi
+  if [[ -n "$EXCLUDE_LANGS" ]]; then
+    IFS=',' read -r -a drop <<<"$EXCLUDE_LANGS"
+    local keep=()
+    for i in "${filtered[@]}"; do
+      local skip=0; for d in "${drop[@]}"; do [[ "$i" == "$d" ]] && skip=1; done
+      [[ $skip -eq 0 ]] && keep+=("$i")
+    done
+    filtered=("${keep[@]}")
+  fi
+  echo "${filtered[@]}"
+}
+
+# Run a module job
+run_lang(){
+  local lang="$1" module="$2" fmt="$3"
+  local out_txt="$TMPDIR_RUN/$lang.txt"
+  local out_json="$TMPDIR_RUN/$lang.json"
+  local out_sarif="$TMPDIR_RUN/$lang.sarif"
+  local err="$TMPDIR_RUN/$lang.err"
+
+  local args=("$PROJECT_DIR" "--ci")
+  [[ "$FAIL_ON_WARNING" -eq 1 ]] && args+=("--fail-on-warning")
+  [[ "$VERBOSE" -eq 1 ]] && args+=('-v')
+  [[ "$JOBS" -gt 0 ]] && args+=("--jobs=$JOBS")
+
+  case "$fmt" in
+    json)
+      # attempt native JSON
+      if "$module" "${args[@]}" --format=json >"$out_json" 2>"$err"; then
+        if need_cmd jq && jq -e . "$out_json" >/dev/null 2>&1; then
+          jq --arg language "$lang" '. + {language: $language}' "$out_json" > "$out_json.tmp" && mv "$out_json.tmp" "$out_json"
+          return 0
+        fi
+      fi
+      # fallback to text, then parse counts
+      "$module" "${args[@]}" >"$out_txt" 2>>"$err" || true
+      parse_text_to_json "$lang" "$out_txt" "$out_json"
+      ;;
+    sarif)
+      if "$module" "${args[@]}" --format=sarif >"$out_sarif" 2>"$err"; then
+        # accept raw SARIF or sarifLog-wrapped
+        if need_cmd jq && jq -e . "$out_sarif" >/dev/null 2>&1; then
+          return 0
+        fi
+      fi
+      # Fallback: produce a minimal SARIF summary from parsed text
+      "$module" "${args[@]}" >"$out_txt" 2>>"$err" || true
+      minimal_sarif_from_text "$lang" "$out_txt" >"$out_sarif"
+      ;;
+    text|*)
+      "$module" "${args[@]}" >"$out_txt" 2>"$err" || true
+      ;;
+  esac
+}
+
+# Parse legacy text logs → JSON summary (robust to colors)
+parse_text_to_json(){
+  local lang="$1" txt="$2" json="$3"
+  local critical=0 warning=0 info=0 files=0
+  # Strip ANSI, normalize
+  local cleaned; cleaned="$(sed -E 's/\x1B\[[0-9;]*[mK]//g' "$txt" | tr -d '\r')"
+  critical=$(printf '%s\n' "$cleaned" | grep -E 'Critical issues:|CRITICAL' | grep -Eo '[0-9]+' | tail -n1 || true)
+  warning=$(printf '%s\n' "$cleaned" | grep -E 'Warning issues:|Warning' | grep -Eo '[0-9]+' | tail -n1 || true)
+  info=$(printf '%s\n' "$cleaned" | grep -E 'Info items:|Info' | grep -Eo '[0-9]+' | tail -n1 || true)
+  files=$(printf '%s\n' "$cleaned" | grep -E 'Files scanned:' | grep -Eo '[0-9]+' | tail -n1 || true)
+  critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; files=${files:-0}
+  cat >"$json" <<JSON
+{"language":"$lang","project":"$PROJECT_DIR","files":$files,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
+JSON
+}
+
+minimal_sarif_from_text(){
+  local lang="$1" txt="$2"
+  local critical=0 warning=0 info=0
+  local cleaned; cleaned="$(sed -E 's/\x1B\[[0-9;]*[mK]//g' "$txt" | tr -d '\r')"
+  critical=$(printf '%s\n' "$cleaned" | grep -E 'Critical issues:|CRITICAL' | grep -Eo '[0-9]+' | tail -n1 || true)
+  warning=$(printf '%s\n' "$cleaned" | grep -E 'Warning issues:|Warning' | grep -Eo '[0-9]+' | tail -n1 || true)
+  info=$(printf '%s\n' "$cleaned" | grep -E 'Info items:|Info' | grep -Eo '[0-9]+' | tail -n1 || true)
+  cat <<SARIF
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"UBS ($lang)","informationUri":"https://github.com/Dicklesworthstone/ultimate_bug_scanner"}},"results":[
+  {"ruleId":"summary.critical","level":"error","message":{"text":"$critical critical findings"}},
+  {"ruleId":"summary.warning","level":"warning","message":{"text":"$warning warnings"}},
+  {"ruleId":"summary.info","level":"note","message":{"text":"$info info items"}}
+]}]}
+SARIF
+}
+
+merge_json_scanners(){
+  local jsons=( "$TMPDIR_RUN"/*.json )
+  if ! need_cmd jq; then
+    say "${YELLOW}${WARN}${RESET} jq not found; cannot emit combined JSON"; return 1
+  fi
+  jq -s --arg project "$PROJECT_DIR" --arg ts "$(date_iso)" '
+    def nz(x): if (x|type)=="number" then x else 0 end;
+    {project:$project, timestamp:$ts, scanners: .,
+     totals:{
+       critical: (map(.critical // 0) | add),
+       warning:  (map(.warning  // 0) | add),
+       info:     (map(.info     // 0) | add),
+       files:    (map(.files    // 0) | add)
+     }}' "${jsons[@]}"
+}
+
+merge_sarif_runs(){
+  local sarifs=( "$TMPDIR_RUN"/*.sarif )
+  if ! need_cmd jq; then
+    say "${YELLOW}${WARN}${RESET} jq not found; cannot merge SARIF; printing first artifact"; cat "${sarifs[0]}"; return 0
+  fi
+  # Accept either raw SARIF root or wrapped under "sarifLog"
+  jq -s '
+    def toRuns(x):
+      if x.sarifLog? then x.sarifLog.runs
+      elif x.version? and x.runs? then x.runs
+      else [] end;
+    {"version":"2.1.0","runs": (map(toRuns(.)) | add)}' "${sarifs[@]}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Banner & preflight
+# ─────────────────────────────────────────────────────────────────────────────
+say "${BOLD}${CYAN}"
+cat <<'BANNER'
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ███    ██ ███████ ███████ ███    ███  ██████  ████████  █████╗              ║
+║  ████   ██ ██      ██      ████  ████ ██    ██    ██    ██   ██             ║
+║  ██ ██  ██ ███████ █████   ██ ████ ██ ██    ██    ██    ███████             ║
+║  ██  ██ ██      ██ ██      ██  ██  ██ ██    ██    ██    ██   ██             ║
+║  ██   ████ ███████ ███████ ██      ██  ██████     ██    ██   ██   META      ║
+║                                                                              ║
+║  JS / TS • PYTHON • C / C++ • RUST • (more langs on deck)                    ║
+║  Multi-agent static analysis with ANSI lasers & SARIF fusion ☄️              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+BANNER
+say "${RESET}"
+say "${CYAN}${BOLD}UBS Meta-Runner v${UBS_VERSION}${RESET}  ${DIM}$(date_iso)${RESET}"
+say "${WHITE}Project:${RESET} ${CYAN}$PROJECT_DIR${RESET}"
+say "${WHITE}Format:${RESET}  ${CYAN}$FORMAT${RESET}"
+
+langs=( $(select_langs) )
+if [[ ${#langs[@]} -eq 0 ]]; then say "${YELLOW}${WARN}${RESET} no recognizable languages in ${PROJECT_DIR}"; exit 0; fi
+say "${WHITE}Detected:${RESET} ${CYAN}${langs[*]}${RESET}"
+
+# Resolve & ensure modules
+declare -A MODULE_PATHS
+for L in "${langs[@]}"; do
+  p="$(resolve_module_path "$L")"
+  ensure_module "$L" "$p" || { say "${RED}$X failed to ensure module for $L${RESET}"; exit 1; }
+  MODULE_PATHS["$L"]="$p"
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Execute modules concurrently
+# ─────────────────────────────────────────────────────────────────────────────
+pids=()
+for L in "${langs[@]}"; do
+  run_lang "$L" "${MODULE_PATHS[$L]}" "$FORMAT" &
+  pids+=($!)
+done
+
+# Wait & collect statuses
+status=0
+for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Emit unified result
+# ─────────────────────────────────────────────────────────────────────────────
+case "$FORMAT" in
+  json)
+    merge_json_scanners || { say "${RED}$X could not produce combined JSON${RESET}"; status=1; }
+    ;;
+  sarif)
+    merge_sarif_runs
+    ;;
+  text|*)
+    for L in "${langs[@]}"; do
+      say "\n${MAGENTA}${BOLD}──────── $L ────────${RESET}"
+      if [ -s "$TMPDIR_RUN/$L.txt" ]; then
+        cat "$TMPDIR_RUN/$L.txt"
+      elif [ -s "$TMPDIR_RUN/$L.json" ]; then
+        say "${DIM}[json summary]${RESET}"
+        cat "$TMPDIR_RUN/$L.json"
+      elif [ -s "$TMPDIR_RUN/$L.sarif" ]; then
+        say "${DIM}[sarif summary]${RESET}"
+        cat "$TMPDIR_RUN/$L.sarif"
+      fi
+    done
+    # Combined human summary (if JSON pieces exist)
+    if need_cmd jq && ls "$TMPDIR_RUN"/*.json >/dev/null 2>&1; then
+      say "\n${WHITE}${BOLD}──────── Combined Summary ────────${RESET}"
+      merge_json_scanners | jq -r '
+        "Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"'
+      totals=$(merge_json_scanners | jq -r '.totals')
+      crit=$(printf '%s' "$totals" | jq -r '.critical')
+      warn=$(printf '%s' "$totals" | jq -r '.warning')
+      if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then status=1; fi
+      if [[ "$FAIL_ON_WARNING" -eq 0 && $crit -gt 0 ]]; then status=1; fi
+    fi
+    ;;
+esac
+
+exit "$status"

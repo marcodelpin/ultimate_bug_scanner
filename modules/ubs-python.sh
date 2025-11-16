@@ -1,0 +1,1422 @@
+#!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════════════
+# PYTHON ULTIMATE BUG SCANNER v1.0 (Bash) - Industrial-Grade Code Analysis
+# ═══════════════════════════════════════════════════════════════════════════
+# Comprehensive static analysis for modern Python (3.13+) using:
+#   • ast-grep (rule packs; language: python)
+#   • ripgrep/grep heuristics for fast code smells
+#   • optional uv-powered extra analyzers (ruff, bandit, pip-audit)
+#
+# Focus:
+#   • None/defensive checks   • exceptions & error handling
+#   • async/await pitfalls    • security & supply-chain risks
+#   • subprocess misuse       • I/O & resource handling
+#   • typing hygiene          • regex safety (ReDoS)
+#   • code quality markers    • performance & style hazards
+#
+# Supports:
+#   --format text|json|sarif (ast-grep passthrough for json/sarif)
+#   --rules DIR   (merge user ast-grep rules)
+#   --fail-on-warning, --skip, --jobs, --include-ext, --exclude, --ci, --no-color
+#   CI-friendly timestamps, robust find, safe pipelines, auto parallel jobs
+#
+# Heavily leverages ast-grep for Python via rule packs; complements with rg.
+# Integrates uv (if installed) to run ruff/bandit/pip-audit without setup.
+# ═══════════════════════════════════════════════════════════════════════════
+
+set -Eeuo pipefail
+shopt -s lastpipe
+shopt -s extglob
+
+on_err() {
+  local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
+  echo -e "\n${RED}${BOLD}Unexpected error (exit $ec)${RESET} ${DIM}at ${src}:${line}${RESET}\n${DIM}Last command:${RESET} ${WHITE}$cmd${RESET}" >&2
+  exit "$ec"
+}
+trap on_err ERR
+
+# Honor NO_COLOR and non-tty
+USE_COLOR=1
+if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
+
+if [[ "$USE_COLOR" -eq 1 ]]; then
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+  MAGENTA='\033[0;35m'; CYAN='\033[0;36m'; WHITE='\033[1;37m'; GRAY='\033[0;90m'
+  BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; GRAY=''
+  BOLD=''; DIM=''; RESET=''
+fi
+
+CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAGNIFY="🔍"; BUG="🐛"; FIRE="🔥"; SPARKLE="✨"; SHIELD="🛡"; ROCKET="🚀"
+
+# ────────────────────────────────────────────────────────────────────────────
+# CLI Parsing & Configuration
+# ────────────────────────────────────────────────────────────────────────────
+VERBOSE=0
+PROJECT_DIR="."
+OUTPUT_FILE=""
+FORMAT="text"          # text|json|sarif (text implemented; ast-grep emits json/sarif when rule packs are run)
+CI_MODE=0
+FAIL_ON_WARNING=0
+INCLUDE_EXT="py,pyi,pyx,pxd,pxi,ipynb"
+QUIET=0
+NO_COLOR_FLAG=0
+EXTRA_EXCLUDES=""
+SKIP_CATEGORIES=""
+DETAIL_LIMIT=3
+MAX_DETAILED=250
+JOBS="${JOBS:-0}"
+USER_RULE_DIR=""
+DISABLE_PIPEFAIL_DURING_SCAN=1
+ENABLE_UV_TOOLS=1           # try uv integrations by default
+UV_TOOLS="ruff,bandit,pip-audit"  # subset via --uv-tools=
+UV_TIMEOUT="${UV_TIMEOUT:-1200}"  # generous time budget per tool
+
+print_usage() {
+  cat >&2 <<USAGE
+Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
+
+Options:
+  -v, --verbose            More code samples per finding (DETAIL=10)
+  -q, --quiet              Reduce non-essential output
+  --format=FMT             Output format: text|json|sarif (default: text)
+  --ci                     CI mode (no clear, stable timestamps)
+  --no-color               Force disable ANSI color
+  --include-ext=CSV        File extensions (default: $INCLUDE_EXT)
+  --exclude=GLOB[,..]      Additional glob(s)/dir(s) to exclude
+  --jobs=N                 Parallel jobs for ripgrep (default: auto)
+  --skip=CSV               Skip categories by number (e.g. --skip=2,7,11)
+  --fail-on-warning        Exit non-zero on warnings or critical
+  --rules=DIR              Additional ast-grep rules directory (merged)
+  --no-uv                  Disable uv-powered extra analyzers
+  --uv-tools=CSV           Which uv tools to run (default: $UV_TOOLS)
+  -h, --help               Show help
+Env:
+  JOBS, NO_COLOR, CI, UV_TIMEOUT
+Args:
+  PROJECT_DIR              Directory to scan (default: ".")
+  OUTPUT_FILE              File to save the report (optional)
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -v|--verbose) VERBOSE=1; DETAIL_LIMIT=10; shift;;
+    -q|--quiet)   VERBOSE=0; DETAIL_LIMIT=1; QUIET=1; shift;;
+    --format=*)   FORMAT="${1#*=}"; shift;;
+    --ci)         CI_MODE=1; shift;;
+    --no-color)   NO_COLOR_FLAG=1; shift;;
+    --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
+    --exclude=*)  EXTRA_EXCLUDES="${1#*=}"; shift;;
+    --jobs=*)     JOBS="${1#*=}"; shift;;
+    --skip=*)     SKIP_CATEGORIES="${1#*=}"; shift;;
+    --fail-on-warning) FAIL_ON_WARNING=1; shift;;
+    --rules=*)    USER_RULE_DIR="${1#*=}"; shift;;
+    --no-uv)      ENABLE_UV_TOOLS=0; shift;;
+    --uv-tools=*) UV_TOOLS="${1#*=}"; shift;;
+    -h|--help)    print_usage; exit 0;;
+    *)
+      if [[ -z "$PROJECT_DIR" || "$PROJECT_DIR" == "." ]] && ! [[ "$1" =~ ^- ]]; then
+        PROJECT_DIR="$1"; shift
+      elif [[ -z "$OUTPUT_FILE" ]] && ! [[ "$1" =~ ^- ]]; then
+        OUTPUT_FILE="$1"; shift
+      else
+        echo "Unexpected argument: $1" >&2; exit 2
+      fi
+      ;;
+  esac
+done
+
+# CI auto-detect + color override
+if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
+if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
+
+# Redirect output early to capture everything
+if [[ -n "${OUTPUT_FILE}" ]]; then exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
+
+DATE_FMT='%Y-%m-%d %H:%M:%S'
+if [[ "$CI_MODE" -eq 1 ]]; then DATE_CMD="date -u '+%Y-%m-%dT%H:%M:%SZ'"; else DATE_CMD="date '+$DATE_FMT'"; fi
+
+# ────────────────────────────────────────────────────────────────────────────
+# Global Counters
+# ────────────────────────────────────────────────────────────────────────────
+CRITICAL_COUNT=0
+WARNING_COUNT=0
+INFO_COUNT=0
+TOTAL_FILES=0
+
+# ────────────────────────────────────────────────────────────────────────────
+# Global State
+# ────────────────────────────────────────────────────────────────────────────
+HAS_AST_GREP=0
+AST_GREP_CMD=()      # array-safe
+AST_RULE_DIR=""      # created later if ast-grep exists
+HAS_RIPGREP=0
+UVX_CMD=()           # (uvx -q) if available
+HAS_UV=0
+
+# ────────────────────────────────────────────────────────────────────────────
+# Search engine configuration (rg if available, else grep) + include/exclude
+# ────────────────────────────────────────────────────────────────────────────
+LC_ALL=C
+IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"
+INCLUDE_GLOBS=()
+for e in "${_EXT_ARR[@]}"; do INCLUDE_GLOBS+=( "--include=*.$(echo "$e" | xargs)" ); done
+
+EXCLUDE_DIRS=(.git .hg .svn .bzr .tox .nox .venv venv env .mypy_cache .pytest_cache __pycache__ .ruff_cache .cache .coverage dist build site-packages .eggs .pdm-build .poetry .idea .vscode .history .ipynb_checkpoints .pytype .hypothesis .maturin .hatch .pants .ninja)
+if [[ -n "$EXTRA_EXCLUDES" ]]; then IFS=',' read -r -a _X <<<"$EXTRA_EXCLUDES"; EXCLUDE_DIRS+=("${_X[@]}"); fi
+EXCLUDE_FLAGS=()
+for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
+
+if command -v rg >/dev/null 2>&1; then
+  HAS_RIPGREP=1
+  if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
+  RG_JOBS=(); if [[ "${JOBS}" -gt 0 ]]; then RG_JOBS=(-j "$JOBS"); fi
+  RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden --pcre2 "${RG_JOBS[@]}")
+  RG_EXCLUDES=()
+  for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
+  RG_INCLUDES=()
+  for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( -g "*.$(echo "$e" | xargs)" ); done
+  GREP_RN=(rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  GREP_RNI=(rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  GREP_RNW=(rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  RG_JOBS=()
+else
+  GREP_R_OPTS=(-R --binary-files=without-match "${EXCLUDE_FLAGS[@]}" "${INCLUDE_GLOBS[@]}")
+  GREP_RN=("grep" "${GREP_R_OPTS[@]}" -n -E)
+  GREP_RNI=("grep" "${GREP_R_OPTS[@]}" -n -i -E)
+  GREP_RNW=("grep" "${GREP_R_OPTS[@]}" -n -w -E)
+fi
+
+# Helper: robust numeric end-of-pipeline counter; never emits 0\n0
+count_lines() { awk 'END{print (NR+0)}'; }
+
+# ────────────────────────────────────────────────────────────────────────────
+# Helper Functions
+# ────────────────────────────────────────────────────────────────────────────
+maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 ]]; then clear || true; fi; }
+say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
+
+print_header() {
+  say "\n${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+  say "${WHITE}${BOLD}$1${RESET}"
+  say "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+}
+
+print_category() {
+  say "\n${MAGENTA}${BOLD}▓▓▓ $1${RESET}"
+  say "${DIM}$2${RESET}"
+}
+
+print_subheader() { say "\n${YELLOW}${BOLD}$BULLET $1${RESET}"; }
+
+print_finding() {
+  local severity=$1
+  case $severity in
+    good)
+      local title=$2
+      say "  ${GREEN}${CHECK} OK${RESET} ${DIM}$title${RESET}"
+      ;;
+    *)
+      local raw_count=$2; local title=$3; local description="${4:-}"
+      local count; count=$(printf '%s\n' "$raw_count" | awk 'END{print $0+0}')
+      case $severity in
+        critical)
+          CRITICAL_COUNT=$((CRITICAL_COUNT + count))
+          say "  ${RED}${BOLD}${FIRE} CRITICAL${RESET} ${WHITE}($count found)${RESET}"
+          say "    ${RED}${BOLD}$title${RESET}"
+          [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
+          ;;
+        warning)
+          WARNING_COUNT=$((WARNING_COUNT + count))
+          say "  ${YELLOW}${WARN} Warning${RESET} ${WHITE}($count found)${RESET}"
+          say "    ${YELLOW}$title${RESET}"
+          [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
+          ;;
+        info)
+          INFO_COUNT=$((INFO_COUNT + count))
+          say "  ${BLUE}${INFO} Info${RESET} ${WHITE}($count found)${RESET}"
+          say "    ${BLUE}$title${RESET}"
+          [ -n "$description" ] && say "    ${DIM}$description${RESET}" || true
+          ;;
+      esac
+      ;;
+  esac
+}
+
+print_code_sample() {
+  local file=$1; local line=$2; local code=$3
+  say "${GRAY}      $file:$line${RESET}"
+  say "${WHITE}      $code${RESET}"
+}
+
+show_detailed_finding() {
+  local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
+  while IFS=: read -r file line code; do
+    print_code_sample "$file" "$line" "$code"; printed=$((printed+1))
+    [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
+  done < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit" || true) || true
+}
+
+begin_scan_section(){ if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi; }
+end_scan_section(){ if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi; }
+
+# ────────────────────────────────────────────────────────────────────────────
+# ast-grep: detection, rule packs, and wrappers
+# ────────────────────────────────────────────────────────────────────────────
+check_ast_grep() {
+  if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; return 0; fi
+  if command -v sg       >/dev/null 2>&1; then AST_GREP_CMD=(sg);       HAS_AST_GREP=1; return 0; fi
+  if command -v npx      >/dev/null 2>&1; then AST_GREP_CMD=(npx -y @ast-grep/cli); HAS_AST_GREP=1; return 0; fi
+  say "${YELLOW}${WARN} ast-grep not found. Advanced AST checks will be skipped.${RESET}"
+  say "${DIM}Tip: npm i -g @ast-grep/cli  or  cargo install ast-grep${RESET}"
+  HAS_AST_GREP=0; return 1
+}
+
+ast_search() {
+  local pattern=$1
+  if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+    ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern "$pattern" --lang python "$PROJECT_DIR" 2>/dev/null || true ) | wc -l | awk '{print $1+0}'
+  else
+    return 1
+  fi
+}
+
+write_ast_rules() {
+  [[ "$HAS_AST_GREP" -eq 1 ]] || return 0
+  AST_RULE_DIR="$(mktemp -d 2>/dev/null || mktemp -d -t py_ag_rules.XXXXXX)"
+  trap '[[ -n "${AST_RULE_DIR:-}" ]] && rm -rf "$AST_RULE_DIR" || true' EXIT
+  if [[ -n "$USER_RULE_DIR" && -d "$USER_RULE_DIR" ]]; then
+    cp -R "$USER_RULE_DIR"/. "$AST_RULE_DIR"/ 2>/dev/null || true
+  fi
+
+  # Core Python rules (security, reliability, correctness)
+  cat >"$AST_RULE_DIR/none-eq.yml" <<'YAML'
+id: py.none-eq
+language: python
+rule:
+  any:
+    - pattern: $X == None
+    - pattern: $X != None
+severity: warning
+message: "Use 'is (not) None' instead of '== None' or '!= None'"
+YAML
+
+  cat >"$AST_RULE_DIR/is-literal.yml" <<'YAML'
+id: py.is-literal
+language: python
+rule:
+  any:
+    - pattern: $X is True
+    - pattern: $X is False
+    - pattern: $X is 0
+    - pattern: $X is 1
+severity: warning
+message: "Avoid 'is' for literal comparison; use '==' (except None uses 'is')"
+YAML
+
+  cat >"$AST_RULE_DIR/bare-except.yml" <<'YAML'
+id: py.bare-except
+language: python
+rule:
+  pattern: |
+    try:
+      $A
+    except:
+      $B
+severity: critical
+message: "Bare 'except' catches all exceptions including SystemExit/KeyboardInterrupt"
+YAML
+
+  cat >"$AST_RULE_DIR/except-pass.yml" <<'YAML'
+id: py.except-pass
+language: python
+rule:
+  pattern: |
+    try:
+      $X
+    except $E as $N:
+      pass
+severity: warning
+message: "Exception swallowed with 'pass'; log or re-raise"
+YAML
+
+  cat >"$AST_RULE_DIR/raise-e.yml" <<'YAML'
+id: py.raise-e
+language: python
+rule:
+  pattern: |
+    except $E as $ex:
+      raise $ex
+severity: warning
+message: "Use 'raise' to preserve traceback, not 'raise e'"
+YAML
+
+  cat >"$AST_RULE_DIR/mutable-defaults.yml" <<'YAML'
+id: py.mutable-defaults
+language: python
+rule:
+  any:
+    - pattern: |
+        def $NAME($A = [], $$):
+          $BODY
+    - pattern: |
+        def $NAME($A = {}, $$):
+          $BODY
+    - pattern: |
+        def $NAME($A = set(), $$):
+          $BODY
+severity: critical
+message: "Mutable default argument; use default=None and set in body"
+YAML
+
+  cat >"$AST_RULE_DIR/eval-exec.yml" <<'YAML'
+id: py.eval-exec
+language: python
+rule:
+  any:
+    - pattern: eval($$)
+    - pattern: exec($$)
+severity: critical
+message: "Avoid eval/exec; leads to code injection"
+YAML
+
+  cat >"$AST_RULE_DIR/pickle-load.yml" <<'YAML'
+id: py.pickle-load
+language: python
+rule:
+  any:
+    - pattern: pickle.load($$)
+    - pattern: pickle.loads($$)
+severity: critical
+message: "Unpickling untrusted data is insecure; prefer safer formats"
+YAML
+
+  cat >"$AST_RULE_DIR/yaml-unsafe.yml" <<'YAML'
+id: py.yaml-unsafe
+language: python
+rule:
+  pattern: yaml.load($ARGS)
+  not:
+    has:
+      pattern: Loader=$L
+severity: critical
+message: "yaml.load without Loader=SafeLoader; prefer yaml.safe_load"
+YAML
+
+  cat >"$AST_RULE_DIR/subprocess-shell.yml" <<'YAML'
+id: py.subprocess-shell
+language: python
+rule:
+  any:
+    - pattern: subprocess.run($$, shell=True)
+    - pattern: subprocess.call($$, shell=True)
+    - pattern: subprocess.check_output($$, shell=True)
+    - pattern: subprocess.Popen($$, shell=True)
+severity: critical
+message: "shell=True is dangerous; prefer exec array with shell=False"
+YAML
+
+  cat >"$AST_RULE_DIR/os-system.yml" <<'YAML'
+id: py.os-system
+language: python
+rule:
+  pattern: os.system($$)
+severity: warning
+message: "os.system is shell-invocation; prefer subprocess without shell"
+YAML
+
+  cat >"$AST_RULE_DIR/requests-verify.yml" <<'YAML'
+id: py.requests-verify
+language: python
+rule:
+  pattern: requests.$M($URL, $$, verify=False)
+severity: warning
+message: "requests with verify=False disables TLS verification"
+YAML
+
+  cat >"$AST_RULE_DIR/hashlib-weak.yml" <<'YAML'
+id: py.hashlib-weak
+language: python
+rule:
+  any:
+    - pattern: hashlib.md5($$)
+    - pattern: hashlib.sha1($$)
+severity: warning
+message: "Weak hash algorithm (md5/sha1); prefer sha256/sha512"
+YAML
+
+  cat >"$AST_RULE_DIR/random-secrets.yml" <<'YAML'
+id: py.random-secrets
+language: python
+rule:
+  any:
+    - pattern: random.random($$)
+    - pattern: random.randint($$)
+    - pattern: random.randrange($$)
+    - pattern: random.choice($$)
+    - pattern: random.choices($$)
+severity: info
+message: "random module is not cryptographically secure; use secrets module"
+YAML
+
+  cat >"$AST_RULE_DIR/open-no-with.yml" <<'YAML'
+id: py.open-no-with
+language: python
+rule:
+  pattern: open($$)
+  not:
+    inside:
+      pattern: |
+        with open($$) as $F:
+          $BODY
+severity: warning
+message: "open() outside of a 'with' block; risk of leaking file handles"
+YAML
+
+  cat >"$AST_RULE_DIR/open-no-encoding.yml" <<'YAML'
+id: py.open-no-encoding
+language: python
+rule:
+  pattern: open($FNAME)
+  not:
+    has:
+      pattern: encoding=$ENC
+severity: info
+message: "open() without encoding=... may be non-deterministic across locales"
+YAML
+
+  cat >"$AST_RULE_DIR/assert-used.yml" <<'YAML'
+id: py.assert-used
+language: python
+rule:
+  pattern: assert $COND
+severity: info
+message: "assert is stripped with -O; avoid for runtime checks"
+YAML
+
+  cat >"$AST_RULE_DIR/datetime-naive.yml" <<'YAML'
+id: py.datetime-naive
+language: python
+rule:
+  any:
+    - pattern: datetime.datetime.utcnow($$)
+    - pattern: datetime.datetime.now()
+severity: info
+message: "Naive datetime; prefer timezone-aware (e.g., datetime.now(tz=UTC))"
+YAML
+
+  cat >"$AST_RULE_DIR/type-equality.yml" <<'YAML'
+id: py.type-equality
+language: python
+rule:
+  any:
+    - pattern: type($X) == $T
+    - pattern: type($X) is $T
+severity: warning
+message: "Use isinstance(x, T) instead of type(x) == T"
+YAML
+
+  cat >"$AST_RULE_DIR/wildcard-import.yml" <<'YAML'
+id: py.wildcard-import
+language: python
+rule:
+  pattern: from $M import *
+severity: warning
+message: "Wildcard import pollutes namespace; import names explicitly"
+YAML
+
+  cat >"$AST_RULE_DIR/importlib-dynamic.yml" <<'YAML'
+id: py.importlib-dynamic
+language: python
+rule:
+  any:
+    - pattern: __import__($NAME)
+    - pattern: importlib.import_module($NAME)
+severity: info
+message: "Dynamic imports hinder static analysis and packaging"
+YAML
+
+  cat >"$AST_RULE_DIR/async-blocking.yml" <<'YAML'
+id: py.async-blocking
+language: python
+rule:
+  pattern: |
+    async def $FN($$):
+      $STMTS
+  has:
+    any:
+      - pattern: time.sleep($$)
+      - pattern: requests.$M($$)
+      - pattern: subprocess.run($$)
+      - pattern: open($$)
+severity: warning
+message: "Blocking call inside async function; consider async equivalent"
+YAML
+
+  cat >"$AST_RULE_DIR/await-in-loop.yml" <<'YAML'
+id: py.await-in-loop
+language: python
+rule:
+  pattern: |
+    for $I in $IT:
+      await $CALL
+severity: info
+message: "await inside loops may be slow; consider gathering with asyncio.gather"
+YAML
+
+  cat >"$AST_RULE_DIR/tempfile-mktemp.yml" <<'YAML'
+id: py.tempfile-mktemp
+language: python
+rule:
+  pattern: tempfile.mktemp($$)
+severity: critical
+message: "tempfile.mktemp is insecure; use NamedTemporaryFile or mkstemp"
+YAML
+
+  cat >"$AST_RULE_DIR/sql-fstring.yml" <<'YAML'
+id: py.sql-fstring
+language: python
+rule:
+  pattern: f"SELECT $X"
+severity: warning
+message: "Interpolated SQL; prefer parameterized queries"
+YAML
+
+  cat >"$AST_RULE_DIR/type-ignore-heavy.yml" <<'YAML'
+id: py.type-ignore
+language: python
+rule:
+  pattern: "# type: ignore$REST"
+severity: info
+message: "Frequent 'type: ignore' may hide type issues"
+YAML
+
+  cat >"$AST_RULE_DIR/any-typing.yml" <<'YAML'
+id: py.any-typing
+language: python
+rule:
+  any:
+    - pattern: Any
+    - pattern: typing.Any
+severity: info
+message: "Use precise types; 'Any' weakens type guarantees"
+YAML
+
+  cat >"$AST_RULE_DIR/re-catastrophic.yml" <<'YAML'
+id: py.re-catastrophic
+language: python
+rule:
+  any:
+    - pattern: re.compile("($A+)+")
+    - pattern: re.compile("($A*)+")
+    - pattern: re.compile("(.*)+")
+severity: warning
+message: "Potential catastrophic backtracking; check regex"
+YAML
+
+  # Done writing rules
+}
+
+run_ast_rules() {
+  [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
+  local outfmt="--json"; [[ "$FORMAT" == "sarif" ]] && outfmt="--sarif"
+  if "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" $outfmt 2>/dev/null; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# uv integrations (ruff, bandit, pip-audit) if available
+# ────────────────────────────────────────────────────────────────────────────
+check_uv() {
+  if command -v uvx >/dev/null 2>&1; then UVX_CMD=(uvx -q); HAS_UV=1; return 0; fi
+  if command -v uv >/dev/null 2>&1;  then UVX_CMD=(uvx -q); HAS_UV=1; return 0; fi
+  HAS_UV=0; return 1
+}
+
+run_uv_tool_text() {
+  local tool="$1"; shift
+  if [[ "$HAS_UV" -eq 1 ]]; then
+    ( set +o pipefail; timeout "$UV_TIMEOUT" "${UVX_CMD[@]}" "$tool" "$@" || true )
+  else
+    if command -v "$tool" >/dev/null 2>&1; then ( set +o pipefail; timeout "$UV_TIMEOUT" "$tool" "$@" || true ); fi
+  fi
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Category skipping helper
+# ────────────────────────────────────────────────────────────────────────────
+should_skip() {
+  local cat="$1"
+  if [[ -z "$SKIP_CATEGORIES" ]]; then return 0; fi
+  IFS=',' read -r -a arr <<<"$SKIP_CATEGORIES"
+  for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done
+  return 0
+}
+
+# ────────────────────────────────────────────────────────────────────────────
+# Init
+# ────────────────────────────────────────────────────────────────────────────
+maybe_clear
+
+echo -e "${BOLD}${CYAN}"
+cat << 'BANNER'
+╔══════════════════════════════════════════════════════════════════════╗
+║                                                                      ║
+║  ██████╗ ██╗   ██╗████████╗██╗  ██╗ ██████╗ ███╗   ██╗     ██████╗   ║
+║  ██╔══██╗██║   ██║╚══██╔══╝██║  ██║██╔═══██╗████╗  ██║    ██╔════╝   ║
+║  ██████╔╝██║   ██║   ██║   ███████║██║   ██║██╔██╗ ██║    ██║  ███╗  ║
+║  ██╔══██╗██║   ██║   ██║   ██╔══██║██║   ██║██║╚██╗██║    ██║   ██║  ║
+║  ██║  ██║╚██████╔╝   ██║   ██║  ██║╚██████╔╝██║ ╚████║    ╚██████╔╝  ║
+║  ╚═╝  ╚═╝ ╚═════╝    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝     ╚═════╝   ║
+║                                                                      ║
+BANNER
+echo -e "║      ${BOLD}${GREEN}${ROCKET} PY BUG SCANNER${RESET}${BOLD}${CYAN} v1.0 ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━${CYAN}      ║"
+cat << 'BANNER'
+║                                                                      ║
+║     🎯 Industrial-Grade Python 3.13+ Code Analysis (Bash runner)      ║
+║      Powered by AST-Grep + Heuristic & uv-backed toolchain           ║
+║         Catch 1000+ Bug Patterns Before Shipping to Prod             ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+BANNER
+echo -e "${RESET}"
+
+say "${WHITE}Project:${RESET}  ${CYAN}$PROJECT_DIR${RESET}"
+say "${WHITE}Started:${RESET}  ${GRAY}$(eval "$DATE_CMD")${RESET}"
+
+# Count files with robust find
+EX_PRUNE=()
+for d in "${EXCLUDE_DIRS[@]}"; do EX_PRUNE+=( -name "$d" -o ); done
+EX_PRUNE=( \( -type d \( "${EX_PRUNE[@]}" -false \) -prune \) )
+NAME_EXPR=( \( )
+first=1
+for e in "${_EXT_ARR[@]}"; do
+  if [[ $first -eq 1 ]]; then NAME_EXPR+=( -name "*.${e}" ); first=0
+  else NAME_EXPR+=( -o -name "*.${e}" ); fi
+done
+NAME_EXPR+=( \) )
+TOTAL_FILES=$(
+  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
+  | wc -l | awk '{print $1+0}'
+)
+say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})${RESET}"
+
+# ast-grep availability
+echo ""
+if check_ast_grep; then
+  say "${GREEN}${CHECK} ast-grep available (${AST_GREP_CMD[*]}) - full AST analysis enabled${RESET}"
+  write_ast_rules || true
+else
+  say "${YELLOW}${WARN} ast-grep unavailable - using regex fallback mode${RESET}"
+fi
+
+# uv availability
+if check_uv; then
+  say "${GREEN}${CHECK} uv detected - ${DIM}uvx ephemeral analyzers enabled${RESET}"
+else
+  say "${YELLOW}${WARN} uv not found - ruff/bandit/pip-audit via system if present${RESET}"
+fi
+
+# relax pipefail for scanning (optional)
+begin_scan_section
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 1: NONE / DEFENSIVE PROGRAMMING
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 1; then
+print_header "1. NONE / DEFENSIVE PROGRAMMING"
+print_category "Detects: None equality, truthy confusions, deep attribute chains" \
+  "Pythonic checks use 'is (not) None' and safe attribute access patterns."
+
+print_subheader "== None or != None (should use 'is' / 'is not')"
+count=$("${GREP_RN[@]}" -e "==[[:space:]]*None|!=[[:space:]]*None" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "Equality to None" "Prefer 'is None' / 'is not None'"
+  show_detailed_finding "==[[:space:]]*None|!=[[:space:]]*None" 5
+else
+  print_finding "good" "No None equality comparisons"
+fi
+
+print_subheader "Attribute chains depth (fragile without guards)"
+count=$(
+  ast_search '$X.$Y.$Z.$W' \
+  || ( "${GREP_RN[@]}" -e "\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null || true ) | count_lines
+)
+if [ "$count" -gt 15 ]; then
+  print_finding "info" "$count" "Deep attribute access ($count)" "Guard with checks or use dataclass/attrs for structure"
+elif [ "$count" -gt 0 ]; then
+  print_finding "info" "$count" "Some deep attribute access detected"
+fi
+
+print_subheader "dict.get(key) without default used immediately"
+count=$("${GREP_RN[@]}" -e "\.get\([[:space:]]*['\"][^'\"]+['\"][[:space:]]*\)[[:space:]]*(\.|\[)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 10 ]; then
+  print_finding "warning" "$count" "dict.get(...) used without default then dereferenced" "Provide default or handle None"
+  show_detailed_finding "\.get\([[:space:]]*['\"][^'\"]+['\"][[:space:]]*\)[[:space:]]*(\.|\[)" 5
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 2: NUMERIC / ARITHMETIC PITFALLS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 2; then
+print_header "2. NUMERIC / ARITHMETIC PITFALLS"
+print_category "Detects: Division by variable, float equality, modulo hazards" \
+  "Silent numeric bugs propagate incorrect results or ZeroDivisionError."
+
+print_subheader "Division by variable (possible ÷0)"
+count=$(
+  ( "${GREP_RN[@]}" -e "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null || true ) \
+  | (grep -Ev "/[[:space:]]*(255|2|10|100|1000)\b|//|/\*" || true) | count_lines)
+if [ "$count" -gt 25 ]; then
+  print_finding "warning" "$count" "Division by variable - verify non-zero" "Guard before division"
+  show_detailed_finding "/[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" 5
+elif [ "$count" -gt 0 ]; then
+  print_finding "info" "$count" "Division operations found - check divisors"
+fi
+
+print_subheader "Floating-point equality (==)"
+count=$("${GREP_RN[@]}" -e "==[[:space:]]*[0-9]+\.[0-9]+" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 3 ]; then
+  print_finding "warning" "$count" "Float equality comparison" "Use tolerance: abs(a-b) < eps"
+  show_detailed_finding "==[[:space:]]*[0-9]+\.[0-9]+" 3
+fi
+
+print_subheader "Modulo by variable (verify non-zero)"
+count=$("${GREP_RN[@]}" -e "%[[:space:]]*[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 10 ]; then
+  print_finding "info" "$count" "Modulo operations - verify divisor non-zero"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 3: COLLECTION SAFETY
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 3; then
+print_header "3. COLLECTION SAFETY"
+print_category "Detects: Index risks, mutation during iteration, len checks" \
+  "Collection misuse leads to IndexError or logical errors."
+
+print_subheader "Index arithmetic like arr[i±1]"
+count=$("${GREP_RN[@]}" -e "\[[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[+\-][[:space:]]*[0-9]+[[:space:]]*\]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 12 ]; then
+  print_finding "warning" "$count" "Array index arithmetic - verify bounds" "Ensure i±k within range"
+  show_detailed_finding "\[[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[+\-][[:space:]]*[0-9]+[[:space:]]*\]" 5
+elif [ "$count" -gt 0 ]; then
+  print_finding "info" "$count" "Index arithmetic present - review"
+fi
+
+print_subheader "Mutation during iteration"
+count=$("${GREP_RN[@]}" -e "for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A3 -E "\1\.(append|extend|insert|remove|pop|clear)" || true) | (grep -c -E "(append|extend|insert|remove|pop|clear)" || true) )
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 5 ]; then
+  print_finding "warning" "$count" "Possible mutation during iteration" "Copy or iterate over snapshot"
+fi
+
+print_subheader "len(x) comparisons"
+count=$("${GREP_RN[@]}" -e "len\([^)]+\)[[:space:]]*(==|!=|<|>|<=|>=)[[:space:]]*0" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 8 ]; then
+  print_finding "info" "$count" "len(x) == 0 checks" "Prefer truthiness: if not x:"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 4: COMPARISON & TYPE CHECKING TRAPS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 4; then
+print_header "4. COMPARISON & TYPE CHECKING TRAPS"
+print_category "Detects: 'is' with literals, type() equality, truthiness with bools" \
+  "Prefer idiomatic Python comparisons and isinstance."
+
+print_subheader "'is' with literals"
+count=$("${GREP_RN[@]}" -e " is[[:space:]]*(True|False|[0-9]+|''|\"\"|'.*'|\".*\")" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "Using 'is' with literals" "Use '==' (only None uses 'is')"
+  show_detailed_finding " is[[:space:]]*(True|False|[0-9]+|''|\"\"|'.*'|\".*\")" 5
+else
+  print_finding "good" "No 'is' literal comparisons"
+fi
+
+print_subheader "type(x) == T instead of isinstance"
+count=$("${GREP_RN[@]}" -e "type\([^)]+\)[[:space:]]*(==|is)[[:space:]]*[A-Za-z_][A-Za-z0-9_\.]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "type equality used" "Use isinstance(x, T)"
+  show_detailed_finding "type\([^)]+\)[[:space:]]*(==|is)[[:space:]]*[A-Za-z_][A-Za-z0-9_\.]*" 5
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 5: ASYNC/AWAIT PITFALLS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 5; then
+print_header "5. ASYNC/AWAIT PITFALLS"
+print_category "Detects: blocking calls in async, await in loops, floating tasks" \
+  "Async bugs cause unpredictable latency and deadlocks."
+
+async_count=$("${GREP_RN[@]}" -e "async[[:space:]]+def[[:space:]]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+await_count=$("${GREP_RNW[@]}" "await" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+print_finding "info" "$async_count" "Async functions found"
+if [ "$async_count" -gt "$await_count" ]; then
+  ratio=$((async_count - await_count))
+  print_finding "warning" "$ratio" "Possible un-awaited async paths" "Check for floating tasks"
+fi
+
+print_subheader "await inside loops (performance)"
+count=$("${GREP_RN[@]}" -e "for[[:space:]]+.*:|while[[:space:]]+.*:" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A3 -w "await" || true) | (grep -cw "await" || true) )
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 3 ]; then
+  print_finding "info" "$count" "await inside loops" "Consider asyncio.gather"
+fi
+
+print_subheader "Blocking calls in async def"
+count=$("${GREP_RN[@]}" -e "async[[:space:]]+def[[:space:]]" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A6 -E "time\.sleep\(|requests\.[a-z]+\(.*\)|subprocess\.run\(|open\(" || true) | \
+  (grep -c -E "time\.sleep|requests\.|subprocess\.run|open\(" || true) )
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "Blocking calls inside async functions" "Use async equivalents"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 6: ERROR HANDLING
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 6; then
+print_header "6. ERROR HANDLING ANTI-PATTERNS"
+print_category "Detects: bare except, swallowed errors, poor re-raise" \
+  "Proper exception handling simplifies debugging and recovery."
+
+print_subheader "Bare except"
+count=$("${GREP_RN[@]}" -e "^[[:space:]]*except[[:space:]]*:[[:space:]]*$" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "Bare except" "Except without class catches BaseException"
+  show_detailed_finding "^[[:space:]]*except[[:space:]]*:[[:space:]]*$" 5
+else
+  print_finding "good" "No bare except blocks"
+fi
+
+print_subheader "except ...: pass"
+count=$("${GREP_RN[@]}" -e "^[[:space:]]*except[[:space:]]+[^:]+:[[:space:]]*pass[[:space:]]*$" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 3 ]; then
+  print_finding "warning" "$count" "Exception swallowed with pass" "Log or handle"
+  show_detailed_finding "^[[:space:]]*except[[:space:]]+[^:]+:[[:space:]]*pass[[:space:]]*$" 5
+fi
+
+print_subheader "raise e (loses traceback)"
+count=$("${GREP_RN[@]}" -e "^[[:space:]]*except[[:space:]].*as[[:space:]]+[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*$" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A2 -E "raise[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$" || true) | (grep -c -E "raise[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$" || true) )
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "Use 'raise' not 'raise e' to preserve traceback"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 7: SECURITY VULNERABILITIES
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 7; then
+print_header "7. SECURITY VULNERABILITIES"
+print_category "Detects: code injection, unsafe deserialization, weak crypto, TLS off" \
+  "Security bugs expose users to attacks and data breaches."
+
+print_subheader "eval/exec usage"
+count=$("${GREP_RN[@]}" -e "(^|[^A-Za-z0-9_])eval\(|(^|[^A-Za-z0-9_])exec\(" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -Ev "^[[:space:]]*#" || true) | count_lines)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "eval()/exec() present" "Never use on untrusted input"
+  show_detailed_finding "eval\(|exec\(" 5
+else
+  print_finding "good" "No eval/exec detected"
+fi
+
+print_subheader "pickle.load/loads"
+count=$("${GREP_RN[@]}" -e "pickle\.(load|loads)\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "Insecure pickle usage" "Avoid unpickling untrusted data"
+  show_detailed_finding "pickle\.(load|loads)\(" 3
+fi
+
+print_subheader "yaml.load without Loader"
+count=$("${GREP_RN[@]}" -e "yaml\.load\(" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -v "Loader[[:space:]]*=" || true) | count_lines)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "yaml.load without SafeLoader" "Use yaml.safe_load or specify Loader=SafeLoader"
+  show_detailed_finding "yaml\.load\(" 3
+fi
+
+print_subheader "subprocess shell=True / os.system"
+count=$("${GREP_RN[@]}" -e "subprocess\.(run|call|check_output|Popen)\(.*shell\s*=\s*True" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+count2=$("${GREP_RN[@]}" -e "os\.system\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+total=$((count + count2))
+if [ "$total" -gt 0 ]; then
+  print_finding "critical" "$total" "Shell command injection risk" "Pass argv list with shell=False"
+  show_detailed_finding "subprocess\.(run|call|check_output|Popen)\(.*shell\s*=\s*True|os\.system\(" 5
+else
+  print_finding "good" "No shell=True / os.system detected"
+fi
+
+print_subheader "requests verify=False (TLS disabled)"
+count=$("${GREP_RN[@]}" -e "requests\.[a-z]+\([^)]*verify\s*=\s*False" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "TLS verification disabled" "Remove verify=False"
+  show_detailed_finding "requests\.[a-z]+\([^)]*verify\s*=\s*False" 3
+fi
+
+print_subheader "Weak hash algorithms (md5/sha1)"
+count=$("${GREP_RN[@]}" -e "hashlib\.(md5|sha1)\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "Weak hash usage" "Use hashlib.sha256/512"
+  show_detailed_finding "hashlib\.(md5|sha1)\(" 3
+fi
+
+print_subheader "Hardcoded secrets"
+count=$("${GREP_RNI[@]}" -e "(password|api_?key|secret|token)[[:space:]]*[:=][[:space:]]*['\"][^\"']+['\"]" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -v "#.*(password|api_?key|secret|token)" || true) | count_lines)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "Potential hardcoded secrets" "Use secret manager or env vars"
+  show_detailed_finding "(password|api_?key|secret|token)[[:space:]]*[:=][[:space:]]*['\"][^\"']+['\"]" 5
+fi
+
+print_subheader "tempfile.mktemp (insecure)"
+count=$("${GREP_RN[@]}" -e "tempfile\.mktemp\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "critical" "$count" "Insecure tempfile.mktemp usage" "Use NamedTemporaryFile/mkstemp"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 8: FUNCTION & SCOPE ISSUES
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 8; then
+print_header "8. FUNCTION & SCOPE ISSUES"
+print_category "Detects: mutable defaults, many params, nested defs, returns" \
+  "Function-level bugs cause subtle state leaks and readability problems."
+
+print_subheader "Mutable default arguments"
+count=$("${GREP_RN[@]}" -e "def[[:space:]]+[A-Za-z_][A-Za-z0-9_]*\([^\)]*(\[\]|{}|set\(\))[^\)]*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "Mutable default arguments" "Use None + set default in body"
+  show_detailed_finding "def[[:space:]]+[A-Za-z_][A-Za-z0-9_]*\([^\)]*(\[\]|{}|set\(\))[^\)]*\)" 5
+else
+  print_finding "good" "No mutable default arguments"
+fi
+
+print_subheader "Functions with high parameter count (>6)"
+count=$("${GREP_RN[@]}" -e "def[[:space:]]+[A-Za-z_][A-Za-z0-9_]*\([^)]*,[^)]*,[^)]*,[^)]*,[^)]*,[^)]*,[^)]*[,)]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 3 ]; then
+  print_finding "warning" "$count" "Functions with >6 parameters" "Refactor to dataclass/options object"
+  show_detailed_finding "def[[:space:]]+[A-Za-z_][A-Za-z0-9_]*\([^)]*,[^)]*,[^)]*,[^)]*,[^)]*,[^)]*,[^)]*[,)]" 5
+fi
+
+print_subheader "Nested function declarations"
+count=$("${GREP_RN[@]}" -e "def[[:space:]]+[A-Za-z_][A-Za-z0-9_]*\(" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A2 -E "^[[:space:]]+def[[:space:]]" || true) | (grep -cw "def" || true))
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 10 ]; then
+  print_finding "info" "$count" "Nested functions - verify closures and lifetimes"
+fi
+
+print_subheader "Missing returns heuristic"
+def_count=$("${GREP_RN[@]}" -e "^[[:space:]]*def[[:space:]]+[A-Za-z_]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+ret_count=$("${GREP_RNW[@]}" "return" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$def_count" -gt "$ret_count" ]; then
+  diff=$((def_count - ret_count)); [ "$diff" -lt 0 ] && diff=0
+  print_finding "info" "$diff" "Some functions may lack return statements" "Void intended?"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 9: PARSING & TYPE CONVERSION
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 9; then
+print_header "9. PARSING & TYPE CONVERSION BUGS"
+print_category "Detects: json.loads without try, str+num concat, int() edge cases" \
+  "Parsing bugs cause runtime exceptions and data corruption."
+
+print_subheader "json.loads without try/catch"
+count=$("${GREP_RN[@]}" -e "json\.loads\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+trycatch_count=$("${GREP_RNW[@]}" -B2 "try" "$PROJECT_DIR" 2>/dev/null || true | (grep -c "json\.loads" || true))
+trycatch_count=$(printf '%s\n' "$trycatch_count" | awk 'END{print $0+0}')
+if [ "$count" -gt "$trycatch_count" ]; then
+  ratio=$((count - trycatch_count))
+  print_finding "warning" "$ratio" "json.loads without error handling" "Wrap in try/except ValueError"
+fi
+
+print_subheader "String concatenation with + adjacent to digits (possible type mix)"
+count=$(( $("${GREP_RN[@]}" -e "\+[[:space:]]*['\"]|['\"][[:space:]]*\+" "$PROJECT_DIR" 2>/dev/null || true | \
+  grep -v -E "\+\+|[+\-]=" || true | wc -l | awk '{print $1+0}') ))
+if [ "$count" -gt 5 ]; then
+  print_finding "info" "$count" "String concatenation with +" "Use f-strings"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 10: CONTROL FLOW GOTCHAS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 10; then
+print_header "10. CONTROL FLOW GOTCHAS"
+print_category "Detects: return/break in finally, nested ternary, unreachable code" \
+  "Flow pitfalls cause surprising behavior and lost exceptions."
+
+print_subheader "return/break/continue inside finally"
+count=$("${GREP_RN[@]}" -e "finally:[[:space:]]*$" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A3 -E "return|break|continue" || true) | (grep -c -E "return|break|continue" || true) )
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "Control transfer in finally" "It may swallow exceptions"
+fi
+
+print_subheader "Nested conditional expressions"
+count=$("${GREP_RN[@]}" -e " if .* else .* if .* else " "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 3 ]; then
+  print_finding "info" "$count" "Nested ternary expressions" "Refactor to if/elif"
+  show_detailed_finding " if .* else .* if .* else " 3
+fi
+
+print_subheader "Unreachable code after return"
+count=$("${GREP_RNW[@]}" "return" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A1 "return" || true) | (grep -v -E "^--$|return|^[[:space:]]*$" || true) | count_lines)
+if [ "$count" -gt 5 ]; then
+  print_finding "info" "$count" "Possible unreachable code after return"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 11: DEBUGGING & PRODUCTION CODE
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 11; then
+print_header "11. DEBUGGING & PRODUCTION CODE"
+print_category "Detects: print, breakpoint/pdb, sensitive logs" \
+  "Debug artifacts degrade performance and leak information."
+
+print_subheader "print statements"
+count=$("${GREP_RN[@]}" -e "^[[:space:]]*print\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 50 ]; then
+  print_finding "warning" "$count" "Many print() statements - prefer logging"
+elif [ "$count" -gt 20 ]; then
+  print_finding "info" "$count" "print() statements found"
+else
+  print_finding "good" "Minimal print usage"
+fi
+
+print_subheader "breakpoint() / pdb.set_trace()"
+count=$("${GREP_RN[@]}" -e "breakpoint\(|pdb\.set_trace\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "Debugger calls present" "Remove before commit"
+  show_detailed_finding "breakpoint\(|pdb\.set_trace\(" 5
+else
+  print_finding "good" "No debugger calls"
+fi
+
+print_subheader "Logging sensitive data"
+count=$("${GREP_RNI[@]}" -e "logging\.(debug|info|warning|error|exception)\(.*(password|token|secret|Bearer|Authorization)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "critical" "$count" "Sensitive data in logs" "Remove or mask secrets"
+  show_detailed_finding "logging\.(debug|info|warning|error|exception)\(.*(password|token|secret|Bearer|Authorization)" 3
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 12: PERFORMANCE & MEMORY
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 12; then
+print_header "12. PERFORMANCE & MEMORY"
+print_category "Detects: string concat in loops, regex compile in loops, I/O in loops" \
+  "Performance anti-patterns reduce throughput and increase latency."
+
+print_subheader "String concatenation in loops"
+count=$("${GREP_RN[@]}" -e "for[[:space:]]+.*:|while[[:space:]]+.*:" "$PROJECT_DIR" 2>/dev/null | (grep -A3 "+=" || true) | (grep -cw "+=" || true) )
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 8 ]; then
+  print_finding "info" "$count" "String concatenation in loops" "Use list-join pattern"
+fi
+
+print_subheader "re.compile inside loops"
+count=$("${GREP_RN[@]}" -e "for[[:space:]]+.*:|while[[:space:]]+.*:" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A3 -E "re\.compile\(" || true) | (grep -cw "re\.compile" || true) )
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 0 ]; then
+  print_finding "info" "$count" "Regex compiled in loop" "Precompile outside loop"
+fi
+
+print_subheader "I/O heavy ops in loops"
+count=$("${GREP_RN[@]}" -e "for|while" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -A5 -E "open\(|read\(|write\(|requests\." || true) | \
+  (grep -c -E "open\(|read\(|write\(|requests\." || true) )
+count=$(printf '%s\n' "$count" | awk 'END{print $0+0}')
+if [ "$count" -gt 5 ]; then
+  print_finding "warning" "$count" "I/O in loops" "Batch or buffer where possible"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 13: VARIABLE & SCOPE
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 13; then
+print_header "13. VARIABLE & SCOPE"
+print_category "Detects: global/nonlocal usage, wildcard imports" \
+  "Scope issues cause hard-to-debug conflicts and side effects."
+
+print_subheader "global/nonlocal statements"
+count=$("${GREP_RN[@]}" -e "^[[:space:]]*(global|nonlocal)[[:space:]]+[A-Za-z_]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 5 ]; then
+  print_finding "info" "$count" "Frequent global/nonlocal usage" "Refactor to dependency injection"
+fi
+
+print_subheader "Wildcard imports"
+count=$("${GREP_RN[@]}" -e "from[[:space:]]+[A-Za-z0-9_\.]+[[:space:]]+import[[:space:]]+\*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "Wildcard imports deter tooling"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 14: CODE QUALITY MARKERS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 14; then
+print_header "14. CODE QUALITY MARKERS"
+print_category "Detects: TODO, FIXME, HACK, XXX, NOTE" \
+  "Technical debt markers indicate incomplete or problematic code."
+
+todo_count=$("${GREP_RNI[@]}" "TODO" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+fixme_count=$("${GREP_RNI[@]}" "FIXME" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+hack_count=$("${GREP_RNI[@]}" "HACK" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+xxx_count=$("${GREP_RNI[@]}" "XXX" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+note_count=$("${GREP_RNI[@]}" "NOTE" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+
+total_markers=$((todo_count + fixme_count + hack_count + xxx_count))
+if [ "$total_markers" -gt 20 ]; then
+  print_finding "warning" "$total_markers" "Significant technical debt" "Create tracking tickets"
+elif [ "$total_markers" -gt 10 ]; then
+  print_finding "info" "$total_markers" "Moderate technical debt"
+elif [ "$total_markers" -gt 0 ]; then
+  print_finding "info" "$total_markers" "Minimal technical debt"
+else
+  print_finding "good" "No technical debt markers"
+fi
+if [ "$total_markers" -gt 0 ]; then
+  say "\n  ${DIM}Breakdown:${RESET}"
+  [ "$todo_count" -gt 0 ] && say "    ${YELLOW}TODO:${RESET}  $todo_count"
+  [ "$fixme_count" -gt 0 ] && say "    ${RED}FIXME:${RESET} $fixme_count"
+  [ "$hack_count" -gt 0 ] && say "    ${MAGENTA}HACK:${RESET}  $hack_count"
+  [ "$xxx_count" -gt 0 ] && say "    ${RED}XXX:${RESET}   $xxx_count"
+  [ "$note_count" -gt 0 ] && say "    ${BLUE}NOTE:${RESET}  $note_count"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 15: REGEX & STRING SAFETY
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 15; then
+print_header "15. REGEX & STRING SAFETY"
+print_category "Detects: ReDoS, dynamic regex with input, escaping issues" \
+  "Regex bugs cause performance issues and security vulnerabilities."
+
+print_subheader "Nested quantifiers (ReDoS risk)"
+count=$("${GREP_RN[@]}" -e "\([^)]*\+[^)]*\)\+|\([^)]*\*[^)]*\)\+" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 3 ]; then
+  print_finding "warning" "$count" "Potential catastrophic regex" "Review with regex101 or safe-regex"
+  show_detailed_finding "\([^)]*\+[^)]*\)\+|\([^)]*\*[^)]*\)\+" 2
+fi
+
+print_subheader "Dynamic re.compile from variables"
+count=$("${GREP_RN[@]}" -e "re\.compile\([[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 3 ]; then
+  print_finding "info" "$count" "Dynamic regex construction" "Sanitize input or use fixed patterns"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 16: I/O & RESOURCE SAFETY
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 16; then
+print_header "16. I/O & RESOURCE SAFETY"
+print_category "Detects: open without with, missing encoding, rmtree(ignore_errors)" \
+  "I/O bugs leak resources and produce nondeterministic behavior."
+
+print_subheader "open(...) without context manager"
+count=$("${GREP_RN[@]}" -e "open\(" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -v -E "with[[:space:]]+open\(" || true) | count_lines)
+if [ "$count" -gt 5 ]; then
+  print_finding "warning" "$count" "open() outside 'with' block" "Wrap in 'with' to ensure close()"
+fi
+
+print_subheader "open() without explicit encoding"
+count=$("${GREP_RN[@]}" -e "open\([^\)]*\)" "$PROJECT_DIR" 2>/dev/null | \
+  (grep -v "encoding[[:space:]]*=" || true) | count_lines
+if [ "$count" -gt 10 ]; then
+  print_finding "info" "$count" "No encoding in open()" "Specify encoding= 'utf-8' etc."
+fi
+
+print_subheader "shutil.rmtree(ignore_errors=True)"
+count=$("${GREP_RN[@]}" -e "shutil\.rmtree\([^)]*ignore_errors\s*=\s*True" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "rmtree(ignore_errors=True) hides failures"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 17: TYPING STRICTNESS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 17; then
+print_header "17. TYPING STRICTNESS"
+print_category "Detects: Any usage, type: ignore density" \
+  "Type hygiene reduces runtime errors."
+
+print_subheader "'Any' usage"
+count=$("${GREP_RN[@]}" -e "(:|->)[[:space:]]*Any\b|typing\.Any\b" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 10 ]; then
+  print_finding "info" "$count" "Frequent 'Any' usage" "Consider generics/Protocol"
+elif [ "$count" -gt 0 ]; then
+  print_finding "info" "$count" "Some 'Any' usage present"
+fi
+
+print_subheader "type: ignore comments"
+count=$("${GREP_RN[@]}" -e "#[[:space:]]*type:[[:space:]]*ignore" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 5 ]; then
+  print_finding "info" "$count" "Many 'type: ignore' pragmas" "Keep them targeted"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 18: PYTHON I/O & MODULE USAGE
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 18; then
+print_header "18. PYTHON I/O & MODULE USAGE"
+print_category "Detects: os.system, wildcard imports, dynamic import" \
+  "Prefer safer subprocess APIs and explicit imports."
+
+print_subheader "os.system invocations"
+count=$("${GREP_RN[@]}" -e "os\.system\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "os.system used (shell)"; fi
+
+print_subheader "Dynamic imports"
+count=$("${GREP_RN[@]}" -e "__import__\(|importlib\.import_module\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Dynamic imports present"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AST-GREP RULE PACK FINDINGS (JSON/SARIF passthrough)
+# ═══════════════════════════════════════════════════════════════════════════
+if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
+  print_header "AST-GREP RULE PACK FINDINGS"
+  if run_ast_rules; then
+    say "${DIM}${INFO} Above JSON/SARIF lines are ast-grep matches (id, message, severity, file/pos).${RESET}"
+    if [[ "$FORMAT" == "sarif" ]]; then
+      say "${DIM}${INFO} Tip: ${BOLD}${AST_GREP_CMD[*]} scan -r $AST_RULE_DIR \"$PROJECT_DIR\" --sarif > report.sarif${RESET}"
+    fi
+  else
+    say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 19: UV-POWERED EXTRA ANALYZERS (optional)
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 19; then
+print_header "19. UV-POWERED EXTRA ANALYZERS"
+print_category "Ruff linting, Bandit security, Pip-audit (supply chain)" \
+  "Uses uvx when available; falls back to system tools if installed."
+
+if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
+  IFS=',' read -r -a UVLIST <<< "$UV_TOOLS"
+  for TOOL in "${UVLIST[@]}"; do
+    case "$TOOL" in
+      ruff)
+        print_subheader "ruff (lint)"
+        if run_uv_tool_text ruff check "$PROJECT_DIR" --quiet; then
+          # best-effort count
+          ruff_count=$("${GREP_RN[@]}" -e "error|warning" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+          if [ "$ruff_count" -gt 0 ]; then print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"; else print_finding "good" "Ruff clean"; fi
+        else
+          say "  ${GRAY}${INFO} ruff not executed${RESET}"
+        fi
+        ;;
+      bandit)
+        print_subheader "bandit (security)"
+        if run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "$(IFS=,; echo "${EXCLUDE_DIRS[*]}")"; then
+          # Can't reliably count; provide info item
+          print_finding "info" 0 "Bandit scan completed" "See output above"
+        else
+          say "  ${GRAY}${INFO} bandit not executed${RESET}"
+        fi
+        ;;
+      pip-audit)
+        print_subheader "pip-audit (dependencies)"
+        # Try lock/req files if present
+        if [ -f "$PROJECT_DIR/requirements.txt" ]; then
+          run_uv_tool_text pip-audit -r "$PROJECT_DIR/requirements.txt" || true
+        elif [ -f "$PROJECT_DIR/pyproject.toml" ]; then
+          run_uv_tool_text pip-audit -P "$PROJECT_DIR/pyproject.toml" || true
+        else
+          run_uv_tool_text pip-audit || true
+        fi
+        print_finding "info" 0 "pip-audit run (if available)" "Review advisories above"
+        ;;
+      *)
+        say "  ${GRAY}${INFO} Unknown uv tool '$TOOL' ignored${RESET}"
+        ;;
+    esac
+  done
+else
+  say "  ${GRAY}${INFO} uv extra analyzers disabled (--no-uv)${RESET}"
+fi
+fi
+
+# restore pipefail if we relaxed it
+end_scan_section
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY
+# ═══════════════════════════════════════════════════════════════════════════
+
+echo ""
+say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
+say "${BOLD}${CYAN}                    🎯 SCAN COMPLETE 🎯                                  ${RESET}"
+say "${BOLD}${WHITE}═══════════════════════════════════════════════════════════════════════════${RESET}"
+echo ""
+
+say "${WHITE}${BOLD}Summary Statistics:${RESET}"
+say "  ${WHITE}Files scanned:${RESET}    ${CYAN}$TOTAL_FILES${RESET}"
+say "  ${RED}${BOLD}Critical issues:${RESET}  ${RED}$CRITICAL_COUNT${RESET}"
+say "  ${YELLOW}Warning issues:${RESET}   ${YELLOW}$WARNING_COUNT${RESET}"
+say "  ${BLUE}Info items:${RESET}       ${BLUE}$INFO_COUNT${RESET}"
+echo ""
+
+say "${BOLD}${WHITE}Priority Actions:${RESET}"
+if [ "$CRITICAL_COUNT" -gt 0 ]; then
+  say "  ${RED}${FIRE} ${BOLD}FIX CRITICAL ISSUES IMMEDIATELY${RESET}"
+  say "  ${DIM}These cause crashes, security vulnerabilities, or data corruption${RESET}"
+fi
+if [ "$WARNING_COUNT" -gt 0 ]; then
+  say "  ${YELLOW}${WARN} ${BOLD}Review and fix WARNING items${RESET}"
+  say "  ${DIM}These cause bugs, performance issues, or maintenance problems${RESET}"
+fi
+if [ "$INFO_COUNT" -gt 0 ]; then
+  say "  ${BLUE}${INFO} ${BOLD}Consider INFO suggestions${RESET}"
+  say "  ${DIM}Code quality improvements and best practices${RESET}"
+fi
+
+if [ "$CRITICAL_COUNT" -eq 0 ] && [ "$WARNING_COUNT" -eq 0 ]; then
+  say "\n  ${GREEN}${BOLD}${SPARKLE} EXCELLENT! No critical or warning issues found ${SPARKLE}${RESET}"
+fi
+
+echo ""
+say "${DIM}Scan completed at: $(eval "$DATE_CMD")${RESET}"
+
+if [[ -n "$OUTPUT_FILE" ]]; then
+  say "${GREEN}${CHECK} Full report saved to: ${CYAN}$OUTPUT_FILE${RESET}"
+fi
+
+echo ""
+if [ "$VERBOSE" -eq 0 ]; then
+  say "${DIM}Tip: Run with -v/--verbose for more code samples per finding.${RESET}"
+fi
+say "${DIM}Add to pre-commit: ./scripts/py-bug-scanner.sh --ci --fail-on-warning . > py-bug-scan-report.txt${RESET}"
+echo ""
+
+EXIT_CODE=0
+if [ "$CRITICAL_COUNT" -gt 0 ]; then EXIT_CODE=1; fi
+if [ "$FAIL_ON_WARNING" -eq 1 ] && [ $((CRITICAL_COUNT + WARNING_COUNT)) -gt 0 ]; then EXIT_CODE=1; fi
+exit "$EXIT_CODE"

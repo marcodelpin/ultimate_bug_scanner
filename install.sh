@@ -12,7 +12,7 @@ if ((BASH_VERSINFO[0] < 4)); then
   echo "Please upgrade bash or install manually." >&2
   exit 1
 fi
-SCRIPT_NAME="bug-scanner.sh"
+SCRIPT_NAME="ubs"
 INSTALL_NAME="ubs"
 REPO_URL="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main"
 
@@ -32,8 +32,10 @@ WARN="${YELLOW}⚠${RESET}"
 
 # Flags
 NON_INTERACTIVE=0
+EASY_MODE=0
 SKIP_AST_GREP=0
 SKIP_RIPGREP=0
+SKIP_JQ=0
 SKIP_HOOKS=0
 INSTALL_DIR=""
 
@@ -67,10 +69,14 @@ error() { echo -e "${CROSS} $*" >&2; }
 warn() { echo -e "${WARN} $*"; }
 
 ask() {
+  local prompt="$1"
+  if [ "$EASY_MODE" -eq 1 ]; then
+    log "Easy mode: auto-accepting prompt -> ${prompt}"
+    return 0
+  fi
   if [ "$NON_INTERACTIVE" -eq 1 ]; then
     return 1  # Default to "no" in non-interactive mode
   fi
-  local prompt="$1"
   local response
   read -p "$(echo -e "${YELLOW}?${RESET} ${prompt} (y/N): ")" response
   [[ "$response" =~ ^[Yy]$ ]]
@@ -225,6 +231,64 @@ check_ripgrep() {
   else
     return 1
   fi
+}
+
+check_jq() {
+  if command -v jq >/dev/null 2>&1; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+install_jq() {
+  local platform
+  platform="$(detect_platform)"
+  log "Installing jq..."
+  case "$platform" in
+    macos)
+      if command -v brew >/dev/null 2>&1; then
+        if brew install jq 2>&1 | tee /tmp/jq-install.log; then
+          success "jq installed via Homebrew"; return 0
+        else
+          error "Homebrew installation failed. See /tmp/jq-install.log"; return 1
+        fi
+      else
+        error "Homebrew not found. Install jq manually."; return 1
+      fi
+      ;;
+    linux)
+      if command -v apt-get >/dev/null 2>&1 && can_use_sudo; then
+        if timeout 300 sudo apt-get update -qq && timeout 300 sudo apt-get install -y jq 2>&1 | tee /tmp/jq-install.log; then
+          success "jq installed via apt-get"; return 0
+        fi
+      fi
+      if command -v dnf >/dev/null 2>&1 && can_use_sudo; then
+        if timeout 300 sudo dnf install -y jq 2>&1 | tee /tmp/jq-install.log; then
+          success "jq installed via dnf"; return 0
+        fi
+      fi
+      if command -v pacman >/dev/null 2>&1 && can_use_sudo; then
+        if timeout 300 sudo pacman -S --noconfirm jq 2>&1 | tee /tmp/jq-install.log; then
+          success "jq installed via pacman"; return 0
+        fi
+      fi
+      if command -v snap >/dev/null 2>&1 && can_use_sudo; then
+        if timeout 300 sudo snap install jq 2>&1 | tee /tmp/jq-install.log; then
+          success "jq installed via snap"; return 0
+        fi
+      fi
+      warn "All package manager methods failed. Download jq from https://stedolan.github.io/jq/"
+      return 1
+      ;;
+    windows)
+      warn "Install jq with scoop/choco or your preferred package manager"
+      return 1
+      ;;
+    *)
+      error "Unknown platform for jq install"; return 1
+      ;;
+  esac
 }
 
 install_ripgrep() {
@@ -506,8 +570,8 @@ install_scanner() {
     fi
 
     # Verify critical content markers
-    if ! grep -q "ULTIMATE BUG SCANNER" "$temp_path"; then
-      error "Downloaded file doesn't appear to be the bug scanner script"
+    if ! grep -q "UBS Meta-Runner" "$temp_path"; then
+      error "Downloaded file doesn't appear to be the UBS meta-runner"
       rm -f "$temp_path"
       return 1
     fi
@@ -654,10 +718,9 @@ create_alias() {
 
 setup_claude_code_hook() {
   if [ ! -d ".claude" ]; then
-    log "Not in a project with .claude directory. Skipping..."
-    return 0
+    mkdir -p ".claude"
+    log "Created .claude directory for Claude Code integration."
   fi
-
   log "Setting up Claude Code hook..."
 
   local hook_dir=".claude/hooks"
@@ -682,6 +745,55 @@ HOOK_EOF
 
   chmod +x "$hook_file"
   success "Claude Code hook created: $hook_file"
+}
+
+append_agent_rule_block() {
+  local agent_dir="$1"
+  local friendly_name="$2"
+  local file="$agent_dir/rules"
+  local marker="Ultimate Bug Scanner Integration"
+
+  mkdir -p "$agent_dir"
+  if [ -f "$file" ] && grep -q "$marker" "$file"; then
+    log "$friendly_name instructions already present at $file"
+    return 0
+  fi
+
+  cat >> "$file" <<'RULE'
+# >>> Ultimate Bug Scanner Integration
+# Always run the unified scanner before finalizing work:
+#   1. Execute: ubs --fail-on-warning .
+#   2. Review and fix any findings (critical + warning) before marking a task complete.
+#   3. Mention outstanding issues in your response if they remain.
+# This keeps AI coding agents honest about quality.
+# <<< End Ultimate Bug Scanner Integration
+
+RULE
+  success "Added $friendly_name quality instructions at $file"
+}
+
+setup_cursor_rules() {
+  append_agent_rule_block ".cursor" "Cursor"
+}
+
+setup_codex_rules() {
+  append_agent_rule_block ".codex" "Codex CLI"
+}
+
+setup_gemini_rules() {
+  append_agent_rule_block ".gemini" "Gemini Code Assist"
+}
+
+setup_windsurf_rules() {
+  append_agent_rule_block ".windsurf" "Windsurf"
+}
+
+setup_cline_rules() {
+  append_agent_rule_block ".cline" "Cline"
+}
+
+setup_opencode_rules() {
+  append_agent_rule_block ".opencode" "OpenCode"
 }
 
 setup_git_hook() {
@@ -725,6 +837,24 @@ HOOK_EOF
   chmod +x "$hook_file"
   success "Git pre-commit hook created: $hook_file"
   log "To bypass: git commit --no-verify"
+}
+
+detect_coding_agents() {
+  HAS_AGENT_CLAUDE=0
+  HAS_AGENT_CODEX=0
+  HAS_AGENT_CURSOR=0
+  HAS_AGENT_GEMINI=0
+  HAS_AGENT_OPENCODE=0
+  HAS_AGENT_WINDSURF=0
+  HAS_AGENT_CLINE=0
+
+  [[ -d "${HOME}/.claude" || -d ".claude" ]] && HAS_AGENT_CLAUDE=1
+  [[ -d "${HOME}/.codex"  || -d ".codex"  ]] && HAS_AGENT_CODEX=1
+  [[ -d "${HOME}/.cursor" || -d ".cursor" ]] && HAS_AGENT_CURSOR=1
+  [[ -d "${HOME}/.gemini" || -d ".gemini" ]] && HAS_AGENT_GEMINI=1
+  [[ -d "${HOME}/.opencode" || -d ".opencode" ]] && HAS_AGENT_OPENCODE=1
+  [[ -d "${HOME}/.windsurf" || -d ".windsurf" ]] && HAS_AGENT_WINDSURF=1
+  [[ -d "${HOME}/.cline" || -d ".cline" ]] && HAS_AGENT_CLINE=1
 }
 
 add_to_agents_md() {
@@ -789,12 +919,36 @@ AGENTS_EOF
   success "Added section to AGENTS.md"
 }
 
+maybe_setup_hook() {
+  local label="$1"
+  local detected_flag="$2"
+  local fn_name="$3"
+
+  if [ "$detected_flag" != "-1" ] && [ "$detected_flag" -eq 0 ]; then
+    log "Skipping ${label} (agent not detected)"
+    return 0
+  fi
+
+  if [ "$EASY_MODE" -eq 1 ]; then
+    "$fn_name"
+  else
+    if ask "Set up ${label}?"; then
+      "$fn_name"
+    fi
+  fi
+}
+
 main() {
   print_header
 
   # Parse arguments
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --easy-mode)
+        EASY_MODE=1
+        NON_INTERACTIVE=1
+        shift
+        ;;
       --non-interactive)
         NON_INTERACTIVE=1
         shift
@@ -805,6 +959,10 @@ main() {
         ;;
       --skip-ripgrep)
         SKIP_RIPGREP=1
+        shift
+        ;;
+      --skip-jq)
+        SKIP_JQ=1
         shift
         ;;
       --skip-hooks)
@@ -827,6 +985,7 @@ main() {
         echo "Usage: install.sh [OPTIONS]"
         echo ""
         echo "Options:"
+        echo "  --easy-mode          Accept all prompts, install deps, and wire integrations"
         echo "  --non-interactive    Skip all prompts (use defaults)"
         echo "  --skip-ast-grep      Skip ast-grep installation"
         echo "  --skip-ripgrep       Skip ripgrep installation"
@@ -846,6 +1005,9 @@ main() {
 
   log "Detected platform: $(detect_platform)"
   log "Detected shell: $(detect_shell)"
+  if [ "$EASY_MODE" -eq 1 ]; then
+    log "Easy mode enabled: auto-confirming prompts and wiring integrations."
+  fi
   echo ""
 
   # Check for ast-grep
@@ -872,6 +1034,18 @@ main() {
     echo ""
   fi
 
+  # Check for jq
+  if ! check_jq && [ "$SKIP_JQ" -eq 0 ]; then
+    warn "jq not found (required for JSON/SARIF merging)"
+    if ask "Install jq now?"; then
+      install_jq || warn "Continuing without jq (merged outputs disabled)"
+    fi
+    echo ""
+  else
+    success "jq is installed"
+    echo ""
+  fi
+
   # Install the scanner
   if ! install_scanner; then
     error "Installation failed"
@@ -887,16 +1061,19 @@ main() {
   create_alias
   echo ""
 
-  # Setup hooks
-  if [ "$SKIP_HOOKS" -eq 0 ]; then
-    if ask "Set up Claude Code hook?"; then
-      setup_claude_code_hook
-    fi
-    echo ""
+  detect_coding_agents
+  log "Detected coding agents: claude=${HAS_AGENT_CLAUDE} codex=${HAS_AGENT_CODEX} cursor=${HAS_AGENT_CURSOR} gemini=${HAS_AGENT_GEMINI} windsurf=${HAS_AGENT_WINDSURF} cline=${HAS_AGENT_CLINE} opencode=${HAS_AGENT_OPENCODE}"
 
-    if ask "Set up git pre-commit hook?"; then
-      setup_git_hook
-    fi
+  # Setup hooks / guardrails
+  if [ "$SKIP_HOOKS" -eq 0 ]; then
+    maybe_setup_hook "Git pre-commit hook" -1 setup_git_hook
+    maybe_setup_hook "Claude Code on-save hook (.claude/hooks/on-file-write.sh)" "$HAS_AGENT_CLAUDE" setup_claude_code_hook
+    maybe_setup_hook "Cursor guardrails (.cursor/rules)" "$HAS_AGENT_CURSOR" setup_cursor_rules
+    maybe_setup_hook "Codex CLI guardrails (.codex/rules)" "$HAS_AGENT_CODEX" setup_codex_rules
+    maybe_setup_hook "Gemini Code Assist guardrails (.gemini/rules)" "$HAS_AGENT_GEMINI" setup_gemini_rules
+    maybe_setup_hook "Windsurf guardrails (.windsurf/rules)" "$HAS_AGENT_WINDSURF" setup_windsurf_rules
+    maybe_setup_hook "Cline guardrails (.cline/rules)" "$HAS_AGENT_CLINE" setup_cline_rules
+    maybe_setup_hook "OpenCode MCP guardrails (.opencode/rules)" "$HAS_AGENT_OPENCODE" setup_opencode_rules
     echo ""
   fi
 

@@ -56,7 +56,13 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 
 ## 🎯 **The Solution: Your 24/7 Bug Hunting Partner**
 
-Ultimate Bug Scanner is like having a senior developer review every line of code **in under 5 seconds**:
+### 🧠 Language-Aware Meta-Runner
+- `ubs` auto-detects **JavaScript/TypeScript, Python, C++, and Rust** in the same repo and fanns out to per-language scanners.
+- Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|sarif` for consistent downstream tooling.
+- Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
+- Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
+
+Ultimate Bug Scanner is like having a senior developer review every line of code **in under 5 seconds**; it's the perfect automated companion to your favorite coding agent:
 
 ```bash
 $ ubs .
@@ -283,6 +289,7 @@ The installer will:
 - ✅ Install the `ubs` command globally
 - ✅ Optionally install `ast-grep` (for advanced AST analysis)
 - ✅ Optionally install `ripgrep` (for 10x faster scanning)
+- ✅ Optionally install `jq` (needed for JSON/SARIF merging across all language scanners)
 - ✅ Set up git hooks (block commits with critical bugs)
 - ✅ Set up Claude Code hooks (scan on file save)
 - ✅ Add documentation to your AGENTS.md
