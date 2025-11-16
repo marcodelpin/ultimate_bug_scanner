@@ -42,14 +42,14 @@
 - [x] Wire helper + call.
 
 ## Fixtures & Tests
-- [ ] Add failing/clean fixtures for JS.
-- [ ] Add failing/clean fixtures for Python.
-- [ ] Add failing/clean fixtures for Go.
-- [ ] Add failing/clean fixtures for C++.
-- [ ] Add failing/clean fixtures for Rust.
-- [ ] Add failing/clean fixtures for Java.
-- [ ] Add failing/clean fixtures for Ruby.
-- [ ] Update test-suite/manifest.json with new cases per language (covering fail + clean expectations, threshold counts).
+- [x] Add failing/clean fixtures for JS.
+- [x] Add failing/clean fixtures for Python.
+- [x] Add failing/clean fixtures for Go.
+- [x] Add failing/clean fixtures for C++.
+- [x] Add failing/clean fixtures for Rust.
+- [x] Add failing/clean fixtures for Java.
+- [x] Add failing/clean fixtures for Ruby.
+- [x] Update test-suite/manifest.json with new cases per language (covering fail + clean expectations, threshold counts).
 - [ ] Run targeted UBS manifest(s) to validate new checks fire; capture summary in notes/issue.
 
 ## Documentation / Handoff
