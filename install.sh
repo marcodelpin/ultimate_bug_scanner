@@ -262,7 +262,7 @@ ask() {
     return 1  # Default to "no" in non-interactive mode
   fi
   local response
-  read -p "$(echo -e "${YELLOW}?${RESET} ${prompt} (y/N): ")" response
+  read -r -p "$(echo -e "${YELLOW}?${RESET} ${prompt} (y/N): ")" response
   [[ "$response" =~ ^[Yy]$ ]]
 }
 
@@ -513,13 +513,6 @@ install_ast_grep() {
       ;;
   esac
 
-  if check_ast_grep; then
-    success "ast-grep installed successfully"
-    return 0
-  else
-    error "ast-grep installation failed - command not found after install"
-    return 1
-  fi
 }
 
 check_ripgrep() { command -v rg >/dev/null 2>&1; }
@@ -533,7 +526,8 @@ check_typos() { command -v typos >/dev/null 2>&1; }
 version_compare() {
   # Compare two version strings using semantic versioning
   # Returns: 0 if $1 > $2, 1 if $1 <= $2
-  local ver1="${1#v}"; local ver2="${2#v}"
+  local ver1="${1#v}"
+  local ver2="${2#v}"
   if [ "$ver1" = "$ver2" ]; then return 1; fi
 
   if echo -e "2.0\n1.0" | sort -V >/dev/null 2>&1; then
@@ -543,11 +537,17 @@ version_compare() {
   fi
 
   # Fallback numeric-only compare: strip non-digits from components
-  IFS='.' read -r -a v1 <<< "$(echo "$ver1" | sed 's/[^0-9.]/./g')"
-  IFS='.' read -r -a v2 <<< "$(echo "$ver2" | sed 's/[^0-9.]/./g')"
-  local n=${#v1[@]}; [ ${#v2[@]} -gt $n ] && n=${#v2[@]}
+  local clean1="${ver1//[^0-9.]/.}"
+  local clean2="${ver2//[^0-9.]/.}"
+  IFS='.' read -r -a v1 <<< "$clean1"
+  IFS='.' read -r -a v2 <<< "$clean2"
+  local n=${#v1[@]}
+  local len2=${#v2[@]}
+  if [ "$len2" -gt "$n" ]; then
+    n="$len2"
+  fi
   for ((i=0;i<n;i++)); do
-    local a="${v1[i]:-0}"; local b="${v2[i]:-0}"
+    local a="${v1[i]:-0}" b="${v2[i]:-0}"
     a=$((10#$a)); b=$((10#$b))
     if ((a>b)); then return 0; elif ((a<b)); then return 1; fi
   done
@@ -618,19 +618,16 @@ download_binary_release() {
   case "$tool" in
     ripgrep)
       local version="14.1.0"
-      local asset tarball_dir
+      local asset
       case "$platform" in
         linux|wsl)
           asset="ripgrep-${version}-${arch}-unknown-linux-musl.tar.gz"
-          tarball_dir="ripgrep-${version}-${arch}-unknown-linux-musl"
           ;;
         macos)
           asset="ripgrep-${version}-${arch}-apple-darwin.tar.gz"
-          tarball_dir="ripgrep-${version}-${arch}-apple-darwin"
           ;;
         freebsd)
           asset="ripgrep-${version}-${arch}-unknown-freebsd.tar.gz"
-          tarball_dir="ripgrep-${version}-${arch}-unknown-freebsd"
           ;;
         *) warn "No binary release for $platform"; return 1 ;;
       esac
@@ -876,13 +873,17 @@ SMOKE
   # Test 6: Hooks
   echo ""
   log "Integration hooks:"
-  [ -f ".git/hooks/pre-commit" ] && grep -q "ubs" ".git/hooks/pre-commit" 2>/dev/null && \
-    success "   Git pre-commit hook installed" || \
+  if [ -f ".git/hooks/pre-commit" ] && grep -q "ubs" ".git/hooks/pre-commit" 2>/dev/null; then
+    success "   Git pre-commit hook installed"
+  else
     log "   Git hook: not installed"
+  fi
 
-  [ -f ".claude/hooks/on-file-write.sh" ] && \
-    success "   Claude Code hook installed" || \
+  if [ -f ".claude/hooks/on-file-write.sh" ]; then
+    success "   Claude Code hook installed"
+  else
     log "   Claude hook: not installed"
+  fi
 
   if [ $errors -eq 0 ]; then
     success "All verification checks passed."
@@ -904,7 +905,11 @@ run_self_tests_if_requested() {
 
   local script_dir test_script
   local -a candidates=()
-  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]:-${0}}")" 2>/dev/null && pwd || pwd)"
+  if script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]:-${0}}")" 2>/dev/null && pwd)"; then
+    :
+  else
+    script_dir="$PWD"
+  fi
   candidates+=("$script_dir/test-suite/install/run_tests.sh")
   candidates+=("$PWD/test-suite/install/run_tests.sh")
 
@@ -1010,7 +1015,8 @@ read_config_file() {
         RUN_SELF_TEST="$(normalize_bool "$value")"
         ;;
       easy_mode)
-        local normalized="$(normalize_bool "$value")"
+        local normalized
+        normalized="$(normalize_bool "$value")"
         EASY_MODE="$normalized"
         NON_INTERACTIVE="$normalized"
         ;;
@@ -1161,25 +1167,35 @@ diagnostic_check() {
 
   # Integration Hooks
   echo -e "${BOLD}Integration Hooks:${RESET}"
-  [ -f ".git/hooks/pre-commit" ] && grep -q "ubs" ".git/hooks/pre-commit" 2>/dev/null && \
-    success "  Git pre-commit hook installed" || \
+  if [ -f ".git/hooks/pre-commit" ] && grep -q "ubs" ".git/hooks/pre-commit" 2>/dev/null; then
+    success "  Git pre-commit hook installed"
+  else
     log "  Git hook: not installed"
+  fi
 
-  [ -f ".claude/hooks/on-file-write.sh" ] && \
-    success "  Claude Code hook installed" || \
+  if [ -f ".claude/hooks/on-file-write.sh" ]; then
+    success "  Claude Code hook installed"
+  else
     log "  Claude hook: not installed"
+  fi
 
-  [ -f ".cursor/rules" ] && grep -q "Ultimate Bug Scanner" ".cursor/rules" 2>/dev/null && \
-    success "  Cursor rules configured" || \
+  if [ -f ".cursor/rules" ] && grep -q "Ultimate Bug Scanner" ".cursor/rules" 2>/dev/null; then
+    success "  Cursor rules configured"
+  else
     log "  Cursor: not configured"
+  fi
 
-  [ -f ".codex/rules" ] && grep -q "Ultimate Bug Scanner" ".codex/rules" 2>/dev/null && \
-    success "  Codex CLI rules configured" || \
+  if [ -f ".codex/rules" ] && grep -q "Ultimate Bug Scanner" ".codex/rules" 2>/dev/null; then
+    success "  Codex CLI rules configured"
+  else
     log "  Codex: not configured"
+  fi
 
-  [ -f ".gemini/rules" ] && grep -q "Ultimate Bug Scanner" ".gemini/rules" 2>/dev/null && \
-    success "  Gemini rules configured" || \
+  if [ -f ".gemini/rules" ] && grep -q "Ultimate Bug Scanner" ".gemini/rules" 2>/dev/null; then
+    success "  Gemini rules configured"
+  else
     log "  Gemini: not configured"
+  fi
 
   echo ""
 
@@ -1188,9 +1204,16 @@ diagnostic_check() {
   echo -e "${BOLD}Module Cache:${RESET}"
   if [ -d "$module_dir" ]; then
     echo "  Location: $module_dir"
-    if [ "$(ls -1 "$module_dir" 2>/dev/null | wc -l)" -gt 0 ]; then
+    local module_entries=()
+    while IFS= read -r entry; do
+      module_entries+=("$entry")
+    done < <(find "$module_dir" -mindepth 1 -maxdepth 1 -exec basename {} \; 2>/dev/null | LC_ALL=C sort)
+
+    if [ ${#module_entries[@]} -gt 0 ]; then
       echo "  Cached modules:"
-      ls -1 "$module_dir" 2>/dev/null | sed 's/^/    - /'
+      for entry in "${module_entries[@]}"; do
+        printf "    - %s\n" "$entry"
+      done
     else
       log "  (No modules cached yet)"
     fi
@@ -1215,14 +1238,16 @@ diagnostic_check() {
 
   # Permissions
   echo -e "${BOLD}Permissions:${RESET}"
-  local install_dir="$(determine_install_dir)"
+  local install_dir
+  install_dir="$(determine_install_dir)"
   if [ -w "$install_dir" ]; then
     success "  Install directory writable: $install_dir"
   else
     warn "  Install directory not writable: $install_dir"
   fi
 
-  local rc_file="$(get_rc_file)"
+  local rc_file
+  rc_file="$(get_rc_file)"
   if [ -w "$rc_file" ]; then
     success "  RC file writable: $rc_file"
   else
@@ -1260,7 +1285,8 @@ uninstall_ubs() {
   echo ""
 
   # Remove binary
-  local install_dir="$(determine_install_dir)"
+  local install_dir
+  install_dir="$(determine_install_dir)"
   local script_path="$install_dir/$INSTALL_NAME"
 
   if [ -f "$script_path" ]; then
@@ -1271,7 +1297,8 @@ uninstall_ubs() {
   fi
 
   # Remove from PATH (restore RC file)
-  local rc_file="$(get_rc_file)"
+  local rc_file
+  rc_file="$(get_rc_file)"
   if [ -f "$rc_file" ]; then
     if grep -q "Ultimate Bug Scanner" "$rc_file" 2>/dev/null; then
       cp "$rc_file" "${rc_file}.pre-uninstall-backup"
@@ -1609,13 +1636,6 @@ install_ripgrep() {
       ;;
   esac
 
-  if check_ripgrep; then
-    success "ripgrep installed successfully"
-    return 0
-  else
-    error "ripgrep installation failed - command not found after install"
-    return 1
-  fi
 }
 
 install_typos() {
@@ -2460,36 +2480,10 @@ uninstall_ubs
 exit 0
 ;;
 --help)
-echo "Usage: install.sh [OPTIONS]"
-echo ""
-echo "Options:"
-echo "  --easy-mode             Accept all prompts, install deps, and wire integrations"
-echo "  --non-interactive       Skip all prompts (use defaults)"
-echo "  --update                Force reinstall to latest version"
-echo "  --skip-ast-grep         Skip ast-grep installation"
-echo "  --skip-ripgrep          Skip ripgrep installation"
-echo "  --skip-jq               Skip jq installation"
-echo "  --skip-typos            Skip typos installation"
-echo "  --skip-hooks            Skip hook setup"
-echo "  --skip-version-check    Don't check for updates"
-echo "  --skip-verification     Skip post-install verification"
-echo "  --dry-run               Print every action without modifying the system (skips verification/self-test contents)"
-echo "  --self-test             Run installer smoke tests after install (requires repo test-suite/install/run_tests.sh)"
-echo "  --install-dir DIR       Custom installation directory"
-echo "  --system                Install system-wide to /usr/local/bin (uses sudo if needed)"
-echo "  --no-path-modify        Do not modify shell RC files to add to PATH"
-echo "  --quiet                 Minimal output"
-echo "  --no-color              Disable ANSI colors"
-echo "  --setup-git-hook        Only set up git hook (no install)"
-echo "  --setup-claude-hook     Only set up Claude Code hook (no install)"
-echo "  --generate-config       Create configuration file at ~/.config/ubs/install.conf"
-echo "  --diagnose              Run diagnostic check and show system information"
-echo "  --uninstall             Remove UBS and all integrations"
-echo "  --help                  Show this help"
-echo ""
+show_help
 echo "Notes:"
-echo "  --dry-run still resolves config and detects agents so you can audit changes safely."
-echo "  --self-test is ideal for CI but must run from a working tree that contains the test-suite harness."
+echo "  --dry-run resolves config and detects agents so you can audit changes safely."
+echo "  --self-test is ideal for CI but must run from a working tree that contains test-suite/install/run_tests.sh."
 exit 0
 ;;
 *)
