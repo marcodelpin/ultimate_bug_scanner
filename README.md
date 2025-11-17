@@ -971,6 +971,8 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scan
 
 **Total time:** 30 seconds to 2 minutes (depending on dependencies)
 
+Need to keep your shell RC files untouched? Combine `--no-path-modify` (and optionally `--skip-hooks`) with the command above—the installer will still drop `ubs` into your chosen `--install-dir`, but it will skip both PATH edits and the alias helper entirely.
+
 ### **Option 2: Manual Install**
 
 ```bash
@@ -1552,6 +1554,18 @@ Layer 4: STATISTICAL (Insightful)  │
 - **DeepCode**: ML-powered analysis (if you trust cloud)
 
 **Best combo:** TypeScript + ESLint + Ultimate Bug Scanner = Maximum safety
+
+---
+
+## 🧪 Installer Regression Tests
+
+Working on the installer? Run the smoke suite so we never regress again:
+
+```bash
+bash test-suite/install/run_tests.sh
+```
+
+The harness boots `install.sh` inside disposable `$HOME` directories, asserts that the post-install verification banner appears, and ensures `--no-path-modify` truly leaves shell rc files untouched. CI jobs can call the same script to get signal in under a second.
 
 ---
 

@@ -192,6 +192,15 @@ Comprehensive enhancement of the UBS installation script with enterprise-grade f
 
 ---
 
+## ♻ Post-Audit Fixes (Nov 17, 2025)
+
+- Hardened `detect_coding_agents()` so it never aborts the installer when a heuristic probe (e.g., missing `.replit` file or absent VS Code extension) fails under `set -e`.
+- `--no-path-modify` now skips both PATH edits **and** the alias helper, so CI installs or reproducible environments can avoid touching shell rc files entirely.
+- Synced the repo `VERSION` file with the installer’s hard-coded version (4.6.0) so update checks behave predictably.
+- Added `test-suite/install/run_tests.sh`, a disposable `$HOME` harness that exercises the installer in non-interactive mode and guards against regressions in automation.
+
+---
+
 ## 📋 Implementation Statistics
 
 ### Files Modified
