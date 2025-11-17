@@ -80,6 +80,24 @@ declare -A ASYNC_ERROR_SEVERITY=(
   [go.async.goroutine-err-no-check]='warning'
 )
 
+# Taint analysis metadata
+TAINT_RULE_IDS=(go.taint.xss go.taint.sql go.taint.command)
+declare -A TAINT_SUMMARY=(
+  [go.taint.xss]='User input flows into fmt.Fprintf/template Execute/ResponseWriter.Write'
+  [go.taint.sql]='User input concatenated into db.Exec/db.Query SQL strings'
+  [go.taint.command]='User input reaches exec.Command/CommandContext'
+)
+declare -A TAINT_REMEDIATION=(
+  [go.taint.xss]='Escape with html/template or html.EscapeString before writing to the response'
+  [go.taint.sql]='Use parameterized queries or database/sql placeholders instead of string concat'
+  [go.taint.command]='Validate and sanitize shell arguments (path.Clean, allowlists) or avoid shell invocation'
+)
+declare -A TAINT_SEVERITY=(
+  [go.taint.xss]='critical'
+  [go.taint.sql]='critical'
+  [go.taint.command]='critical'
+)
+
 # Resource lifecycle correlation spec (acquire vs release pairs)
 RESOURCE_LIFECYCLE_IDS=(context_cancel ticker_stop timer_stop)
 declare -A RESOURCE_LIFECYCLE_SEVERITY=(
@@ -430,6 +448,241 @@ PY
   rm -f "$tmp_json"
   if [[ $printed -eq 0 ]]; then
     print_finding "good" "All goroutines handle errors explicitly"
+  fi
+}
+
+
+run_taint_analysis_checks() {
+  print_subheader "Lightweight taint analysis"
+  if ! command -v python3 >/dev/null 2>&1; then
+    print_finding "info" 0 "python3 not available" "Install python3 to enable taint flow checks"
+    return
+  fi
+  local printed=0
+  while IFS=$'\t' read -r rule_id count samples; do
+    [[ -z "$rule_id" ]] && continue
+    printed=1
+    local severity=${TAINT_SEVERITY[$rule_id]:-warning}
+    local summary=${TAINT_SUMMARY[$rule_id]:-$rule_id}
+    local desc=${TAINT_REMEDIATION[$rule_id]:-"Sanitize user input before reaching this sink"}
+    if [[ -n "$samples" ]]; then
+      desc+=" (e.g., $samples)"
+    fi
+    print_finding "$severity" "$count" "$summary" "$desc"
+  done < <(python3 - "$PROJECT_DIR" <<'PY'
+import re, sys
+from collections import defaultdict
+from pathlib import Path
+
+ROOT = Path(sys.argv[1]).resolve()
+BASE_DIR = ROOT if ROOT.is_dir() else ROOT.parent
+SKIP_DIRS = {'.git', 'vendor', '.cache', 'bin', 'dist', '.idea'}
+EXTS = {'.go'}
+PATH_LIMIT = 5
+
+SOURCE_PATTERNS = [
+    re.compile(r"\.FormValue\(", re.IGNORECASE),
+    re.compile(r"URL\.Query\(\)\.Get", re.IGNORECASE),
+    re.compile(r"os\.Getenv", re.IGNORECASE),
+    re.compile(r"bufio\.NewReader\(os\.Stdin\)", re.IGNORECASE),
+    re.compile(r"io\.ReadAll\([^)]*req\.Body", re.IGNORECASE),
+    re.compile(r"json\.NewDecoder\([^)]*req\.Body", re.IGNORECASE),
+]
+
+SANITIZER_REGEXES = [
+    re.compile(r"html\.EscapeString"),
+    re.compile(r"template\.HTMLEscapeString"),
+    re.compile(r"url\.QueryEscape"),
+    re.compile(r"path\.Clean"),
+]
+
+SINKS = [
+    (re.compile(r"fmt\.Fprint[fLn]?\s*\((.+)\)"), 'go.taint.xss', 'fmt.Fprintf'),
+    (re.compile(r"[A-Za-z0-9_]+\.Write\s*\((.+)\)"), 'go.taint.xss', 'ResponseWriter.Write'),
+    (re.compile(r"template\.(?:Must\()?[A-Za-z0-9_]+\.Execute\s*\((.+)\)"), 'go.taint.xss', 'template.Execute'),
+    (re.compile(r"\bdb\.(?:Exec|Query|Raw|NamedQuery)\s*\((.+)\)"), 'go.taint.sql', 'db query'),
+    (re.compile(r"exec\.Command(?:Context)?\s*\((.+)\)"), 'go.taint.command', 'exec.Command'),
+]
+
+ASSIGN_PATTERNS = [
+    re.compile(r"^(?P<targets>[A-Za-z_][\w]*(?:\s*,\s*[A-Za-z_][\w]*)*)\s*:=\s*(?P<expr>.+)"),
+    re.compile(r"^(?P<targets>[A-Za-z_][\w]*(?:\s*,\s*[A-Za-z_][\w]*)*)\s*=\s*(?P<expr>.+)"),
+    re.compile(r"^var\s+(?P<targets>[A-Za-z_][\w]*(?:\s*,\s*[A-Za-z_][\w]*)*)(?:\s+[A-Za-z0-9_\*\[\]]+)?\s*=\s*(?P<expr>.+)")
+]
+
+def should_skip(path: Path) -> bool:
+    return any(part in SKIP_DIRS for part in path.parts)
+
+
+def iter_files(root: Path):
+    if root.is_file():
+        if root.suffix.lower() in EXTS:
+            yield root
+        return
+    for path in root.rglob('*'):
+        if not path.is_file():
+            continue
+        if should_skip(path):
+            continue
+        if path.suffix.lower() in EXTS:
+            yield path
+
+
+def strip_comments(line: str) -> str:
+    out, quote, escape = [], '', False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == quote:
+                quote = ''
+            i += 1
+            continue
+        if ch in ('"', "'", '`'):
+            quote = ch
+            i += 1
+            continue
+        if ch == '/' and i + 1 < len(line):
+            nxt = line[i + 1]
+            if nxt == '/':
+                break
+            if nxt == '*':
+                end = line.find('*/', i + 2)
+                if end == -1:
+                    break
+                i = end + 2
+                continue
+        out.append(ch)
+        i += 1
+    return ''.join(out).strip()
+
+
+def parse_assignments(lines):
+    assignments = []
+    for idx, raw in enumerate(lines, start=1):
+        line = strip_comments(raw)
+        if not line or '=' not in line:
+            continue
+        for pattern in ASSIGN_PATTERNS:
+            match = pattern.match(line)
+            if not match:
+                continue
+            targets = match.group('targets')
+            expr = match.group('expr')
+            for target in [t.strip() for t in targets.split(',') if t.strip()]:
+                assignments.append((idx, target, expr))
+            break
+    return assignments
+
+
+def find_sources(expr: str):
+    matches = []
+    for regex in SOURCE_PATTERNS:
+        for m in regex.finditer(expr):
+            matches.append(m.group(0))
+    return matches
+
+
+def expr_has_sanitizer(expr: str, sink_rule: str | None = None) -> bool:
+    for regex in SANITIZER_REGEXES:
+        if regex.search(expr):
+            return True
+    if sink_rule == 'go.taint.sql' and re.search(r",\s*(?:args|params|values)\b", expr, re.IGNORECASE):
+            return True
+    return False
+
+
+def expr_has_tainted(expr: str, tainted):
+    for name, meta in tainted.items():
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
+        if re.search(pattern, expr):
+            return name, meta
+    return None, None
+
+
+def record_taint(assignments):
+    tainted = {}
+    for line_no, target, expr in assignments:
+        if expr_has_sanitizer(expr, None):
+            continue
+        sources = find_sources(expr)
+        if sources:
+            tainted[target] = {'source': sources[0], 'line': line_no, 'path': [sources[0], target]}
+    for _ in range(5):
+        changed = False
+        for line_no, target, expr in assignments:
+            if target in tainted or expr_has_sanitizer(expr, None):
+                continue
+            ref, meta = expr_has_tainted(expr, tainted)
+            if ref:
+                seq = list(meta.get('path', [ref]))
+                if len(seq) >= PATH_LIMIT:
+                    seq = seq[-(PATH_LIMIT-1):]
+                seq.append(target)
+                tainted[target] = {'source': meta.get('source', ref), 'line': line_no, 'path': seq}
+                changed = True
+        if not changed:
+            break
+    return tainted
+
+
+def analyze_file(path: Path, issues):
+    try:
+        text = path.read_text(encoding='utf-8')
+    except (UnicodeDecodeError, OSError):
+        return
+    lines = text.splitlines()
+    assignments = parse_assignments(lines)
+    tainted = record_taint(assignments)
+    for idx, raw in enumerate(lines, start=1):
+        stripped = strip_comments(raw)
+        if not stripped:
+            continue
+        for regex, rule, label in SINKS:
+            match = regex.search(stripped)
+            if not match:
+                continue
+            expr = match.group(1)
+            if not expr or expr_has_sanitizer(expr, rule):
+                continue
+            direct = find_sources(expr)
+            if direct:
+                path_desc = f"{direct[0]} -> {label}"
+            else:
+                ref, meta = expr_has_tainted(expr, tainted)
+                if not ref:
+                    continue
+                seq = list(meta.get('path', [ref]))
+                if len(seq) >= PATH_LIMIT:
+                    seq = seq[-(PATH_LIMIT-1):]
+                seq.append(label)
+                path_desc = ' -> '.join(seq)
+            try:
+                rel = path.relative_to(BASE_DIR)
+            except ValueError:
+                rel = path.name
+            sample = f"{rel}:{idx} {path_desc}"
+            bucket = issues[rule]
+            bucket['count'] += 1
+            if len(bucket['samples']) < 3:
+                bucket['samples'].append(sample)
+
+
+issues = defaultdict(lambda: {'count': 0, 'samples': []})
+for file_path in iter_files(ROOT):
+    analyze_file(file_path, issues)
+
+for rule_id, data in issues.items():
+    samples = ','.join(data['samples'])
+    print(f"{rule_id}\t{data['count']}\t{samples}")
+PY
+)
+  if [[ $printed -eq 0 ]]; then
+    print_finding "good" "No tainted sources reach dangerous sinks"
   fi
 }
 
@@ -1149,6 +1402,8 @@ if [ "$count" -gt 0 ]; then print_finding "critical" "$count" "exec.Command(*, \
 print_subheader "exec without context"
 cmdctx=$([[ "$HAS_AST_GREP" -eq 1 && -f "$AST_JSON" ]] && ast_count "go.exec-command-without-context" || echo 0)
 if [ "$cmdctx" -gt 0 ]; then print_finding "info" "$cmdctx" "Prefer exec.CommandContext(ctx, ...)"; fi
+
+run_taint_analysis_checks
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
