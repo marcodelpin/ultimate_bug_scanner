@@ -724,6 +724,7 @@ KEYWORDS = {
     'try', 'catch', 'finally', 'throw', 'import', 'from', 'export', 'extends', 'super',
     'true', 'false', 'null', 'undefined', 'NaN', 'Infinity'
 }
+
 BUILTINS = {
     'console', 'Math', 'JSON', 'Number', 'String', 'Boolean', 'Promise', 'Date', 'window',
     'document', 'fetch', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'log',
@@ -999,6 +1000,53 @@ PY
   if [[ $printed -eq 0 ]]; then
     print_finding "good" "Hooks dependency arrays look accurate"
   fi
+}
+
+run_type_narrowing_checks() {
+  print_subheader "Type narrowing validation"
+  local script_dir helper
+  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  helper="$script_dir/helpers/type_narrowing_ts.js"
+  if [[ ! -f "$helper" ]]; then
+    print_finding "info" 0 "Type narrowing helper missing" "Helper script $helper not found"
+    return
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    print_finding "info" 0 "Node.js unavailable" "Install Node.js and the 'typescript' package to enable type narrowing analysis"
+    return
+  fi
+  local raw status
+  raw="$(node "$helper" "$PROJECT_DIR" 2>&1)"
+  status=$?
+  if [[ $status -ne 0 ]]; then
+    print_finding "warning" 0 "Type narrowing analyzer failed" "$raw"
+    return
+  fi
+  local info_lines issue_lines
+  info_lines="$(grep '^\[ubs-type-narrowing' <<<"$raw" || true)"
+  issue_lines="$(grep -v '^\[ubs-type-narrowing' <<<"$raw" | sed '/^[[:space:]]*$/d' || true)"
+  if [[ -z "$issue_lines" ]]; then
+    if [[ -n "$info_lines" ]]; then
+      print_finding "info" 0 "TypeScript compiler not detected" "Install the 'typescript' npm package to enable structural type narrowing validation"
+    else
+      print_finding "good" "No unsafe type narrowing patterns detected"
+    fi
+    return
+  fi
+  local count=0
+  local previews=()
+  while IFS=$'\t' read -r location message; do
+    [[ -z "$location" ]] && continue
+    count=$((count + 1))
+    if [[ ${#previews[@]} -lt 3 ]]; then
+      previews+=("$location → $message")
+    fi
+  done <<< "$issue_lines"
+  local desc="Examples: ${previews[*]}"
+  if [[ $count -gt ${#previews[@]} ]]; then
+    desc+=" (and $((count - ${#previews[@]})) more)"
+  fi
+  print_finding "warning" "$count" "Potentially unsafe type narrowing" "$desc"
 }
 
 run_taint_analysis_checks() {
@@ -2243,6 +2291,7 @@ fi
 
 run_async_error_checks
 run_hooks_dependency_checks
+run_type_narrowing_checks
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
