@@ -1589,6 +1589,32 @@ coverage/
 
 ---
 
+## 🧭 Language Coverage Comparison
+
+UBS ships seven language-focused analyzers. Each category below is scored using the following scale:
+
+- **0 – Not covered**
+- **1 – Simple heuristics/regex only**
+- **2 – Multi-signal/static heuristics (context-aware passes)**
+- **3 – Deep analysis (AST-grep rule packs, taint/dataflow engines, or toolchain integrations such as `cargo clippy`)**
+
+| Issue Category | JS / TS | Python | Go | C / C++ | Rust | Java | Ruby |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Null / Nil Safety | **2** – DOM guard & optional-chaining heuristics (cat.1) | **2** – `None` guard + dataclass fallbacks | **1** – Basic nil/pointer guards | **2** – Raw pointer/nullptr/RAII checks | **3** – Borrow/Option misuse via clippy + rules | **2** – Optional/null equality audits | **1** – Nil guard reminders |
+| Numeric & Type Coercion | **2** – NaN/loose equality/float equality (cat.2/4) | **2** – Division-by-zero & float precision | **1** – Limited arithmetic heuristics | **2** – UB risk & narrowing warnings | **2** – Float/overflow watchers (cat.4) | **1** – Basic comparisons only | **1** – Simple arithmetic foot-guns |
+| Collections & Memory | **2** – Array mutation/leak detectors | **2** – Dict/list iteration pitfalls | **1** – Slice/map heuristics | **3** – malloc/free, iterator invalidation, UB (cat.1/5/7) | **2** – Vec/String/iterator audits | **2** – Collections & generics misuse | **1** – Enumerator/default mutability hints |
+| Async / Concurrency | **3** – AST-grep + fallback for missing `await`, React hooks dep analyzer | **2** – Async/Await pitfall scans | **3** – Goroutine/channel/context/defer hygiene | **2** – `std::thread` join + `std::async` wait tracking | **2** – Async macros, Send/Sync checks | **2** – ExecutorService shutdown, `synchronized` monitors | **1** – Basic thread/promise hints |
+| Error Handling & Logging | **2** – Promise rejection / try–catch auditing | **2** – Exception swallow/logging checks | **2** – Error wrapping, panic usage | **2** – Throw-in-dtor, catch-by-value | **2** – Result/expect/panic usage | **2** – Logging best practices, try-with-resources | **1** – Rescue/raise heuristics |
+| Security & Taint | **3** – Lightweight taint engine + security heuristics (cat.7) | **2** – Eval/exec/SQL string heuristics | **2** – HTTP/crypto/command checks | **1** – Limited dedicated security (mostly UB) | **2** – Security category (cat.8) | **3** – SQL concat, `Runtime.exec`, SSL/crypto checks | **2** – Rails mass-assignment, shell/eval warnings |
+| Resource Lifecycle & I/O | **3** – AST event-listener/timer/observer tracking + heuristics | **2** – Context-manager & file lifecycle hints | **2** – `defer`/file close + HTTP resource hygiene | **2** – Thread join/malloc/free & resource correlation | **2** – Drop/RAII heuristics + correlation | **3** – Executor/file stream cleanup detections | **2** – File open/close + block usage hints |
+| Build / Tooling Hygiene | **0** – Not covered yet | **2** – `uv` extras, packaging, notebook hygiene | **2** – Go toolchain sanity (`go vet`, module drift) | **1** – CMake/CXX standard reminders | **3** – `cargo fmt/clippy/test/check` integrations | **2** – Maven/Gradle best-effort builds | **2** – Bundler/Rake/AST rule packs |
+| Code Quality Markers | **1** – TODO/HACK detectors | **1** | **1** | **1** | **1** | **1** | **1** |
+| Domain-Specific Extras | **3** – React hooks, Node I/O, taint flows | **2** – Typing strictness, notebook linting | **2** – Context propagation, HTTP server/client reviews | **2** – Modernization, macro/STL idioms | **3** – Unsafe/FFI audits, cargo inventory | **3** – SQL/Executor/annotation/path handling | **2** – Rails practicals, bundle hygiene |
+
+Use this matrix to decide which language module’s findings you want to prioritize or extend. For example, if you need deeper Go resource-lifecycle audits, you can extend category 5 (defer/cleanup) or contribute new AST-grep rules; for JavaScript security you can build on the taint engine already running in category 7.
+
+---
+
 ## 📜 **License**
 
 MIT License - see [LICENSE](LICENSE) file
