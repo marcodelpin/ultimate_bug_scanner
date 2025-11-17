@@ -181,6 +181,22 @@ success() { echo -e "${CHECK} $*"; }
 error() { echo -e "${CROSS} $*" >&2; }
 warn() { echo -e "${WARN} $*"; }
 
+log_network_failure() {
+  local context="$1"
+  local err_file="$2"
+  warn "$context"
+  if [ -n "$err_file" ] && [ -s "$err_file" ]; then
+    warn "  Last error: $(tail -n 1 "$err_file")"
+  fi
+}
+
+warn_path_shadow() {
+  local expected="$1"
+  local actual="$2"
+  warn "PATH resolves 'ubs' to $actual, but installer just wrote $expected."
+  warn "Update PATH or remove old binaries so the new version is used."
+}
+
 ask() {
   local prompt="$1"
   if [ "$EASY_MODE" -eq 1 ]; then
@@ -339,14 +355,22 @@ install_ast_grep() {
 
   log "Installing ast-grep..."
 
+  if dry_run_enabled; then
+    log_dry_run "Would install ast-grep (platform $platform)."
+    return 0
+  fi
+
+  local log_file
+  log_file="$(mktemp_in_workdir "ast-grep-install.log.XXXXXX")"
+
   case "$platform" in
     macos)
       if command -v brew >/dev/null 2>&1; then
-        if brew install ast-grep 2>&1 | tee /tmp/ast-grep-install.log; then
+        if brew install ast-grep 2>&1 | tee "$log_file"; then
           success "ast-grep installed via Homebrew"
           return 0
         else
-          error "Homebrew installation failed. Check /tmp/ast-grep-install.log"
+          error "Homebrew installation failed. Check $log_file"
           return 1
         fi
       else
@@ -360,7 +384,7 @@ install_ast_grep() {
       fi
       if command -v cargo >/dev/null 2>&1; then
         log "Attempting installation via cargo..."
-        if cargo install ast-grep 2>&1 | tee /tmp/ast-grep-install.log; then
+        if cargo install ast-grep 2>&1 | tee "$log_file"; then
           success "ast-grep installed via cargo"
           return 0
         else
@@ -370,7 +394,7 @@ install_ast_grep() {
 
       if command -v npm >/dev/null 2>&1; then
         log "Attempting installation via npm..."
-        if npm install -g @ast-grep/cli 2>&1 | tee /tmp/ast-grep-install.log; then
+        if npm install -g @ast-grep/cli 2>&1 | tee "$log_file"; then
           success "ast-grep installed via npm"
           return 0
         else
@@ -391,7 +415,7 @@ install_ast_grep() {
       log "BSD platform detected: $platform"
       if command -v cargo >/dev/null 2>&1; then
         log "Attempting installation via cargo..."
-        if cargo install ast-grep 2>&1 | tee /tmp/ast-grep-install.log; then
+        if cargo install ast-grep 2>&1 | tee "$log_file"; then
           success "ast-grep installed via cargo"
           return 0
         fi
@@ -399,7 +423,7 @@ install_ast_grep() {
 
       if command -v npm >/dev/null 2>&1; then
         log "Attempting installation via npm..."
-        if npm install -g @ast-grep/cli 2>&1 | tee /tmp/ast-grep-install.log; then
+        if npm install -g @ast-grep/cli 2>&1 | tee "$log_file"; then
           success "ast-grep installed via npm"
           return 0
         fi
@@ -416,7 +440,7 @@ install_ast_grep() {
       ;;
     windows)
       if command -v cargo >/dev/null 2>&1; then
-        if cargo install ast-grep 2>&1 | tee /tmp/ast-grep-install.log; then
+        if cargo install ast-grep 2>&1 | tee "$log_file"; then
           success "ast-grep installed via cargo"
           return 0
         else
@@ -504,10 +528,7 @@ check_for_updates() {
       success "You have the latest version ($current_version)"
     fi
   else
-    warn "Could not check for updates (network issue or rate limit)"
-    if [ -s "$err_log" ]; then
-      warn "  Last error: $(tail -n 1 "$err_log")"
-    fi
+    log_network_failure "Could not check for updates (network issue or rate limit)" "$err_log"
   fi
 }
 
@@ -527,7 +548,16 @@ download_binary_release() {
   local install_dir="$HOME/.local/bin"
   mkdir -p "$install_dir" 2>/dev/null || { error "Cannot create $install_dir"; return 1; }
 
+  if dry_run_enabled; then
+    log_dry_run "Would download binary for $tool ($platform-$arch)."
+    return 0
+  fi
+
   log "Attempting binary download for $tool ($platform-$arch)..."
+  local err_log temp_dir
+  err_log="$(mktemp_in_workdir "${tool}.download.err.XXXXXX")"
+  temp_dir="$(mktemp -d -p "$WORKDIR" "${tool}.download.XXXXXX")"
+  register_temp_path "$temp_dir"
 
   case "$tool" in
     ripgrep)
@@ -550,23 +580,22 @@ download_binary_release() {
       esac
 
       local url="https://github.com/BurntSushi/ripgrep/releases/download/${version}/${asset}"
+      local tarball_path="$temp_dir/${asset}"
 
-      if curl -fsSL "$url" -o /tmp/ripgrep.tar.gz 2>/dev/null; then
-        if tar -xzf /tmp/ripgrep.tar.gz -C /tmp 2>/dev/null; then
+      if with_backoff 3 curl -fsSL "$url" -o "$tarball_path" 2>"$err_log"; then
+        if tar -xzf "$tarball_path" -C "$temp_dir" >/dev/null 2>&1; then
           local rg_binary
-          rg_binary=$(find /tmp/ripgrep-* -name "rg" -type f 2>/dev/null | head -1)
+          rg_binary=$(find "$temp_dir" -name "rg" -type f 2>/dev/null | head -1)
           if [ -n "$rg_binary" ] && [ -f "$rg_binary" ]; then
             chmod +x "$rg_binary" 2>/dev/null
             mv "$rg_binary" "$install_dir/rg"
-            rm -rf /tmp/ripgrep.tar.gz /tmp/ripgrep-* 2>/dev/null
             success "ripgrep binary installed to $install_dir/rg"
             return 0
           else
-            warn "Could not find rg binary in downloaded archive"
+            warn "Could not locate rg binary in extracted archive"
           fi
         fi
       fi
-      rm -rf /tmp/ripgrep.tar.gz /tmp/ripgrep-* 2>/dev/null
       ;;
 
     ast-grep)
@@ -574,35 +603,34 @@ download_binary_release() {
       local asset
       case "$platform-$arch" in
         linux-x86_64|wsl-x86_64) asset="ast-grep-x86_64-unknown-linux-gnu.zip" ;;
-        linux-aarch64|wsl-aarch64) asset="ast-grep-aarch64-unknown-linux-gnu.zip" ;;
+        linux-aarch64|wsl-aarch64)        asset="ast-grep-aarch64-unknown-linux-gnu.zip" ;;
         macos-x86_64) asset="ast-grep-x86_64-apple-darwin.zip" ;;
         macos-aarch64) asset="ast-grep-aarch64-apple-darwin.zip" ;;
         *) warn "No binary release for $platform-$arch"; return 1 ;;
       esac
 
       local url="https://github.com/ast-grep/ast-grep/releases/download/${version}/${asset}"
+      local zip_path="$temp_dir/${asset}"
 
-      if curl -fsSL "$url" -o /tmp/ast-grep.zip 2>/dev/null; then
+      if with_backoff 3 curl -fsSL "$url" -o "$zip_path" 2>"$err_log"; then
         if command -v unzip >/dev/null 2>&1; then
-          if unzip -q /tmp/ast-grep.zip -d /tmp/ast-grep 2>/dev/null; then
+          if unzip -q "$zip_path" -d "$temp_dir/ast-grep" 2>/dev/null; then
             local sg_binary
-            sg_binary=$(find /tmp/ast-grep \( -name "ast-grep" -o -name "sg" \) -type f 2>/dev/null | head -1)
+            sg_binary=$(find "$temp_dir/ast-grep" \( -name "ast-grep" -o -name "sg" \) -type f 2>/dev/null | head -1)
             if [ -n "$sg_binary" ] && [ -f "$sg_binary" ]; then
               chmod +x "$sg_binary" 2>/dev/null
               mv "$sg_binary" "$install_dir/ast-grep"
-              rm -rf /tmp/ast-grep.zip /tmp/ast-grep
               success "ast-grep binary installed to $install_dir/ast-grep"
               export PATH="$install_dir:$PATH"
               return 0
             else
-              warn "Could not find ast-grep binary in downloaded archive"
+              warn "Could not find ast-grep binary in extracted archive"
             fi
           fi
         else
-          warn "unzip not available, cannot extract ast-grep"
+          warn "unzip not available, cannot extract ast-grep archive"
         fi
       fi
-      rm -rf /tmp/ast-grep.zip /tmp/ast-grep 2>/dev/null
       ;;
 
     jq)
@@ -618,7 +646,7 @@ download_binary_release() {
 
       local url="https://github.com/jqlang/jq/releases/download/jq-${version}/${asset}"
 
-      if with_backoff 3 curl -fsSL "$url" -o "$install_dir/jq" 2>/dev/null; then
+      if with_backoff 3 curl -fsSL "$url" -o "$install_dir/jq" 2>"$err_log"; then
         chmod +x "$install_dir/jq"
         success "jq binary installed to $install_dir/jq"
         export PATH="$install_dir:$PATH"
@@ -627,22 +655,22 @@ download_binary_release() {
       ;;
   esac
 
-  error "Binary download failed for $tool"
+  log_network_failure "Binary download failed for $tool" "$err_log"
   return 1
 }
 
+
 verify_installation() {
   [ "$RUN_VERIFICATION" -eq 0 ] && return 0
+  if dry_run_enabled; then
+    log_dry_run "Skipping post-install verification checks."
+    return 0
+  fi
 
   log "Running post-install verification..."
   local errors=0
   local had_ubs=0
-
-  echo ""
-  echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════${RESET}"
-  echo -e "${BOLD}${BLUE}   POST-INSTALL VERIFICATION${RESET}"
-  echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════${RESET}"
-  echo ""
+  log_section "POST-INSTALL VERIFICATION"
 
   # Test 1: Command available
   if command -v ubs >/dev/null 2>&1; then
@@ -686,7 +714,8 @@ verify_installation() {
   # Test 4: Quick smoke test
   echo ""
   log "Running smoke test..."
-  local test_file="/tmp/ubs-test-$$.js"
+  local test_file
+  test_file="$(mktemp_in_workdir "ubs-smoke.js.XXXXXX")"
   cat > "$test_file" << 'SMOKE'
 // Intentional bugs for smoke test
 eval(userInput);
@@ -696,10 +725,8 @@ SMOKE
 
   if [ "$had_ubs" -eq 1 ] && safe_timeout 10 ubs "$test_file" --ci 2>&1 | grep -E -q "eval|null"; then
     success "Smoke test PASSED - scanner detects bugs correctly"
-    rm -f "$test_file"
   else
     warn "Smoke test inconclusive - scanner may not be fully functional"
-    rm -f "$test_file"
   fi
 
   # Test 5: Module cache directory
@@ -722,20 +749,67 @@ SMOKE
     success "   Claude Code hook installed" || \
     log "   Claude hook: not installed"
 
-  echo ""
-  echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════${RESET}"
-
   if [ $errors -eq 0 ]; then
-    echo ""
-    success "${BOLD}All verification checks passed! ✓${RESET}"
+    success "All verification checks passed."
+    return 0
+  else
+    error "$errors critical verification checks failed"
+    warn "Installation may be incomplete. Review errors above."
+    return 1
+  fi
+}
+
+run_self_tests_if_requested() {
+  [ "$RUN_SELF_TEST" -eq 1 ] || return 0
+
+  if dry_run_enabled; then
+    log_dry_run "Would run installer self-test harness (--self-test)."
+    return 0
+  fi
+
+  local script_dir test_script
+  local -a candidates=()
+  script_dir="$(cd -- "$(dirname "${BASH_SOURCE[0]:-${0}}")" 2>/dev/null && pwd || pwd)"
+  candidates+=("$script_dir/test-suite/install/run_tests.sh")
+  candidates+=("$PWD/test-suite/install/run_tests.sh")
+
+  for candidate in "${candidates[@]}"; do
+    if [ -f "$candidate" ]; then
+      test_script="$candidate"
+      break
+    fi
+  done
+
+  if [ -z "${test_script:-}" ]; then
+    error "--self-test requested but test-suite/install/run_tests.sh not found next to installer."
+    error "Run installer from repository root or provide the test suite."
+    return 1
+  fi
+
+  log_section "Installer Self-Test"
+  if bash "$test_script"; then
+    success "Installer self-test suite passed"
     echo ""
     return 0
   else
-    echo ""
-    error "$errors critical verification checks failed"
-    warn "Installation may be incomplete. Review errors above."
-    echo ""
+    error "Installer self-test suite failed"
     return 1
+  fi
+}
+
+warn_if_stale_binary() {
+  if dry_run_enabled; then
+    log_dry_run "Would compare PATH-resolved ubs with freshly installed binary."
+    return 0
+  fi
+
+  local install_dir expected actual
+  install_dir="$(determine_install_dir)"
+  expected="$install_dir/$INSTALL_NAME"
+  actual="$(command -v ubs 2>/dev/null || true)"
+
+  if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then
+    warn_path_shadow "$expected" "$actual"
   fi
 }
 
@@ -791,6 +865,12 @@ read_config_file() {
       skip_version_check)
         SKIP_VERSION_CHECK="$(normalize_bool "$value")"
         ;;
+      dry_run)
+        DRY_RUN="$(normalize_bool "$value")"
+        ;;
+      self_test)
+        RUN_SELF_TEST="$(normalize_bool "$value")"
+        ;;
       easy_mode)
         local normalized="$(normalize_bool "$value")"
         EASY_MODE="$normalized"
@@ -844,6 +924,12 @@ skip_jq=0
 # Skip version checking on install
 skip_version_check=0
 
+# Dry-run mode (1 = log actions only, 0 = perform actions)
+dry_run=0
+
+# Run extended self-test after install
+self_test=0
+
 # Skip hook/integration setup (1=skip, 0=prompt or install in easy mode)
 skip_hooks=0
 
@@ -872,11 +958,7 @@ CONFIG
 }
 
 diagnostic_check() {
-  echo ""
-  echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════${RESET}"
-  echo -e "${BOLD}${BLUE}   ULTIMATE BUG SCANNER DIAGNOSTIC REPORT${RESET}"
-  echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════${RESET}"
-  echo ""
+  log_section "ULTIMATE BUG SCANNER DIAGNOSTIC REPORT"
 
   # System info
   echo -e "${BOLD}System Information:${RESET}"
@@ -1130,16 +1212,24 @@ uninstall_ubs() {
 }
 
 install_jq() {
-  local platform
+  local platform log_file
   platform="$(detect_platform)"
   log "Installing jq..."
+
+  if dry_run_enabled; then
+    log_dry_run "Would install jq (platform $platform)."
+    return 0
+  fi
+
+  log_file="$(mktemp_in_workdir "jq-install.log.XXXXXX")"
+
   case "$platform" in
     macos)
       if command -v brew >/dev/null 2>&1; then
-        if brew install jq 2>&1 | tee /tmp/jq-install.log; then
+        if brew install jq 2>&1 | tee "$log_file"; then
           success "jq installed via Homebrew"; return 0
         else
-          error "Homebrew installation failed. See /tmp/jq-install.log"; return 1
+          error "Homebrew installation failed. See $log_file"; return 1
         fi
       else
         error "Homebrew not found. Install jq manually."; return 1
@@ -1150,22 +1240,22 @@ install_jq() {
         log "Detected WSL environment - using Linux package managers"
       fi
       if command -v apt-get >/dev/null 2>&1 && can_use_sudo; then
-        if safe_timeout 300 sudo apt-get update -qq && ( safe_timeout 300 sudo apt-get install -y jq ) 2>&1 | tee /tmp/jq-install.log; then
+        if safe_timeout 300 sudo apt-get update -qq && ( safe_timeout 300 sudo apt-get install -y jq ) 2>&1 | tee "$log_file"; then
           success "jq installed via apt-get"; return 0
         fi
       fi
       if command -v dnf >/dev/null 2>&1 && can_use_sudo; then
-        if safe_timeout 300 sudo dnf install -y jq 2>&1 | tee /tmp/jq-install.log; then
+        if safe_timeout 300 sudo dnf install -y jq 2>&1 | tee "$log_file"; then
           success "jq installed via dnf"; return 0
         fi
       fi
       if command -v pacman >/dev/null 2>&1 && can_use_sudo; then
-        if safe_timeout 300 sudo pacman -S --noconfirm jq 2>&1 | tee /tmp/jq-install.log; then
+        if safe_timeout 300 sudo pacman -S --noconfirm jq 2>&1 | tee "$log_file"; then
           success "jq installed via pacman"; return 0
         fi
       fi
       if command -v snap >/dev/null 2>&1 && can_use_sudo; then
-        if safe_timeout 300 sudo snap install jq 2>&1 | tee /tmp/jq-install.log; then
+        if safe_timeout 300 sudo snap install jq 2>&1 | tee "$log_file"; then
           success "jq installed via snap"; return 0
         fi
       fi
@@ -1180,12 +1270,12 @@ install_jq() {
     freebsd|openbsd|netbsd)
       log "BSD platform detected: $platform"
       if command -v pkg >/dev/null 2>&1 && can_use_sudo; then
-        if safe_timeout 300 sudo pkg install -y jq 2>&1 | tee /tmp/jq-install.log; then
+        if safe_timeout 300 sudo pkg install -y jq 2>&1 | tee "$log_file"; then
           success "jq installed via pkg"; return 0
         fi
       fi
       if command -v pkg_add >/dev/null 2>&1 && can_use_sudo; then
-        if safe_timeout 300 sudo pkg_add jq 2>&1 | tee /tmp/jq-install.log; then
+        if safe_timeout 300 sudo pkg_add jq 2>&1 | tee "$log_file"; then
           success "jq installed via pkg_add"; return 0
         fi
       fi
@@ -1208,19 +1298,26 @@ install_jq() {
 }
 
 install_ripgrep() {
-  local platform
+  local platform log_file
   platform="$(detect_platform)"
 
   log "Installing ripgrep..."
 
+  if dry_run_enabled; then
+    log_dry_run "Would install ripgrep (platform $platform)."
+    return 0
+  fi
+
+  log_file="$(mktemp_in_workdir "ripgrep-install.log.XXXXXX")"
+
   case "$platform" in
     macos)
       if command -v brew >/dev/null 2>&1; then
-        if brew install ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+        if brew install ripgrep 2>&1 | tee "$log_file"; then
           success "ripgrep installed via Homebrew"
           return 0
         else
-          error "Homebrew installation failed. Check /tmp/ripgrep-install.log"
+          error "Homebrew installation failed. Check $log_file"
           return 1
         fi
       else
@@ -1234,7 +1331,7 @@ install_ripgrep() {
       fi
       if command -v cargo >/dev/null 2>&1; then
         log "Attempting installation via cargo..."
-        if cargo install ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+        if cargo install ripgrep 2>&1 | tee "$log_file"; then
           success "ripgrep installed via cargo"
           return 0
         else
@@ -1245,7 +1342,7 @@ install_ripgrep() {
       if command -v apt-get >/dev/null 2>&1; then
         if can_use_sudo; then
           log "Attempting installation via apt-get..."
-          if safe_timeout 300 sudo apt-get update -qq && safe_timeout 300 sudo apt-get install -y ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+          if safe_timeout 300 sudo apt-get update -qq && safe_timeout 300 sudo apt-get install -y ripgrep 2>&1 | tee "$log_file"; then
             success "ripgrep installed via apt-get"
             return 0
           else
@@ -1259,7 +1356,7 @@ install_ripgrep() {
       if command -v dnf >/dev/null 2>&1; then
         if can_use_sudo; then
           log "Attempting installation via dnf..."
-          if safe_timeout 300 sudo dnf install -y ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+          if safe_timeout 300 sudo dnf install -y ripgrep 2>&1 | tee "$log_file"; then
             success "ripgrep installed via dnf"
             return 0
           else
@@ -1273,7 +1370,7 @@ install_ripgrep() {
       if command -v pacman >/dev/null 2>&1; then
         if can_use_sudo; then
           log "Attempting installation via pacman..."
-          if safe_timeout 300 sudo pacman -S --noconfirm ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+          if safe_timeout 300 sudo pacman -S --noconfirm ripgrep 2>&1 | tee "$log_file"; then
             success "ripgrep installed via pacman"
             return 0
           else
@@ -1287,7 +1384,7 @@ install_ripgrep() {
       if command -v snap >/dev/null 2>&1; then
         if can_use_sudo; then
           log "Attempting installation via snap..."
-          if safe_timeout 300 sudo snap install ripgrep --classic 2>&1 | tee /tmp/ripgrep-install.log; then
+          if safe_timeout 300 sudo snap install ripgrep --classic 2>&1 | tee "$log_file"; then
             success "ripgrep installed via snap"
             return 0
           else
@@ -1312,7 +1409,7 @@ install_ripgrep() {
       if command -v pkg >/dev/null 2>&1; then
         if can_use_sudo; then
           log "Attempting installation via pkg..."
-          if safe_timeout 300 sudo pkg install -y ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+          if safe_timeout 300 sudo pkg install -y ripgrep 2>&1 | tee "$log_file"; then
             success "ripgrep installed via pkg"
             return 0
           fi
@@ -1322,18 +1419,10 @@ install_ripgrep() {
       if command -v pkg_add >/dev/null 2>&1; then
         if can_use_sudo; then
           log "Attempting installation via pkg_add..."
-          if safe_timeout 300 sudo pkg_add ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+          if safe_timeout 300 sudo pkg_add ripgrep 2>&1 | tee "$log_file"; then
             success "ripgrep installed via pkg_add"
             return 0
           fi
-        fi
-      fi
-
-      if command -v cargo >/dev/null 2>&1; then
-        log "Attempting installation via cargo..."
-        if cargo install ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
-          success "ripgrep installed via cargo"
-          return 0
         fi
       fi
 
@@ -1341,7 +1430,6 @@ install_ripgrep() {
       if download_binary_release "ripgrep" "$platform"; then
         return 0
       fi
-
       error "All installation methods failed for BSD"
       log "Download manually from: https://github.com/BurntSushi/ripgrep/releases"
       return 1
@@ -1349,7 +1437,7 @@ install_ripgrep() {
     windows)
       if command -v cargo >/dev/null 2>&1; then
         log "Attempting installation via cargo..."
-        if cargo install ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+        if cargo install ripgrep 2>&1 | tee "$log_file"; then
           success "ripgrep installed via cargo"
           return 0
         else
@@ -1359,7 +1447,7 @@ install_ripgrep() {
 
       if command -v scoop >/dev/null 2>&1; then
         log "Attempting installation via scoop..."
-        if scoop install ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+        if scoop install ripgrep 2>&1 | tee "$log_file"; then
           success "ripgrep installed via scoop"
           return 0
         else
@@ -1369,7 +1457,7 @@ install_ripgrep() {
 
       if command -v choco >/dev/null 2>&1; then
         log "Attempting installation via chocolatey..."
-        if choco install ripgrep 2>&1 | tee /tmp/ripgrep-install.log; then
+        if choco install ripgrep 2>&1 | tee "$log_file"; then
           success "ripgrep installed via chocolatey"
           return 0
         else
@@ -1450,6 +1538,11 @@ install_scanner() {
 
   log "Installing Ultimate Bug Scanner to $install_dir..."
 
+  if dry_run_enabled; then
+    log_dry_run "Would create $install_dir, download $SCRIPT_NAME, and install as $install_dir/$INSTALL_NAME."
+    return 0
+  fi
+
   # Create directory if needed
   if [ -n "$use_sudo" ]; then
     $use_sudo mkdir -p "$install_dir" 2>/dev/null || true
@@ -1464,14 +1557,17 @@ install_scanner() {
   # Download or copy script
   local script_path="$install_dir/$INSTALL_NAME"
   local temp_path="${script_path}.tmp"
-  TEMP_FILES+=("$temp_path")
+  register_temp_path "$temp_path"
+
+  local download_err
+  download_err="$(mktemp_in_workdir "download-error.log.XXXXXX")"
 
   download_to_file() {
     local url="$1" out="$2"
     if command -v curl >/dev/null 2>&1; then
-      with_backoff 3 curl -fsSL "$url" -o "$out" 2>/tmp/download-error.log
+      with_backoff 3 curl -fsSL "$url" -o "$out" 2>"$download_err"
     else
-      with_backoff 3 wget -q "$url" -O "$out" 2>/tmp/download-error.log
+      with_backoff 3 wget -q "$url" -O "$out" 2>"$download_err"
     fi
   }
 
@@ -1496,7 +1592,7 @@ install_scanner() {
     if download_to_file "$download_url" "$temp_path"; then
       log "Downloaded successfully"
     else
-      error "Download failed. Check /tmp/download-error.log"
+      error "Download failed. Check $download_err"
       rm -f "$temp_path"
       return 1
     fi
@@ -1588,14 +1684,19 @@ add_to_path() {
   install_dir="$(determine_install_dir)"
   [ "$NO_PATH_MODIFY" -eq 1 ] && { log "Skipping PATH modification (per flag)"; return 0; }
 
+  local rc_file
+  rc_file="$(get_rc_file)"
+  local shell_type="$(detect_shell)"
+
+  if dry_run_enabled; then
+    log_dry_run "Would update PATH in $rc_file for $install_dir."
+    return 0
+  fi
+
   if is_in_path "$install_dir"; then
     log "Directory already in PATH"
     return 0
   fi
-
-  local rc_file
-  rc_file="$(get_rc_file)"
-  local shell_type="$(detect_shell)"
 
   if [ ! -w "$rc_file" ] && [ ! -w "$(dirname "$rc_file")" ]; then
     error "Cannot write to $rc_file - check permissions"
@@ -1647,6 +1748,11 @@ create_alias() {
 
   log "Configuring 'ubs' command..."
 
+  if dry_run_enabled; then
+    log_dry_run "Would add alias/function for 'ubs' in $rc_file pointing to $script_path."
+    return 0
+  fi
+
   if command -v ubs >/dev/null 2>&1; then
     success "'ubs' command is already available"
     return 0
@@ -1690,6 +1796,10 @@ create_alias() {
 }
 
 setup_claude_code_hook() {
+  if dry_run_enabled; then
+    log_dry_run "Would configure Claude Code hook at .claude/hooks/on-file-write.sh."
+    return 0
+  fi
   if [ ! -d ".claude" ]; then
     mkdir -p ".claude"
     log "Created .claude directory for Claude Code integration."
@@ -1726,6 +1836,11 @@ append_agent_rule_block() {
   local file="$agent_dir/rules"
   local marker="Ultimate Bug Scanner Integration"
 
+  if dry_run_enabled; then
+    log_dry_run "Would update $file with $friendly_name guardrails."
+    return 0
+  fi
+
   mkdir -p "$agent_dir"
   if [ -f "$file" ] && grep -q "$marker" "$file"; then
     log "$friendly_name instructions already present at $file"
@@ -1757,6 +1872,11 @@ setup_aider_rules() {
 
   log "Setting up Aider integration..."
 
+  if dry_run_enabled; then
+    log_dry_run "Would update $aider_conf for Aider integration."
+    return 0
+  fi
+
   if [ ! -f "$aider_conf" ]; then
     cat > "$aider_conf" << 'AIDER'
 # Aider configuration with UBS integration
@@ -1779,6 +1899,10 @@ AIDER
 
 setup_continue_rules() {
   local continue_dir=".continue"
+  if dry_run_enabled; then
+    log_dry_run "Would configure Continue integration at $continue_dir/config.json."
+    return 0
+  fi
   mkdir -p "$continue_dir"
 
   log "Setting up Continue integration..."
@@ -1814,6 +1938,11 @@ setup_copilot_instructions() {
   local copilot_file=".github/copilot-instructions.md"
 
   log "Setting up GitHub Copilot instructions..."
+
+  if dry_run_enabled; then
+    log_dry_run "Would write $copilot_file with Copilot guardrails."
+    return 0
+  fi
 
   if [ ! -d ".github" ]; then
     mkdir -p ".github"
@@ -1854,6 +1983,11 @@ setup_git_hook() {
     return 0
   fi
 
+  if dry_run_enabled; then
+    log_dry_run "Would configure git pre-commit hook at .git/hooks/pre-commit."
+    return 0
+  fi
+
   log "Setting up git pre-commit hook..."
 
   local hook_file=".git/hooks/pre-commit"
@@ -1875,13 +2009,16 @@ if ! command -v ubs >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! ubs . --fail-on-warning 2>&1 | tee /tmp/bug-scan.txt | tail -30; then
+SCAN_LOG=$(mktemp -t ubs-pre-commit.XXXXXX 2>/dev/null || echo "/tmp/ubs-pre-commit.log")
+
+if ! ubs . --fail-on-warning 2>&1 | tee "$SCAN_LOG" | tail -30; then
   echo ""
   echo "❌ Bug scanner found issues. Fix them or use: git commit --no-verify"
   exit 1
 fi
 
 echo "✓ No critical issues found"
+rm -f "$SCAN_LOG" 2>/dev/null || true
 HOOK_EOF
 
   chmod +x "$hook_file"
@@ -1952,6 +2089,11 @@ add_to_agents_md() {
 
   log "Adding scanner section to AGENTS.md..."
 
+  if dry_run_enabled; then
+    log_dry_run "Would append scanner documentation to $agents_file."
+    return 0
+  fi
+
   if ! cp "$agents_file" "${agents_file}.backup" 2>/dev/null; then
     warn "Could not create backup of AGENTS.md"
   fi
@@ -1999,6 +2141,11 @@ local fn_name="$3"
 
 if [ "$detected_flag" != "-1" ] && [ "$detected_flag" -eq 0 ]; then
 log "Skipping ${label} (agent not detected)"
+return 0
+fi
+
+if dry_run_enabled; then
+log_dry_run "Would configure ${label}."
 return 0
 fi
 
@@ -2086,6 +2233,14 @@ shift
 RUN_VERIFICATION=0
 shift
 ;;
+--dry-run)
+DRY_RUN=1
+shift
+;;
+--self-test)
+RUN_SELF_TEST=1
+shift
+;;
 --update)
 FORCE_REINSTALL=1
 shift
@@ -2127,6 +2282,8 @@ echo "  --skip-jq               Skip jq installation"
 echo "  --skip-hooks            Skip hook setup"
 echo "  --skip-version-check    Don't check for updates"
 echo "  --skip-verification     Skip post-install verification"
+echo "  --dry-run               Print actions without changing the system"
+echo "  --self-test             Run extended self-tests after installation"
 echo "  --install-dir DIR       Custom installation directory"
 echo "  --system                Install system-wide to /usr/local/bin (uses sudo if needed)"
 echo "  --no-path-modify        Do not modify shell RC files to add to PATH"
@@ -2247,6 +2404,13 @@ fi
 
 verify_installation
 
+if ! run_self_tests_if_requested; then
+  error "Self-test suite failed"
+  exit 1
+fi
+
+warn_if_stale_binary
+
 echo ""
 echo -e "${BOLD}${GREEN}"
 cat << 'SUCCESS'
@@ -2294,6 +2458,8 @@ echo -e "${BLUE}└──${RESET} ${BOLD}Verbose mode:${RESET}   ${GREEN}ubs -v 
 fi
 
 echo ""
+warn_if_stale_binary
+
 echo -e "${BOLD}${BLUE}📚 Documentation:${RESET} ${BLUE}[https://github.com/Dicklesworthstone/ultimate_bug_scanner${RESET}](https://github.com/Dicklesworthstone/ultimate_bug_scanner${RESET})"
 echo ""
 echo -e "${GREEN}${BOLD}Happy bug hunting! 🐛🔫${RESET}"
