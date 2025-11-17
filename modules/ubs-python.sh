@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# PYTHON ULTIMATE BUG SCANNER v2.0 (Bash) - Industrial-Grade Code Analysis
+# PYTHON ULTIMATE BUG SCANNER v3.1 (Bash) - Industrial-Grade Code Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 # Comprehensive static analysis for modern Python (3.13+) using:
 #   • ast-grep (rule packs; language: python)
 #   • ripgrep/grep heuristics for fast code smells
-#   • optional uv-powered extra analyzers (ruff, bandit, pip-audit)
+#   • optional uv-powered extra analyzers (ruff, bandit, pip-audit, mypy, safety, detect-secrets)
 #   • optional mypy/pyright (if installed) for type-checking touchpoints
-#   • optional safety / detect-secrets if available
 #
 # Focus:
 #   • None/defensive checks   • exceptions & error handling
@@ -19,19 +18,24 @@
 # Supports:
 #   --format text|json|sarif (ast-grep passthrough for json/sarif)
 #   --rules DIR   (merge user ast-grep rules)
-#   --fail-on-warning, --skip, --jobs, --include-ext, --exclude, --ci, --no-color
-#   --summary-json FILE  (machine-readable run summary)
+#   --fail-on-warning, --skip, --jobs, --include-ext, --exclude, --ci, --no-color, --force-color
+#   --summary-json FILE  (machine-readable run summary with rule histogram)
 #   --max-detailed N     (cap detailed code samples)
+#   --list-categories    (print category index and exit)
+#   --timeout-seconds N  (global external tool timeout budget)
+#   --baseline FILE      (compare current totals to prior summary JSON)
+#   --max-file-size SIZE (ripgrep limit, e.g., 25M)
 #
 # CI-friendly timestamps, robust find, safe pipelines, auto parallel jobs.
 # Heavily leverages ast-grep for Python via rule packs; complements with rg.
-# Integrates uv (if installed) to run ruff/bandit/pip-audit without setup.
+# Integrates uv (if installed) to run ruff/bandit/pip-audit/mypy without setup.
 # Adds portable timeout resolution (timeout/gtimeout) and UTF‑8-safe output.
 # ═══════════════════════════════════════════════════════════════════════════
 
 set -Eeuo pipefail
 shopt -s lastpipe
 shopt -s extglob
+shopt -s compat31 || true
 
 on_err() {
   local ec=$?; local cmd=${BASH_COMMAND}; local line=${BASH_LINENO[0]}; local src=${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}
@@ -43,6 +47,7 @@ trap on_err ERR
 # Honor NO_COLOR and non-tty
 USE_COLOR=1
 if [[ -n "${NO_COLOR:-}" || ! -t 1 ]]; then USE_COLOR=0; fi
+FORCE_COLOR=0
 
 if [[ "$USE_COLOR" -eq 1 ]]; then
   RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
@@ -55,9 +60,10 @@ fi
 
 # Symbols (ensure UTF-8 output; run grep under LC_ALL=C separately)
 SAFE_LOCALE="C"
-if locale -a 2>/dev/null | grep -qi '^C\.UTF-8$'; then SAFE_LOCALE="C.UTF-8"; fi
-export LC_CTYPE="$SAFE_LOCALE"
-export LC_MESSAGES="$SAFE_LOCALE"
+if locale -a 2>/dev/null | grep -qiE '^(C\.UTF-8|en_US\.UTF-8)$'; then SAFE_LOCALE="C.UTF-8"; fi
+export LC_CTYPE="${SAFE_LOCALE}"
+export LC_MESSAGES="${SAFE_LOCALE}"
+export LANG="${SAFE_LOCALE}"
 
 CHECK="✓"; CROSS="✗"; WARN="⚠"; INFO="ℹ"; ARROW="→"; BULLET="•"; MAGNIFY="🔍"; BUG="🐛"; FIRE="🔥"; SPARKLE="✨"; SHIELD="🛡"; ROCKET="🚀"
 
@@ -70,6 +76,9 @@ OUTPUT_FILE=""
 FORMAT="text"          # text|json|sarif
 CI_MODE=0
 FAIL_ON_WARNING=0
+BASELINE=""
+LIST_CATEGORIES=0
+MAX_FILE_SIZE="${MAX_FILE_SIZE:-25M}"
 INCLUDE_EXT="py,pyi,pyx,pxd,pxi,ipynb"
 QUIET=0
 NO_COLOR_FLAG=0
@@ -83,9 +92,12 @@ DISABLE_PIPEFAIL_DURING_SCAN=1
 ENABLE_UV_TOOLS=1                     # try uv integrations by default
 UV_TOOLS="ruff,bandit,pip-audit"      # subset via --uv-tools=
 UV_TIMEOUT="${UV_TIMEOUT:-1200}"      # generous time budget per tool
-ENABLE_EXTRA_TOOLS=1                  # mypy/pyright/safety/detect-secrets if present
+ENABLE_EXTRA_TOOLS=1                  # mypy/safety/detect-secrets if present
 SUMMARY_JSON=""
 TIMEOUT_CMD=""                        # resolved later
+TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-0}"
+AST_PASSTHROUGH=0
+AST_TEXT_SUMMARY=1
 
 # Async error coverage metadata
 ASYNC_ERROR_RULE_IDS=(py.async.task-no-await)
@@ -125,27 +137,32 @@ print_usage() {
 Usage: $(basename "$0") [options] [PROJECT_DIR] [OUTPUT_FILE]
 
 Options:
-  -v, --verbose            More code samples per finding (DETAIL=10)
-  -q, --quiet              Reduce non-essential output
-  --format=FMT             Output format: text|json|sarif (default: text)
-  --ci                     CI mode (no clear, stable timestamps)
-  --no-color               Force disable ANSI color
-  --include-ext=CSV        File extensions (default: $INCLUDE_EXT)
-  --exclude=GLOB[,..]      Additional glob(s)/dir(s) to exclude
-  --jobs=N                 Parallel jobs for ripgrep (default: auto)
-  --skip=CSV               Skip categories by number (e.g. --skip=2,7,11)
-  --fail-on-warning        Exit non-zero on warnings or critical
-  --rules=DIR              Additional ast-grep rules directory (merged)
-  --no-uv                  Disable uv-powered extra analyzers
-  --uv-tools=CSV           Which uv tools to run (default: $UV_TOOLS)
-  --summary-json=FILE      Also write machine-readable summary JSON
-  --max-detailed=N         Cap number of detailed code samples (default: $MAX_DETAILED)
-  -h, --help               Show help
+  --list-categories       Print numbered categories and exit
+  --timeout-seconds=N     Override global per-tool timeout budget (also sets UV_TIMEOUT)
+  --baseline=FILE         Compare against a previous run's summary JSON and show deltas
+  --max-file-size=SIZE    Limit ripgrep file size (e.g. 10M, 250M). Default: $MAX_FILE_SIZE
+  --force-color           Force ANSI even if not TTY (overrides auto disable)
+  -v, --verbose           More code samples per finding (DETAIL=10)
+  -q, --quiet             Reduce non-essential output
+  --format=FMT            Output format: text|json|sarif (default: text)
+  --ci                    CI mode (no clear, stable timestamps)
+  --no-color              Force disable ANSI color
+  --include-ext=CSV       File extensions (default: $INCLUDE_EXT)
+  --exclude=GLOB[,..]     Additional glob(s)/dir(s) to exclude
+  --jobs=N                Parallel jobs for ripgrep (default: auto)
+  --skip=CSV              Skip categories by number (e.g. --skip=2,7,11)
+  --fail-on-warning       Exit non-zero on warnings or critical
+  --rules=DIR             Additional ast-grep rules directory (merged)
+  --no-uv                 Disable uv-powered extra analyzers
+  --uv-tools=CSV          Which uv tools to run (default: $UV_TOOLS)
+  --summary-json=FILE     Also write machine-readable summary JSON
+  --max-detailed=N        Cap number of detailed code samples (default: $MAX_DETAILED)
+  -h, --help              Show help
 Env:
-  JOBS, NO_COLOR, CI, UV_TIMEOUT
+  JOBS, NO_COLOR, CI, UV_TIMEOUT, TIMEOUT_SECONDS, MAX_FILE_SIZE
 Args:
-  PROJECT_DIR              Directory to scan (default: ".")
-  OUTPUT_FILE              File to save the report (optional)
+  PROJECT_DIR             Directory to scan (default: ".")
+  OUTPUT_FILE             File to save the report (optional)
 USAGE
 }
 
@@ -156,6 +173,11 @@ while [[ $# -gt 0 ]]; do
     --format=*)   FORMAT="${1#*=}"; shift;;
     --ci)         CI_MODE=1; shift;;
     --no-color)   NO_COLOR_FLAG=1; shift;;
+    --force-color) FORCE_COLOR=1; shift;;
+    --timeout-seconds=*) TIMEOUT_SECONDS="${1#*=}"; UV_TIMEOUT="$TIMEOUT_SECONDS"; shift;;
+    --baseline=*) BASELINE="${1#*=}"; shift;;
+    --list-categories) LIST_CATEGORIES=1; shift;;
+    --max-file-size=*) MAX_FILE_SIZE="${1#*=}"; shift;;
     --include-ext=*) INCLUDE_EXT="${1#*=}"; shift;;
     --exclude=*)  EXTRA_EXCLUDES="${1#*=}"; shift;;
     --jobs=*)     JOBS="${1#*=}"; shift;;
@@ -179,15 +201,33 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Category index helper
+if [[ "$LIST_CATEGORIES" -eq 1 ]]; then
+  cat <<'CAT'
+1 None/Defensive  2 Numeric/Arithmetic  3 Collections  4 Comparison/Type
+5 Async/Await     6 Error Handling      7 Security     8 Functions/Scope
+9 Parsing/Convert 10 Control Flow       11 Debug/Prod  12 Perf/Memory
+13 Vars/Scope     14 Code Quality       15 Regex       16 I/O & Resources
+17 Typing         18 Module Usage       19 Lifecycle   20 Extra Analyzers
+21 Deprecations   22 Packaging/Config   23 Notebooks
+CAT
+  exit 0
+fi
+
 # CI auto-detect + color override
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
+if [[ -n "${OUTPUT_FILE}" && "$FORCE_COLOR" -eq 0 && "$NO_COLOR_FLAG" -eq 0 ]]; then
+  USE_COLOR=0
+fi
 
 # Redirect output early to capture everything
 if [[ -n "${OUTPUT_FILE}" ]]; then exec > >(tee "${OUTPUT_FILE}") 2>&1; fi
 
-DATE_FMT='%Y-%m-%d %H:%M:%S'
-if [[ "$CI_MODE" -eq 1 ]]; then DATE_CMD="date -u '+%Y-%m-%dT%H:%M:%SZ'"; else DATE_CMD="date '+$DATE_FMT'"; fi
+safe_date() {
+  if [[ "$CI_MODE" -eq 1 ]]; then command date -u '+%Y-%m-%dT%H:%M:%SZ' || command date '+%Y-%m-%dT%H:%M:%SZ'; else command date '+%Y-%m-%d %H:%M:%S'; fi
+}
+DATE_CMD="safe_date"
 
 # ────────────────────────────────────────────────────────────────────────────
 # Global Counters
@@ -206,6 +246,7 @@ AST_RULE_DIR=""      # created later if ast-grep exists
 HAS_RIPGREP=0
 UVX_CMD=()           # (uvx -q or uv -qx) if available
 HAS_UV=0
+RG_MAX_SIZE_FLAGS=()
 
 # Resource lifecycle correlation spec (acquire vs release pairs)
 RESOURCE_LIFECYCLE_IDS=(file_handle popen_handle asyncio_task)
@@ -253,15 +294,17 @@ for d in "${EXCLUDE_DIRS[@]}"; do EXCLUDE_FLAGS+=( "--exclude-dir=$d" ); done
 if command -v rg >/dev/null 2>&1; then
   HAS_RIPGREP=1
   if [[ "${JOBS}" -eq 0 ]]; then JOBS="$( (command -v nproc >/dev/null && nproc) || sysctl -n hw.ncpu 2>/dev/null || echo 0 )"; fi
+  if [[ "${JOBS}" -le 0 ]]; then JOBS=1; fi
   RG_JOBS=(); if [[ "${JOBS}" -gt 0 ]]; then RG_JOBS=(-j "$JOBS"); fi
   RG_BASE=(--no-config --no-messages --line-number --with-filename --hidden --pcre2 "${RG_JOBS[@]}")
   RG_EXCLUDES=()
   for d in "${EXCLUDE_DIRS[@]}"; do RG_EXCLUDES+=( -g "!$d/**" ); done
   RG_INCLUDES=()
   for e in "${_EXT_ARR[@]}"; do RG_INCLUDES+=( -g "*.$(echo "$e" | xargs)" ); done
-  GREP_RN=("${GREP_ENV[@]}" rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  GREP_RNI=("${GREP_ENV[@]}" rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
-  GREP_RNW=("${GREP_ENV[@]}" rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}")
+  RG_MAX_SIZE_FLAGS=(--max-filesize "$MAX_FILE_SIZE")
+  GREP_RN=("${GREP_ENV[@]}" rg "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}" "${RG_MAX_SIZE_FLAGS[@]}")
+  GREP_RNI=("${GREP_ENV[@]}" rg -i "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}" "${RG_MAX_SIZE_FLAGS[@]}")
+  GREP_RNW=("${GREP_ENV[@]}" rg -w "${RG_BASE[@]}" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}" "${RG_MAX_SIZE_FLAGS[@]}")
 else
   GREP_R_OPTS=(-R --binary-files=without-match "${EXCLUDE_FLAGS[@]}" "${INCLUDE_GLOBS[@]}")
   GREP_RN=("${GREP_ENV[@]}" grep "${GREP_R_OPTS[@]}" -n -E)
@@ -271,6 +314,7 @@ fi
 
 # Helper: robust numeric end-of-pipeline counter
 count_lines() { awk 'END{print (NR+0)}'; }
+num_clamp() { local v=${1:-0}; printf '%s' "$v" | awk 'END{print ($0+0)}'; }
 
 # ────────────────────────────────────────────────────────────────────────────
 # Helper Functions
@@ -397,11 +441,12 @@ language: python
 rule:
   pattern: $TASK = asyncio.create_task($ARGS)
   not:
-    inside:
-      any:
-        - pattern: await $TASK
-        - pattern: $TASK.cancel()
-        - pattern: $TASK.add_done_callback($CB)
+    any:
+      - inside: { pattern: await $TASK }
+      - inside: { pattern: $TASK.cancel() }
+      - inside: { pattern: $TASK.add_done_callback($CB) }
+severity: warning
+message: "asyncio.create_task result neither awaited nor cancelled"
 YAML
   tmp_json="$(mktemp 2>/dev/null || mktemp -t py_async_matches.XXXXXX)"
   : >"$tmp_json"
@@ -484,7 +529,7 @@ run_taint_analysis_checks() {
     fi
     print_finding "$severity" "$count" "$summary" "$desc"
   done < <(python3 - "$PROJECT_DIR" <<'PY'
-import re, sys
+import re, sys, os
 from collections import defaultdict
 from pathlib import Path
 
@@ -530,10 +575,8 @@ SINKS = [
 
 ASSIGN_SIMPLE = re.compile(r"^(?P<targets>[A-Za-z_][\w]*(?:\s*,\s*[A-Za-z_][\w]*)*)\s*=\s*(?P<expr>.+)")
 
-
 def should_skip(path: Path) -> bool:
     return any(part in SKIP_DIRS for part in path.parts)
-
 
 def iter_files(root: Path):
     if root.is_file():
@@ -541,39 +584,28 @@ def iter_files(root: Path):
             yield root
         return
     for path in root.rglob('*'):
-        if not path.is_file():
-            continue
-        if should_skip(path):
-            continue
-        if path.suffix.lower() in EXTS:
-            yield path
-
+        if not path.is_file(): continue
+        if should_skip(path): continue
+        if path.suffix.lower() in EXTS: yield path
 
 def strip_comments(line: str) -> str:
     if '#' in line:
         idx = line.find('#')
-        if idx >= 0:
-            line = line[:idx]
+        if idx >= 0: line = line[:idx]
     return line
-
 
 def parse_assignments(lines):
     assignments = []
     for idx, raw in enumerate(lines, start=1):
         line = strip_comments(raw).strip()
-        if not line or '=' not in line:
-            continue
-        if '==' in line or '>=' in line or '<=' in line or '!=' in line:
-            continue
+        if not line or '=' not in line: continue
+        if '==' in line or '>=' in line or '<=' in line or '!=' in line: continue
         match = ASSIGN_SIMPLE.match(line)
-        if not match:
-            continue
-        lhs = match.group('targets')
-        expr = match.group('expr')
+        if not match: continue
+        lhs = match.group('targets'); expr = match.group('expr')
         for target in [t.strip() for t in lhs.split(',') if t.strip()]:
             assignments.append((idx, target, expr))
     return assignments
-
 
 def find_sources(expr: str):
     matches = []
@@ -582,97 +614,79 @@ def find_sources(expr: str):
             matches.append(m.group(0))
     return matches
 
-
 def expr_has_sanitizer(expr: str, sink_rule: str | None = None) -> bool:
     expr_lower = expr.lower()
     for regex in SANITIZER_REGEXES:
-        if regex.search(expr_lower):
-            return True
-    if sink_rule == 'py.taint.sql' and re.search(r",\s*(?:\(|\[|params|data|values|bindings)", expr_lower):
-        return True
+        if regex.search(expr_lower): return True
+    if sink_rule == 'py.taint.sql':
+        if re.search(r'%(?!\()|\.format\(|f["\']', expr): return False
+        if re.search(r",\s*(?:\(|\[|params|data|values|bindings)", expr_lower): return True
     return False
-
 
 def expr_has_tainted(expr: str, tainted):
     for name, meta in tainted.items():
         pattern = rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
-        if re.search(pattern, expr):
-            return name, meta
+        if re.search(pattern, expr): return name, meta
     return None, None
-
 
 def record_taint(assignments):
     tainted = {}
     for line_no, target, expr in assignments:
-        if expr_has_sanitizer(expr, None):
-            continue
+        if expr_has_sanitizer(expr, None): continue
         sources = find_sources(expr)
         if sources:
             tainted[target] = {'source': sources[0], 'line': line_no, 'path': [sources[0], target]}
     for _ in range(5):
         changed = False
         for line_no, target, expr in assignments:
-            if target in tainted or expr_has_sanitizer(expr, None):
-                continue
+            if target in tainted or expr_has_sanitizer(expr, None): continue
             ref, meta = expr_has_tainted(expr, tainted)
             if ref:
                 new_path = list(meta.get('path', [ref]))
-                if len(new_path) >= PATH_LIMIT:
-                    new_path = new_path[-(PATH_LIMIT-1):]
+                if len(new_path) >= 5: new_path = new_path[-4:]
                 new_path.append(target)
                 tainted[target] = {'source': meta.get('source', ref), 'line': line_no, 'path': new_path}
                 changed = True
-        if not changed:
-            break
+        if not changed: break
     return tainted
 
-
-def analyze_file(path: Path, issues):
+def analyze_file(path, issues):
     try:
         text = path.read_text(encoding='utf-8')
-    except (UnicodeDecodeError, OSError):
+    except Exception:
         return
     lines = text.splitlines()
     assignments = parse_assignments(lines)
     tainted = record_taint(assignments)
     for idx, raw in enumerate(lines, start=1):
         stripped = strip_comments(raw)
-        if not stripped:
-            continue
+        if not stripped: continue
         for regex, rule, label in SINKS:
             match = regex.search(stripped)
-            if not match:
-                continue
+            if not match: continue
             expr = match.group(1)
-            if not expr or expr_has_sanitizer(expr, rule):
-                continue
+            if not expr or expr_has_sanitizer(expr, rule): continue
             direct = find_sources(expr)
             if direct:
                 path_desc = f"{direct[0]} -> {label}"
             else:
                 ref, meta = expr_has_tainted(expr, tainted)
-                if not ref:
-                    continue
+                if not ref: continue
                 seq = list(meta.get('path', [ref]))
-                if len(seq) >= PATH_LIMIT:
-                    seq = seq[-(PATH_LIMIT-1):]
+                if len(seq) >= 5: seq = seq[-4:]
                 seq.append(label)
                 path_desc = ' -> '.join(seq)
-            try:
-                rel = path.relative_to(BASE_DIR)
-            except ValueError:
-                rel = path.name
+            try: rel = path.relative_to(ROOT)
+            except ValueError: rel = path.name
             sample = f"{rel}:{idx} {path_desc}"
             bucket = issues[rule]
             bucket['count'] += 1
             if len(bucket['samples']) < 3:
                 bucket['samples'].append(sample)
 
-
 issues = defaultdict(lambda: {'count': 0, 'samples': []})
 for file_path in iter_files(ROOT):
     analyze_file(file_path, issues)
-
 for rule_id, data in issues.items():
     samples = ','.join(data['samples'])
     print(f"{rule_id}\t{data['count']}\t{samples}")
@@ -682,7 +696,6 @@ PY
     print_finding "good" "No tainted sources reach dangerous sinks"
   fi
 }
-
 
 show_ast_samples_from_json() {
   local blob=$1
@@ -709,16 +722,8 @@ persist_metric_json() {
   } >"$UBS_METRICS_DIR/$key.json"
 }
 
-begin_scan_section(){
-  if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi
-  set +e
-  trap - ERR
-}
-end_scan_section(){
-  trap on_err ERR
-  set -e
-  if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi
-}
+begin_scan_section(){ if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set +o pipefail; fi; set +e; trap - ERR; }
+end_scan_section(){ trap on_err ERR; set -e; if [[ "$DISABLE_PIPEFAIL_DURING_SCAN" -eq 1 ]]; then set -o pipefail; fi; }
 
 # ────────────────────────────────────────────────────────────────────────────
 # ast-grep: detection, rule packs, and wrappers
@@ -751,8 +756,8 @@ analyze_py_attr_guards() {
 
   # Attribute chains of depth >= 4
   ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern '$A.$B.$C.$D' --lang python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_attrs"
-  # Capture BODY region (root-cause fix: previously captured COND)
-  ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern $'if $COND:\n    $BODY' --lang python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_ifs"
+  # Capture the BODY of any if statement (less brittle)
+  ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern $'if $COND:\n  $BODY' --lang python "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_ifs"
 
   result=$(python3 - "$tmp_attrs" "$tmp_ifs" "$limit" <<'PYHELP'
 import json, sys
@@ -764,14 +769,10 @@ def load_stream(path):
         with open(path, 'r', encoding='utf-8') as fh:
             for line in fh:
                 line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    except FileNotFoundError:
-        return data
+                if not line: continue
+                try: data.append(json.loads(line))
+                except json.JSONDecodeError: pass
+    except FileNotFoundError: return data
     return data
 
 matches_path, guards_path, limit_raw = sys.argv[1:4]
@@ -798,12 +799,10 @@ bodies_by_file = defaultdict(list)
 for guard in guards:
     file_path = guard.get('file')
     body = guard.get('metaVariables', {}).get('single', {}).get('BODY')
-    if not file_path or not body:
-        continue
+    if not file_path or not body: continue
     rng = body.get('range') or {}
     start = rng.get('start'); end = rng.get('end')
-    if not start or not end:
-        continue
+    if not start or not end: continue
     bodies_by_file[file_path].append((as_pos(start), as_pos(end)))
 
 unguarded = 0
@@ -814,13 +813,11 @@ for match in matches:
     file_path = match.get('file')
     rng = match.get('range') or {}
     start = rng.get('start'); end = rng.get('end')
-    if not file_path or not start or not end:
-        continue
+    if not file_path or not start or not end: continue
     start_pos = as_pos(start); end_pos = as_pos(end)
     regions = bodies_by_file.get(file_path, [])
     if any(within((start_pos, end_pos), region) for region in regions):
-        guarded += 1
-        continue
+        guarded += 1; continue
     unguarded += 1
     if len(samples) < limit:
         snippet = (match.get('lines') or '').strip()
@@ -865,6 +862,15 @@ rule:
     - pattern: $X is 1
 severity: warning
 message: "Avoid 'is' for literal comparison; use '==' (except None uses 'is')"
+YAML
+
+  # Broad except and suppress
+  cat >"$AST_RULE_DIR/except-broad.yml" <<'YAML'
+id: py.except-broad
+language: python
+rule: { pattern: "except Exception as $E:\n  $B" }
+severity: warning
+message: "Catches broad Exception; consider narrowing"
 YAML
 
   cat >"$AST_RULE_DIR/bare-except.yml" <<'YAML'
@@ -1033,13 +1039,18 @@ YAML
 id: py.open-no-encoding
 language: python
 rule:
-  pattern: open($FNAME)
+  any:
+    - pattern: open($FNAME)
+    - pattern: pathlib.Path($P).open($$)
   not:
     has:
       pattern: encoding=$ENC
   not:
-    has:
-      pattern: "mode='b'"
+    any:
+      - has: { pattern: "mode='b'" }
+      - has: { pattern: "mode=\"b\"" }
+      - has: { pattern: "mode='rb'" }
+      - has: { pattern: "mode=\"rb\"" }
 severity: info
 message: "open() without encoding=... may be non-deterministic across locales"
 YAML
@@ -1267,17 +1278,169 @@ severity: warning
 message: "create_task() result unused; keep a reference and handle exceptions"
 YAML
 
+  # Requests timeout missing
+  cat >"$AST_RULE_DIR/requests-timeout-missing.yml" <<'YAML'
+id: py.requests-timeout-missing
+language: python
+rule:
+  pattern: requests.$M($URL, $$)
+  not:
+    has:
+      pattern: timeout=$T
+severity: info
+message: "requests call without timeout=... may hang"
+YAML
+
+  # JSON loads without try/except
+  cat >"$AST_RULE_DIR/json-loads-no-try.yml" <<'YAML'
+id: py.json.loads-no-try
+language: python
+rule:
+  pattern: json.loads($DATA)
+  not:
+    inside:
+      pattern: |
+        try:
+          $A
+        except $E:
+          $B
+severity: warning
+message: "json.loads without exception handling"
+YAML
+
+  # SQL interpolation via % and f-strings
+  cat >"$AST_RULE_DIR/sql-interpolation-percent.yml" <<'YAML'
+id: py.sql-string-format-percent
+language: python
+rule:
+  pattern: $CURSOR.$EXEC("SELECT " + $QS % $ARGS)
+severity: warning
+message: "Interpolated SQL via % operator; use parameters"
+YAML
+
+  cat >"$AST_RULE_DIR/sql-interpolation-fstring.yml" <<'YAML'
+id: py.sql-fstring-params
+language: python
+rule:
+  regex: 'execute\\(f["\\\']\\s*(SELECT|UPDATE|INSERT|DELETE)\\b'
+severity: warning
+message: "Interpolated SQL via f-string; use parameters"
+YAML
+
+  # contextlib.suppress broad
+  cat >"$AST_RULE_DIR/contextlib-suppress-broad.yml" <<'YAML'
+id: py.contextlib-suppress-broad
+language: python
+rule:
+  pattern: contextlib.suppress(Exception)
+severity: info
+message: "contextlib.suppress(Exception) hides all errors"
+YAML
+
+  # aiohttp session not closed
+  cat >"$AST_RULE_DIR/aiohttp-session-no-close.yml" <<'YAML'
+id: py.aiohttp-session-no-close
+language: python
+rule:
+  pattern: $S = aiohttp.ClientSession($$)
+  not:
+    inside:
+      any:
+        - pattern: await $S.close()
+        - pattern: async with aiohttp.ClientSession($$) as $S:
+severity: warning
+message: "aiohttp ClientSession not closed/used as async context manager"
+YAML
+
+  # logging.exception without exc_info
+  cat >"$AST_RULE_DIR/logging-exc-info.yml" <<'YAML'
+id: py.logging-exception-no-exc-info
+language: python
+rule:
+  pattern: logging.$L($MSG)
+  not:
+    has:
+      pattern: exc_info=True
+severity: info
+message: "logging call missing exc_info=True when reporting exceptions"
+YAML
+
+  # Deprecations / 3.13 migration
+  cat >"$AST_RULE_DIR/asyncio-get-event-loop-legacy.yml" <<'YAML'
+id: py.asyncio.get_event_loop-legacy
+language: python
+rule:
+  pattern: asyncio.get_event_loop()
+severity: info
+message: "get_event_loop() legacy usage; prefer get_running_loop() or asyncio.run()"
+YAML
+
+  cat >"$AST_RULE_DIR/imp-module.yml" <<'YAML'
+id: py.imp-module
+language: python
+rule: { pattern: import imp }
+severity: warning
+message: "imp is deprecated; use importlib"
+YAML
+
   # Done writing rules
 }
 
 run_ast_rules() {
   [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
-  local outfmt="--json"; [[ "$FORMAT" == "sarif" ]] && outfmt="--sarif"
-  if "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" $outfmt 2>/dev/null; then
-    return 0
-  else
-    return 1
+  if [[ "$FORMAT" == "sarif" ]]; then
+    "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --sarif 2>/dev/null || return 1
+    AST_PASSTHROUGH=1; return 0
   fi
+  if [[ "$FORMAT" == "json" ]]; then
+    "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json 2>/dev/null || return 1
+    AST_PASSTHROUGH=1; return 0
+  fi
+  # text summary
+  local tmp_stream; tmp_stream="$(mktemp -t ag_stream.XXXXXX 2>/dev/null || mktemp -t ag_stream)"
+  ( set +o pipefail; "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json=stream 2>/dev/null || true ) >"$tmp_stream"
+  if [[ ! -s "$tmp_stream" ]]; then rm -f "$tmp_stream"; return 0; fi
+  print_subheader "ast-grep rule-pack summary"
+  python3 - "$tmp_stream" "$DETAIL_LIMIT" <<'PY'
+import json, sys, collections
+path, limit = sys.argv[1], int(sys.argv[2])
+buckets = collections.OrderedDict()
+def add(obj):
+    rid = obj.get('rule_id') or obj.get('id') or 'unknown'
+    sev = (obj.get('severity') or '').lower() or 'info'
+    file = obj.get('file','?')
+    rng  = obj.get('range') or {}
+    ln = (rng.get('start') or {}).get('row',0)+1
+    msg = obj.get('message') or rid
+    b = buckets.setdefault(rid, {'severity': sev, 'message': msg, 'count': 0, 'samples': []})
+    b['count'] += 1
+    if len(b['samples']) < limit:
+        code = (obj.get('lines') or '').strip().splitlines()[:1]
+        b['samples'].append((file, ln, code[0] if code else ''))
+with open(path, 'r', encoding='utf-8') as fh:
+    for line in fh:
+        line=line.strip()
+        if not line: continue
+        try: add(json.loads(line))
+        except: pass
+sev_rank = {'critical':0, 'warning':1, 'info':2, 'good':3}
+for rid, data in sorted(buckets.items(), key=lambda kv:(sev_rank.get(kv[1]['severity'],9), -kv[1]['count'])):
+    sev = data['severity']; cnt=data['count']; title=data['message']
+    if sev=='critical': print(f"__FINDING__\tcritical\t{cnt}\t{rid}\t{title}")
+    elif sev=='warning': print(f"__FINDING__\twarning\t{cnt}\t{rid}\t{title}")
+    else: print(f"__FINDING__\tinfo\t{cnt}\t{rid}\t{title}")
+    for f,l,c in data['samples']:
+        s=c.replace('\t',' ').strip()
+        print(f"__SAMPLE__\t{f}\t{l}\t{s}")
+PY
+  while IFS=$'\t' read -r tag a b c d; do
+    case "$tag" in
+      __FINDING__) print_finding "$a" "$(num_clamp "$b")" "$c: $d" ;;
+      __SAMPLE__)  print_code_sample "$a" "$b" "$c" ;;
+    esac
+  done <"$tmp_stream"
+  rm -f "$tmp_stream"
+  return 0
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1290,6 +1453,7 @@ check_uv() {
 }
 
 resolve_timeout() {
+  if [[ "${TIMEOUT_SECONDS:-0}" -gt 0 ]]; then UV_TIMEOUT="$TIMEOUT_SECONDS"; fi
   if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD="timeout"; return 0; fi
   if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_CMD="gtimeout"; return 0; fi
   TIMEOUT_CMD=""
@@ -1312,6 +1476,12 @@ run_uv_tool_text() {
       fi
     fi
   fi
+}
+
+run_system_or_uv_tool() {
+  local tool="$1"; shift
+  if [[ "$HAS_UV" -eq 1 ]]; then ( set +o pipefail; "${UVX_CMD[@]}" "$tool" "$@" || true ); return; fi
+  if command -v "$tool" >/dev/null 2>&1; then ( set +o pipefail; "$tool" "$@" || true ); fi
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1380,7 +1550,7 @@ fi
 # Resolve portable timeout
 resolve_timeout || true
 
-# Count files with robust find
+# Count files with robust find / rg
 EX_PRUNE=()
 for d in "${EXCLUDE_DIRS[@]}"; do EX_PRUNE+=( -name "$d" -o ); done
 EX_PRUNE=( \( -type d \( "${EX_PRUNE[@]}" -false \) -prune \) )
@@ -1391,10 +1561,17 @@ for e in "${_EXT_ARR[@]}"; do
   else NAME_EXPR+=( -o -name "*.${e}" ); fi
 done
 NAME_EXPR+=( \) )
-TOTAL_FILES=$(
-  ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
-  | wc -l | awk '{print $1+0}'
-)
+if [[ "$HAS_RIPGREP" -eq 1 ]]; then
+  TOTAL_FILES=$(
+    ( set +o pipefail; rg --files "$PROJECT_DIR" "${RG_EXCLUDES[@]}" "${RG_INCLUDES[@]}" "${RG_MAX_SIZE_FLAGS[@]}" 2>/dev/null || true ) \
+    | wc -l | awk '{print $1+0}'
+  )
+else
+  TOTAL_FILES=$(
+    ( set +o pipefail; find "$PROJECT_DIR" "${EX_PRUNE[@]}" -o \( -type f "${NAME_EXPR[@]}" -print \) 2>/dev/null || true ) \
+    | wc -l | awk '{print $1+0}'
+  )
+fi
 say "${WHITE}Files:${RESET}    ${CYAN}$TOTAL_FILES source files (${INCLUDE_EXT})${RESET}"
 
 # ast-grep availability
@@ -1445,10 +1622,9 @@ if [[ "$HAS_AST_GREP" -eq 1 ]]; then
 import json, sys
 try:
     data = json.load(sys.stdin)
+    print(f"{data.get('unguarded', 0)} {data.get('guarded', 0)}")
 except Exception:
     pass
-else:
-    print(f"{data.get('unguarded', 0)} {data.get('guarded', 0)}")
 PY
 )
     if [[ -n "$parsed_counts" ]]; then
@@ -1460,8 +1636,8 @@ PY
 fi
 if [[ -z "${count:-}" ]]; then
   count=$(
-    ast_search '$X.$Y.$Z.$W' \
-    || ( "${GREP_RN[@]}" -e "\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null || true ) | count_lines
+    ( ast_search '$X.$Y.$Z.$W' ) \
+    || ( ( "${GREP_RN[@]}" -e "\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null || true ) | count_lines )
   )
   guarded_inside=0
 fi
@@ -1547,8 +1723,7 @@ fi
 
 print_subheader "Mutation during iteration"
 if [[ "$HAS_AST_GREP" -eq 1 ]]; then
-  # High-level heuristic: count loops; detailed evidence shown elsewhere
-  count=$("${AST_GREP_CMD[@]}" --lang python --pattern $'for $I in $C:\n    $B' "$PROJECT_DIR" --json=stream 2>/dev/null | grep -c . || true)
+  count=$("${AST_GREP_CMD[@]}" --lang python --pattern $'for $I in $C:\n  $B' "$PROJECT_DIR" --json=stream 2>/dev/null | grep -c . || true)
 else
   count=$("${GREP_RN[@]}" -e "for[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]+in[[:space:]]+[A-Za-z_][A-Za-z0-9_]*" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 fi
@@ -1858,7 +2033,7 @@ print_subheader "Logging sensitive data"
 count=$("${GREP_RNI[@]}" -e "logging\.(debug|info|warning|error|exception)\(.*(password|token|secret|Bearer|Authorization)" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Sensitive data in logs" "Remove or mask secrets"
-  show_detailed_finding "logging\.(debug|info|warning|error|exception)\(.*(password|token|secret|Bearer|Authorization)" 3
+  show_detailed_finding "logging\.(debug|info|warning|error|exception)\(.*(password|token|Bearer|Authorization)" 3
 fi
 fi
 
@@ -1986,7 +2161,7 @@ if [ "$count" -gt 5 ]; then
 fi
 
 print_subheader "open() without explicit encoding"
-count=$("${GREP_RN[@]}" -e "open\([^\)]*\)" "$PROJECT_DIR" 2>/dev/null | \
+count=$("${GREP_RN[@]}" -e "open\([^\)]*\)|Path\([^\)]*\)\.open\([^\)]*\)" "$PROJECT_DIR" 2>/dev/null | \
   (grep -v "encoding[[:space:]]*=" || true) | count_lines
 if [ "$count" -gt 10 ]; then
   print_finding "info" "$count" "No encoding in open()" "Specify encoding= 'utf-8' etc."
@@ -2049,14 +2224,16 @@ run_resource_lifecycle_checks
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AST-GREP RULE PACK FINDINGS (JSON/SARIF passthrough)
+# AST-GREP RULE PACK FINDINGS (JSON/SARIF passthrough or text summary)
 # ═══════════════════════════════════════════════════════════════════════════
 if [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]]; then
   print_header "AST-GREP RULE PACK FINDINGS"
   if run_ast_rules; then
-    say "${DIM}${INFO} Above JSON/SARIF lines are ast-grep matches (id, message, severity, file/pos).${RESET}"
-    if [[ "$FORMAT" == "sarif" ]]; then
-      say "${DIM}${INFO} Tip: ${BOLD}${AST_GREP_CMD[*]} scan -r $AST_RULE_DIR \"$PROJECT_DIR\" --sarif > report.sarif${RESET}"
+    if [[ "$AST_PASSTHROUGH" -eq 1 ]]; then
+      say "${DIM}${INFO} Above JSON/SARIF lines are ast-grep matches (id, message, severity, file/pos).${RESET}"
+      if [[ "$FORMAT" == "sarif" ]]; then
+        say "${DIM}${INFO} Tip: ${BOLD}${AST_GREP_CMD[*]} scan -r $AST_RULE_DIR \"$PROJECT_DIR\" --sarif > report.sarif${RESET}"
+      fi
     fi
   else
     say "${YELLOW}${WARN} ast-grep scan subcommand unavailable; rule-pack mode skipped.${RESET}"
@@ -2068,7 +2245,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 if should_skip 20; then
 print_header "20. UV-POWERED EXTRA ANALYZERS"
-print_category "Ruff linting, Bandit security, Pip-audit (supply chain)" \
+print_category "Ruff linting, Bandit security, Pip-audit, Mypy, Safety, Detect-secrets" \
   "Uses uvx when available; falls back to system tools if installed."
 
 if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
@@ -2077,7 +2254,6 @@ if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
     case "$TOOL" in
       ruff)
         print_subheader "ruff (lint)"
-        # Use ruff's counting mode to quantify diagnostics, also emit JSON for context
         run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=json || true
         ruff_count=$(run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=count | tail -n1 | awk '{print $1+0}')
         if [ "${ruff_count:-0}" -gt 0 ]; then print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"; else print_finding "good" "Ruff clean"; fi
@@ -2085,7 +2261,7 @@ if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
       bandit)
         print_subheader "bandit (security)"
         _EXC=""; for d in "${EXCLUDE_DIRS[@]}"; do _EXC="${_EXC:+$_EXC,}$d"; done
-        if run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "$_EXC"; then
+        if run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "${_EXC:-}" ; then
           print_finding "info" 0 "Bandit scan completed" "See output above"
         else
           say "  ${GRAY}${INFO} bandit not executed${RESET}"
@@ -2102,6 +2278,22 @@ if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
         fi
         print_finding "info" 0 "pip-audit run (if available)" "Review advisories above"
         ;;
+      mypy)
+        print_subheader "mypy (type-check)"
+        run_uv_tool_text mypy --hide-error-context "$PROJECT_DIR" || true
+        ;;
+      detect-secrets)
+        print_subheader "detect-secrets (secrets)"
+        run_system_or_uv_tool detect-secrets scan "$PROJECT_DIR" || true
+        ;;
+      safety)
+        print_subheader "safety (dependency vulns)"
+        if [[ -f "$PROJECT_DIR/requirements.txt" ]]; then
+          run_system_or_uv_tool safety check -r "$PROJECT_DIR/requirements.txt" --full-report || true
+        else
+          run_system_or_uv_tool safety check --full-report || true
+        fi
+        ;;
       *)
         say "  ${GRAY}${INFO} Unknown uv tool '$TOOL' ignored${RESET}"
         ;;
@@ -2114,6 +2306,53 @@ fi
 
 # restore pipefail if we relaxed it
 end_scan_section
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 21: DEPRECATIONS & PY3.13 MIGRATIONS
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 21; then
+print_header "21. DEPRECATIONS & PY3.13 MIGRATIONS"
+print_category "Detects: deprecated modules/APIs likely to break on newer Python" \
+  "Proactive remediation avoids upgrade surprises."
+
+print_subheader "Deprecated modules/APIs"
+count=$("${GREP_RN[@]}" -e "^from[[:space:]]+imp[[:space:]]+import|^import[[:space:]]+imp|asyncio\.get_event_loop\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then
+  print_finding "warning" "$count" "Deprecated API usage" "Replace 'imp' with importlib; prefer get_running_loop()/asyncio.run"
+fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 22: PACKAGING & CONFIG HYGIENE
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 22; then
+print_header "22. PACKAGING & CONFIG HYGIENE"
+print_category "Detects: unpinned requirements, editable installs, local paths" \
+  "Supply-chain & reproducibility safeguards."
+
+print_subheader "Requirements without pins"
+if [ -f "$PROJECT_DIR/requirements.txt" ]; then
+  count=$(grep -E '^[A-Za-z0-9._-]+( *[#].*)?$' "$PROJECT_DIR/requirements.txt" 2>/dev/null | count_lines || true)
+  if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Unpinned dependencies" "Pin versions to avoid drift"; fi
+fi
+
+print_subheader "Editable installs / local paths"
+count=$("${GREP_RN[@]}" -e "^-e[[:space:]]+|file:[/]" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 0 ]; then print_finding "info" "$count" "Editable/local dependency references"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATEGORY 23: NOTEBOOK HYGIENE
+# ═══════════════════════════════════════════════════════════════════════════
+if should_skip 23; then
+print_header "23. NOTEBOOK HYGIENE"
+print_category "Detects: large cell outputs, execution counts, trusted state" \
+  "Keeps VCS diffs clean and reproducible."
+
+print_subheader "Large embedded outputs"
+count=$("${GREP_RN[@]}" -e '"outputs":[[:space:]]*\[[[:space:]]*{' "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+if [ "$count" -gt 5 ]; then print_finding "info" "$count" "Notebooks contain outputs" "Clear outputs before commit"; fi
+fi
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FINAL SUMMARY
@@ -2131,6 +2370,30 @@ say "  ${RED}${BOLD}Critical issues:${RESET}  ${RED}$CRITICAL_COUNT${RESET}"
 say "  ${YELLOW}Warning issues:${RESET}   ${YELLOW}$WARNING_COUNT${RESET}"
 say "  ${BLUE}Info items:${RESET}       ${BLUE}$INFO_COUNT${RESET}"
 echo ""
+
+# Baseline compare (if provided)
+if [[ -n "$BASELINE" && -f "$BASELINE" ]]; then
+  say "${BOLD}${WHITE}Baseline Comparison:${RESET}"
+  CRITICAL_COUNT="$CRITICAL_COUNT" WARNING_COUNT="$WARNING_COUNT" INFO_COUNT="$INFO_COUNT" python3 - "$BASELINE" <<'PY'
+import json,sys,os
+try:
+  with open(sys.argv[1],'r',encoding='utf-8') as fh:
+    b=json.load(fh)
+except Exception:
+  print("  (could not read baseline)")
+  sys.exit(0)
+def get(k): 
+  try: return int(b.get(k,0))
+  except: return 0
+from_now={'critical':int(os.environ.get('CRITICAL_COUNT',0)),
+          'warning':int(os.environ.get('WARNING_COUNT',0)),
+          'info':int(os.environ.get('INFO_COUNT',0))}
+for k in ['critical','warning','info']:
+  prior=get(k); now=from_now[k]; delta=now-prior
+  arrow = '↑' if delta>0 else ('↓' if delta<0 else '→')
+  print(f"  {k.capitalize():<8}: {now:>4}  (baseline {prior:>4})  {arrow} {delta:+}")
+PY
+fi
 
 say "${BOLD}${WHITE}Priority Actions:${RESET}"
 if [ "$CRITICAL_COUNT" -gt 0 ]; then
@@ -2161,7 +2424,30 @@ if [[ -n "$SUMMARY_JSON" ]]; then
     printf '"info":%s,' "$INFO_COUNT"
     printf '"timestamp":"%s",' "$(eval "$DATE_CMD")"
     printf '"format":"%s",' "$FORMAT"
-    printf '"uv_tools":"%s"' "$(printf %s "$UV_TOOLS" | sed 's/"/\\"/g')"
+    printf '"uv_tools":"%s",' "$(printf %s "$UV_TOOLS" | sed 's/"/\\"/g')"
+    printf '"categories":{'
+    printf '"1":%s,"2":%s,"3":%s,"4":%s,"5":%s,"6":%s,"7":%s,"8":%s,' \
+      "$(num_clamp "${CAT1:-0}")" "$(num_clamp "${CAT2:-0}")" "$(num_clamp "${CAT3:-0}")" "$(num_clamp "${CAT4:-0}")" "$(num_clamp "${CAT5:-0}")" "$(num_clamp "${CAT6:-0}")" "$(num_clamp "${CAT7:-0}")" "$(num_clamp "${CAT8:-0}")"
+    printf '"9":%s,"10":%s,"11":%s,"12":%s,"13":%s,"14":%s,"15":%s,"16":%s,' \
+      "$(num_clamp "${CAT9:-0}")" "$(num_clamp "${CAT10:-0}")" "$(num_clamp "${CAT11:-0}")" "$(num_clamp "${CAT12:-0}")" "$(num_clamp "${CAT13:-0}")" "$(num_clamp "${CAT14:-0}")" "$(num_clamp "${CAT15:-0}")" "$(num_clamp "${CAT16:-0}")"
+    printf '"17":%s,"18":%s,"19":%s,"20":%s,"21":%s,"22":%s,"23":%s},' \
+      "$(num_clamp "${CAT17:-0}")" "$(num_clamp "${CAT18:-0}")" "$(num_clamp "${CAT19:-0}")" "$(num_clamp "${CAT20:-0}")" "$(num_clamp "${CAT21:-0}")" "$(num_clamp "${CAT22:-0}")" "$(num_clamp "${CAT23:-0}")"
+    # ast-grep histogram if available
+    if [[ -n "$AST_RULE_DIR" && "$HAS_AST_GREP" -eq 1 ]]; then
+      printf '"ast_grep_rules":['
+      ( set +o pipefail; "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json=stream 2>/dev/null || true ) \
+        | python3 - <<'PY'
+import json,sys,collections
+seen=collections.Counter()
+for line in sys.stdin:
+  line=line.strip()
+  if not line: continue
+  try: rid=(json.loads(line).get('rule_id') or 'unknown'); seen[rid]+=1
+  except: pass
+print(",".join(json.dumps({"id":k,"count":v}) for k,v in seen.items()))
+PY
+      printf ']'
+    else printf '"ast_grep_rules":[]'; fi
     printf '}\n'
   } > "$SUMMARY_JSON" 2>/dev/null || true
   say "${DIM}Summary JSON written to: ${SUMMARY_JSON}${RESET}"
