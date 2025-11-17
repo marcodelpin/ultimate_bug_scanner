@@ -733,3 +733,16 @@ Key behavior:
 
 `run_all.sh` simply forwards to `run_manifest.py`, so CI and humans share the
 same entry point.
+
+### CI automation
+
+GitHub Actions now runs the manifest on every push and pull request via
+`.github/workflows/manifest.yml`. The workflow installs `python3`, `jq`, and
+`ripgrep`, exports `NO_COLOR=1` for stable logs, and executes:
+
+```bash
+cd test-suite && ./run_manifest.py --fail-fast
+```
+
+Failures bubble up exactly as they do locally because the workflow relies on
+the same manifest runner and artifacts under `test-suite/artifacts/`.

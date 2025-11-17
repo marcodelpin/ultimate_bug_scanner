@@ -8,14 +8,14 @@
 - [x] Add substring/rule-id requirement checks so we can prove specific categories fire.
 - [x] Extend manifest to Python fixtures once parser stabilizes; include both `test-suite/python/buggy` and `python/clean` directories.
 - [x] Extend manifest to Go, Rust, C++, Java, Ruby fixtures in `test-suite/<lang>/`.
-- [ ] Investigate why `modules/ubs-js.sh` sometimes reports `Files scanned: 0` even when files exist.
+- [x] Investigate why `modules/ubs-js.sh` sometimes reports `Files scanned: 0` even when files exist.
 - [x] Add threshold coverage for edge-case fixtures (unicode, floating-point, timezone).
-- [ ] Wire manifest runner into CI once other modules catch up.
+- [x] Wire manifest runner into CI once other modules catch up.
 
 ## Resource lifecycle fixtures (ultimate_bug_scanner-6ig)
-- [ ] Investigate `modules/ubs-python.sh` single-file runs (resource_lifecycle) reporting zero files/warnings.
-- [ ] Do the same for Go and Java fixtures (confirm detection logic).
-- [ ] Restore warnings so `--fail-on-warning` triggers and manifest passes.
+- [x] Investigate `modules/ubs-python.sh` single-file runs (resource_lifecycle) reporting zero files/warnings. _(Confirmed manifest case now reports `Files: 1` and warning threshold fires.)_
+- [x] Do the same for Go and Java fixtures (confirm detection logic). _(Go fix required updating `ubs` parser fallback to capture `Files:` lines without “source files”; Java already non-zero.)_
+- [x] Restore warnings so `--fail-on-warning` triggers and manifest passes. _(All three resource-lifecycle cases re-run via `run_manifest.py --fail-fast`.)_
 
 ## Non-JS manifest expansion & docs (ultimate_bug_scanner-ny5)
 - [x] Update `test-suite/README.md` with a multi-language overview, manifest instructions, and tables listing every language’s buggy/clean directories.
@@ -35,4 +35,4 @@
 - [x] Update `run_all.sh` to delegate to `run_manifest.py` (or drive manifest cases directly) instead of running bare directory scans.
 - [x] Run the refreshed manifest end-to-end, capture artifacts, and record the date/result in `notes/` for future baselines.
 
-_Last updated: 2025-11-17 01:05 UTC_
+_Last updated: 2025-11-17 03:25 UTC_
