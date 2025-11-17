@@ -186,17 +186,14 @@ HAS_UDEPS=0
 HAS_OUTDATED=0
 
 # Async error coverage metadata
-ASYNC_ERROR_RULE_IDS=(rust.async.await-no-handler rust.async.tokio-task-no-await)
+ASYNC_ERROR_RULE_IDS=(rust.async.tokio-task-no-await)
 declare -A ASYNC_ERROR_SUMMARY=(
-  [rust.async.await-no-handler]='await expression lacks match/? error handling'
   [rust.async.tokio-task-no-await]='tokio::spawn JoinHandle dropped without await/abort'
 )
 declare -A ASYNC_ERROR_REMEDIATION=(
-  [rust.async.await-no-handler]='Use ? or match to propagate/handle errors from async calls'
   [rust.async.tokio-task-no-await]='Await or abort JoinHandles returned by tokio::spawn to observe failures'
 )
 declare -A ASYNC_ERROR_SEVERITY=(
-  [rust.async.await-no-handler]='warning'
   [rust.async.tokio-task-no-await]='warning'
 )
 
@@ -377,104 +374,25 @@ run_resource_lifecycle_checks() {
 
 run_async_error_checks() {
   print_subheader "Async error path coverage"
-  if [[ "$HAS_AST_GREP" -ne 1 ]]; then
-    print_finding "info" 0 "ast-grep not available" "Install ast-grep to inspect async error handling"
+  local files has_issues=0
+  files=$("${GREP_RN[@]}" -e "tokio::spawn" "$PROJECT_DIR" 2>/dev/null | cut -d: -f1 | sort -u || true)
+  if [[ -z "$files" ]]; then
+    print_finding "good" "No tokio::spawn usage detected"
     return
   fi
-  local rule_dir tmp_json
-  rule_dir="$(mktemp -d 2>/dev/null || mktemp -d -t rs_async_rules.XXXXXX)"
-  if [[ ! -d "$rule_dir" ]]; then
-    print_finding "info" 0 "temp dir creation failed" "Unable to stage ast-grep rules"
-    return
-  fi
-  cat >"$rule_dir/rust.async.await-no-handler.yml" <<'YAML'
-id: rust.async.await-no-handler
-language: rust
-rule:
-  all:
-    - pattern: $CALL.await
-    - not:
-        pattern: $CALL.await?
-    - not:
-        inside:
-          pattern: match $EXPR { $$ }
-    - not:
-        inside:
-          pattern: if let Err($ERR) = $CALL.await { $$ }
-YAML
-  cat >"$rule_dir/rust.async.tokio-task-no-await.yml" <<'YAML'
-id: rust.async.tokio-task-no-await
-language: rust
-rule:
-  all:
-    - pattern: let $HANDLE = tokio::spawn($ARGS);
-    - not:
-        has:
-          pattern: $HANDLE.await
-    - not:
-        has:
-          pattern: $HANDLE.abort()
-YAML
-  tmp_json="$(mktemp 2>/dev/null || mktemp -t rs_async_matches.XXXXXX)"
-  : >"$tmp_json"
-  local rule_file
-  for rule_file in "$rule_dir"/*.yml; do
-    if ! "${AST_GREP_CMD[@]}" scan -r "$rule_file" "$PROJECT_DIR" --json=stream >>"$tmp_json" 2>/dev/null; then
-      rm -rf "$rule_dir"
-      rm -f "$tmp_json"
-      print_finding "info" 0 "ast-grep scan failed" "Unable to compute async error coverage"
-      return
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    local await_hits abort_hits
+    await_hits=$("${GREP_RN[@]}" -e "\.await" "$file" 2>/dev/null | count_lines || true)
+    abort_hits=$("${GREP_RN[@]}" -e "\.abort" "$file" 2>/dev/null | count_lines || true)
+    if (( await_hits == 0 && abort_hits == 0 )); then
+      has_issues=1
+      local rel="${file#"$PROJECT_DIR"/}"
+      print_finding "warning" 1 "tokio::spawn JoinHandle dropped" "Await or abort JoinHandles returned by tokio::spawn ($rel)"
     fi
-  done
-  rm -rf "$rule_dir"
-  if ! [[ -s "$tmp_json" ]]; then
-    rm -f "$tmp_json"
-    print_finding "good" "Async awaits appear handled"
-    return
-  fi
-  local printed=0
-  while IFS=$'\t' read -r rid count samples; do
-    [[ -z "$rid" ]] && continue
-    printed=1
-    local severity=${ASYNC_ERROR_SEVERITY[$rid]:-warning}
-    local summary=${ASYNC_ERROR_SUMMARY[$rid]:-$rid}
-    local desc=${ASYNC_ERROR_REMEDIATION[$rid]:-"Handle Result errors"}
-    if [[ -n "$samples" ]]; then
-      desc+=" (e.g., $samples)"
-    fi
-    print_finding "$severity" "$count" "$summary" "$desc"
-  done < <(python3 - "$tmp_json" <<'PY'
-import json, sys
-from collections import OrderedDict
-path = sys.argv[1]
-stats = OrderedDict()
-with open(path, 'r', encoding='utf-8') as fh:
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        rid = obj.get('rule_id') or obj.get('id') or obj.get('ruleId')
-        if not rid:
-            continue
-        rng = obj.get('range') or {}
-        start = rng.get('start') or {}
-        line_no = start.get('row', 0) + 1
-        file_path = obj.get('file', '?')
-        entry = stats.setdefault(rid, {'count': 0, 'samples': []})
-        entry['count'] += 1
-        if len(entry['samples']) < 3:
-            entry['samples'].append(f"{file_path}:{line_no}")
-for rid, data in stats.items():
-    print(f"{rid}\t{data['count']}\t{','.join(data['samples'])}")
-PY
-)
-  rm -f "$tmp_json"
-  if [[ $printed -eq 0 ]]; then
-    print_finding "good" "Async awaits appear handled"
+  done <<<"$files"
+  if [[ $has_issues -eq 0 ]]; then
+    print_finding "good" "tokio::spawn handles appear awaited"
   fi
 }
 
