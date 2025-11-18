@@ -29,4 +29,13 @@ All tasks reference Beads issue IDs so progress stays traceable. Update this lis
 - [x] Do the same for Go and Java fixtures (confirm detection logic).
 - [x] Restore warnings so `--fail-on-warning` triggers and manifest passes.
 
+## 6. Resource/Shareable follow-up (tracking new CLI/features)
+- [x] Document lifecycle heuristics + shareable workflow in README/test-suite docs.
+- [x] Update per-language module help text to mention category filter env support.
+- [x] Tighten manifest expectations for python/go/java resource cases (assert new messages).
+- [x] Add automated regression that runs `ubs --report-json/--html-report/--comparison` and validates outputs.
+
+## 7. AST migration backlog
+- [ ] See beads `ultimate_bug_scanner-mma`, `ultimate_bug_scanner-5wx`, `ultimate_bug_scanner-6x4`, `ultimate_bug_scanner-41t`, `ultimate_bug_scanner-7g7` for the plan to move lifecycle heuristics + non-AST modules onto ast-grep/semantic helpers.
+
 _Last updated: 2025-11-16 22:58 UTC_

@@ -106,6 +106,27 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 - `--html-report=<file>` emits a standalone HTML preview showing totals, trends vs. baseline, and per-language breakdowns—ideal for attaching to PRs or chat updates.
 - All shareable outputs inject GitHub permalinks when UBS is run inside a git repo with a GitHub remote. Text output automatically annotates `path:line` references, JSON gains `git.*` metadata, and merged SARIF runs now include `versionControlProvenance` plus `automationDetails` keyed by the comparison id.
 
+#### Resource lifecycle heuristics in each language
+- **Python** – Category 16 now correlates every `open()` call against matching `with open(...)` usage and explicit `encoding=` parameters, while Category 19 cross-references file handles, sockets, subprocesses, and asyncio tasks to ensure `.close()`, `.wait()/cancel()` calls exist. The diff counts (`acquire=X, release=Y, context-managed=Z`) show the exact imbalance per file.
+- **Go** – Category 5/17 look for `os.Open/OpenFile`, `sql.Open`, `context.With*`, `time.NewTicker/NewTimer`, and mutex locks that lack matching `Close/Stop/Unlock/cancel`. The heuristics keep a simple acquire/release counter so leaks show up even without AST packs, and they pair nicely with the existing AST rules (tickers/timers/cancel).
+- **Java** – Category 5 surfaces `FileInputStream`, readers/writers, JDBC handles, etc. that were created outside try-with-resources, while Category 19 keeps tracking executor services and file streams that never close. The new summary text matches the manifest fixtures, so CI will fail if regression swallows these warnings.
+
+#### Shareable output quickstart
+```bash
+# 1) Capture a baseline JSON (checked into CI artifacts or local history)
+ubs --ci --only=python --category=resource-lifecycle \
+    --report-json .ubs/baseline.json test-suite/python/buggy
+
+# 2) Re-run with comparison + HTML preview for PRs or chat threads
+ubs --ci --only=python --category=resource-lifecycle \
+    --comparison .ubs/baseline.json \
+    --report-json .ubs/latest.json \
+    --html-report  .ubs/latest.html \
+    test-suite/python/buggy
+```
+
+`latest.json` now contains the git metadata (repo URL, commit, blob_base) plus a `comparison.delta` block, and `latest.html` renders a lightweight dashboard summarising the deltas. SARIF uploads also pick up the comparison id so repeating runs in CI stay grouped by automation id.
+
 Ultimate Bug Scanner is like having a senior developer review every line of code **in under 5 seconds**; it's the perfect automated companion to your favorite coding agent:
 
 ```bash
