@@ -25,6 +25,9 @@ temp/
 
 # Python environments
 .venv/
+__pycache__/
+*.pyc
+*.pyo
 
 # Rust build artifacts
 **/target/
