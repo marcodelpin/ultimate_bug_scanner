@@ -98,6 +98,10 @@ TIMEOUT_CMD=""                        # resolved later
 TIMEOUT_SECONDS="${TIMEOUT_SECONDS:-0}"
 AST_PASSTHROUGH=0
 AST_TEXT_SUMMARY=1
+CATEGORY_WHITELIST=""
+if [[ "${UBS_CATEGORY_FILTER:-}" == "resource-lifecycle" ]]; then
+  CATEGORY_WHITELIST="19"
+fi
 
 # Async error coverage metadata
 ASYNC_ERROR_RULE_IDS=(py.async.task-no-await)
@@ -249,29 +253,34 @@ HAS_UV=0
 RG_MAX_SIZE_FLAGS=()
 
 # Resource lifecycle correlation spec (acquire vs release pairs)
-RESOURCE_LIFECYCLE_IDS=(file_handle popen_handle asyncio_task)
+RESOURCE_LIFECYCLE_IDS=(file_handle socket_handle popen_handle asyncio_task)
 declare -A RESOURCE_LIFECYCLE_SEVERITY=(
   [file_handle]="critical"
+  [socket_handle]="warning"
   [popen_handle]="warning"
   [asyncio_task]="warning"
 )
 declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
   [file_handle]='open\('
+  [socket_handle]='socket\.socket\('
   [popen_handle]='subprocess\.Popen\('
   [asyncio_task]='asyncio\.create_task'
 )
 declare -A RESOURCE_LIFECYCLE_RELEASE=(
   [file_handle]='\.close\(|with[[:space:]]+open'
+  [socket_handle]='\.close\('
   [popen_handle]='\.wait\(|\.communicate\(|\.terminate\(|\.kill\('
   [asyncio_task]='\.cancel\(|await[[:space:]]+asyncio\.(gather|wait)'
 )
 declare -A RESOURCE_LIFECYCLE_SUMMARY=(
   [file_handle]='File handles opened without context manager/close'
+  [socket_handle]='Sockets opened without matching close()'
   [popen_handle]='Popen handles not waited or terminated'
   [asyncio_task]='asyncio tasks spawned without cancellation/await'
 )
 declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
   [file_handle]='Use "with open(...)" or explicitly call .close()'
+  [socket_handle]='Use contextlib closing() or call sock.close() in finally/defer'
   [popen_handle]='Capture the Popen object and call wait/communicate/terminate on it'
   [asyncio_task]='Await the task result or cancel/monitor it before shutdown'
 )
@@ -398,6 +407,10 @@ run_resource_lifecycle_checks() {
       local acquire_hits release_hits
       acquire_hits=$("${GREP_RN[@]}" -e "$acquire_regex" "$file" 2>/dev/null | count_lines || true)
       release_hits=$("${GREP_RN[@]}" -e "$release_regex" "$file" 2>/dev/null | count_lines || true)
+      local context_hits=0
+      if [[ "$rid" == "file_handle" ]]; then
+        context_hits=$("${GREP_RN[@]}" -e "with[[:space:]]+open" "$file" 2>/dev/null | count_lines || true)
+      fi
       acquire_hits=${acquire_hits:-0}
       release_hits=${release_hits:-0}
       if (( acquire_hits > release_hits )); then
@@ -412,7 +425,11 @@ run_resource_lifecycle_checks() {
         local remediation="${RESOURCE_LIFECYCLE_REMEDIATION[$rid]:-Ensure matching cleanup call}"
         local severity="${RESOURCE_LIFECYCLE_SEVERITY[$rid]:-warning}"
         local title="$summary [$relpath]"
-        local desc="$remediation (acquire=$acquire_hits, release=$release_hits)"
+        local extra=""
+        if [[ "$rid" == "file_handle" ]]; then
+          extra=", context-managed=${context_hits:-0}"
+        fi
+        local desc="$remediation (acquire=$acquire_hits, release=$release_hits$extra)"
         print_finding "$severity" "$delta" "$title" "$desc"
       fi
     done <<<"$file_list"
@@ -1489,6 +1506,12 @@ run_system_or_uv_tool() {
 # ────────────────────────────────────────────────────────────────────────────
 should_skip() {
   local cat="$1"
+  if [[ -n "$CATEGORY_WHITELIST" ]]; then
+    local match=1
+    IFS=',' read -r -a allow <<<"$CATEGORY_WHITELIST"
+    for s in "${allow[@]}"; do [[ "$s" == "$cat" ]] && match=0; done
+    [[ $match -eq 1 ]] && return 1
+  fi
   if [[ -z "$SKIP_CATEGORIES" ]]; then return 0; fi
   IFS=',' read -r -a arr <<<"$SKIP_CATEGORIES"
   for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done

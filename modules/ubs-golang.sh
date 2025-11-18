@@ -69,6 +69,10 @@ AST_SARIF=""
 AST_SCAN_OK=0
 RUN_GO_TOOLS=0
 GOTEST_PKGS="./..."
+CATEGORY_WHITELIST=""
+if [[ "${UBS_CATEGORY_FILTER:-}" == "resource-lifecycle" ]]; then
+  CATEGORY_WHITELIST="5,17"
+fi
 
 # Async error coverage metadata
 ASYNC_ERROR_RULE_IDS=(go.async.goroutine-err-no-check)
@@ -101,31 +105,46 @@ declare -A TAINT_SEVERITY=(
 )
 
 # Resource lifecycle correlation spec (acquire vs release pairs)
-RESOURCE_LIFECYCLE_IDS=(context_cancel ticker_stop timer_stop)
+RESOURCE_LIFECYCLE_IDS=(context_cancel ticker_stop timer_stop file_handle db_handle mutex_lock)
 declare -A RESOURCE_LIFECYCLE_SEVERITY=(
   [context_cancel]="critical"
   [ticker_stop]="warning"
   [timer_stop]="warning"
+  [file_handle]="warning"
+  [db_handle]="warning"
+  [mutex_lock]="warning"
 )
 declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
   [context_cancel]='context\.With(Cancel|Timeout|Deadline)\('
   [ticker_stop]='time\.NewTicker\('
   [timer_stop]='time\.NewTimer\('
+  [file_handle]='os\.(Open|OpenFile)\('
+  [db_handle]='sql\.Open(DB)?\('
+  [mutex_lock]='\.Lock\('
 )
 declare -A RESOURCE_LIFECYCLE_RELEASE=(
   [context_cancel]='cancel\('
   [ticker_stop]='\.Stop\('
   [timer_stop]='\.Stop\('
+  [file_handle]='\.Close\('
+  [db_handle]='\.Close\('
+  [mutex_lock]='\.Unlock\('
 )
 declare -A RESOURCE_LIFECYCLE_SUMMARY=(
   [context_cancel]='context.With* without deferred cancel'
   [ticker_stop]='time.NewTicker not stopped'
   [timer_stop]='time.NewTimer not stopped'
+  [file_handle]='os.Open/OpenFile without defer Close()'
+  [db_handle]='sql.Open without DB.Close()'
+  [mutex_lock]='Mutex Lock without Unlock()'
 )
 declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
   [context_cancel]='Store the cancel func and defer cancel() immediately after acquiring the context'
   [ticker_stop]='Keep the ticker handle and call Stop() when finished'
   [timer_stop]='Stop or drain timers to avoid leaks'
+  [file_handle]='Call defer f.Close() immediately after Open to avoid FD leaks'
+  [db_handle]='Close sql.DB handles when shutting down or prefer context-managed lifecycle'
+  [mutex_lock]='Pair Lock() with defer Unlock() to avoid deadlocks when returning early'
 )
 
 print_usage() {
@@ -1067,6 +1086,12 @@ run_ast_rules() {
 # ────────────────────────────────────────────────────────────────────────────
 should_skip() {
   local cat="$1"
+  if [[ -n "$CATEGORY_WHITELIST" ]]; then
+    local keep=1
+    IFS=',' read -r -a allow <<<"$CATEGORY_WHITELIST"
+    for s in "${allow[@]}"; do [[ "$s" == "$cat" ]] && keep=0; done
+    [[ $keep -eq 1 ]] && return 1
+  fi
   if [[ -z "$SKIP_CATEGORIES" ]]; then return 0; fi
   IFS=',' read -r -a arr <<<"$SKIP_CATEGORIES"
   for s in "${arr[@]}"; do [[ "$s" == "$cat" ]] && return 1; done

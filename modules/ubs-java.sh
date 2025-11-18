@@ -180,6 +180,12 @@ while [[ $# -gt 0 ]]; do
       fi;;
   esac
 done
+
+if [[ "${UBS_CATEGORY_FILTER:-}" == "resource-lifecycle" ]]; then
+  if [[ -z "$ONLY_CATEGORIES" ]]; then
+    ONLY_CATEGORIES="5,19"
+  fi
+fi
 if [[ -n "$DETAIL_LIMIT_OVERRIDE" ]]; then DETAIL_LIMIT="$DETAIL_LIMIT_OVERRIDE"; fi
 if [[ -n "${CI:-}" ]]; then CI_MODE=1; fi
 if [[ "$NO_COLOR_FLAG" -eq 1 ]]; then USE_COLOR=0; fi
@@ -1440,6 +1446,15 @@ print_subheader "Files.readAllBytes / large reads inside loops"
 read_all_bytes_loop=$("${GREP_RN[@]}" -e "for[[:space:]]*\(|while[[:space:]]*\(" "$PROJECT_DIR" 2>/dev/null | (grep -A4 "Files\.readAllBytes\(" || true) | (grep -c "Files\.readAllBytes\(" || true))
 read_all_bytes_loop=$(echo "$read_all_bytes_loop" | awk 'END{print $0+0}')
 if [ "$read_all_bytes_loop" -gt 0 ]; then print_finding "warning" "$read_all_bytes_loop" "Files.readAllBytes in loop - consider streaming"; fi
+
+print_subheader "Try-with-resources coverage"
+twr_candidates=$("${GREP_RN[@]}" -e "new[[:space:]]+(File(Input|Output)Stream|Buffered(Reader|Writer)|Scanner|FileReader|FileWriter|Connection|PreparedStatement)\(" "$PROJECT_DIR" 2>/dev/null | grep -v "try[[:space:]]*\(" | count_lines || true)
+if [ "$twr_candidates" -gt 0 ]; then
+  print_finding "warning" "$twr_candidates" "Closeable created outside try-with-resources" "Wrap AutoCloseable objects in try-with-resources or close them in finally blocks"
+  show_detailed_finding "new[[:space:]]+(File(Input|Output)Stream|Buffered(Reader|Writer)|Scanner|Connection|PreparedStatement)\(" 3
+else
+  print_finding "good" "Closeable resources appear wrapped in try-with-resources"
+fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
