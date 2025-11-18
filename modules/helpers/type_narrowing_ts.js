@@ -12,16 +12,39 @@ const projectDir = path.resolve(process.argv[2] || process.cwd());
 const SKIP_DIRS = new Set(['.git', '.hg', '.svn', 'node_modules', 'dist', 'build', '.next', '.nuxt', '.turbo', '.expo']);
 const EXTENSIONS = new Set(['.ts', '.tsx']);
 
-async function collectFiles(dir) {
-  const entries = await fs.readdir(dir, { withFileTypes: true });
+async function collectFiles(target) {
+  let stats;
+  try {
+    stats = await fs.stat(target);
+  } catch (err) {
+    console.warn(`[ubs-type-narrowing] Unable to access ${target}: ${err.message}`);
+    return [];
+  }
+
+  if (stats.isFile()) {
+    return EXTENSIONS.has(path.extname(target).toLowerCase()) ? [target] : [];
+  }
+  if (!stats.isDirectory()) {
+    return [];
+  }
+
+  let entries;
+  try {
+    entries = await fs.readdir(target, { withFileTypes: true });
+  } catch (err) {
+    console.warn(`[ubs-type-narrowing] Skipping ${target}: ${err.message}`);
+    return [];
+  }
+
   const batches = await Promise.all(entries.map(async (entry) => {
+    if (entry.isSymbolicLink()) return [];
     if (SKIP_DIRS.has(entry.name)) return [];
-    const fullPath = path.join(dir, entry.name);
+    const fullPath = path.join(target, entry.name);
     if (entry.isDirectory()) {
       if (entry.name.startsWith('.') && entry.name.length > 1) return [];
       return collectFiles(fullPath);
     }
-    if (EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
+    if (entry.isFile() && EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
       return [fullPath];
     }
     return [];
