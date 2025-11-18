@@ -1214,6 +1214,8 @@ rule:
     - pattern: Statement $S = $EXPR.createStatement($$);
     - pattern: java.sql.PreparedStatement $S = $EXPR.prepareStatement($$);
     - pattern: PreparedStatement $S = $EXPR.prepareStatement($$);
+    - pattern: java.sql.CallableStatement $S = $EXPR.prepareCall($$);
+    - pattern: CallableStatement $S = $EXPR.prepareCall($$);
   not:
     any:
       - inside:
