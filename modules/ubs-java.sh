@@ -211,6 +211,7 @@ HAS_SWIFT_FILES=0
 HAS_AST_GREP=0
 AST_GREP_CMD=()
 AST_RULE_DIR=""
+AST_RULE_RESULTS_JSON=""
 HAS_RG=0
 
 HAS_JAVA=0
@@ -223,29 +224,50 @@ START_TS=""
 END_TS=""
 START_TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%s')"
 
-# Resource lifecycle correlation spec (acquire vs release pairs)
-RESOURCE_LIFECYCLE_IDS=(executor_shutdown thread_join jdbc_close)
-declare -A RESOURCE_LIFECYCLE_SEVERITY=(
+# Resource lifecycle correlation spec (AST + regex fallback)
+RESOURCE_LIFECYCLE_RULE_IDS=(
+  java.resource.executor-no-shutdown
+  java.resource.thread-no-join
+  java.resource.jdbc-no-close
+)
+declare -A RESOURCE_LIFECYCLE_RULE_SEVERITY=(
+  [java.resource.executor-no-shutdown]="critical"
+  [java.resource.thread-no-join]="warning"
+  [java.resource.jdbc-no-close]="warning"
+)
+declare -A RESOURCE_LIFECYCLE_RULE_SUMMARY=(
+  [java.resource.executor-no-shutdown]='ExecutorService created without shutdown'
+  [java.resource.thread-no-join]='Thread started without join()'
+  [java.resource.jdbc-no-close]='JDBC connection acquired without close()'
+)
+declare -A RESOURCE_LIFECYCLE_RULE_REMEDIATION=(
+  [java.resource.executor-no-shutdown]='Store the ExecutorService and call shutdown()/shutdownNow() in finally blocks'
+  [java.resource.thread-no-join]='Join threads or use executors to avoid orphaned workers'
+  [java.resource.jdbc-no-close]='Use try-with-resources or explicitly close java.sql.Connection objects'
+)
+
+RESOURCE_LIFECYCLE_REGEX_IDS=(executor_shutdown thread_join jdbc_close)
+declare -A RESOURCE_LIFECYCLE_REGEX_SEVERITY=(
   [executor_shutdown]="critical"
   [thread_join]="warning"
   [jdbc_close]="warning"
 )
-declare -A RESOURCE_LIFECYCLE_ACQUIRE=(
+declare -A RESOURCE_LIFECYCLE_REGEX_ACQUIRE=(
   [executor_shutdown]='Executors?\.[A-Za-z_]+\('
   [thread_join]='new[[:space:]]+Thread\('
   [jdbc_close]='(DriverManager|DataSource)\.getConnection\('
 )
-declare -A RESOURCE_LIFECYCLE_RELEASE=(
+declare -A RESOURCE_LIFECYCLE_REGEX_RELEASE=(
   [executor_shutdown]='\.shutdown(Now)?\('
   [thread_join]='\.join\('
   [jdbc_close]='\.close\(|try[[:space:]]*\([^)]*Connection[[:space:]]+[A-Za-z_][A-Za-z0-9_]*'
 )
-declare -A RESOURCE_LIFECYCLE_SUMMARY=(
+declare -A RESOURCE_LIFECYCLE_REGEX_SUMMARY=(
   [executor_shutdown]='ExecutorService created without shutdown'
   [thread_join]='Thread started without join()'
   [jdbc_close]='JDBC connection acquired without close()'
 )
-declare -A RESOURCE_LIFECYCLE_REMEDIATION=(
+declare -A RESOURCE_LIFECYCLE_REGEX_REMEDIATION=(
   [executor_shutdown]='Store the ExecutorService and call shutdown()/shutdownNow() in finally blocks'
   [thread_join]='Join threads or use executors to avoid orphaned workers'
   [jdbc_close]='Use try-with-resources or explicitly close connections'
@@ -363,7 +385,7 @@ show_detailed_finding() {
 
 run_resource_lifecycle_checks() {
   print_subheader "Resource lifecycle correlation"
-  if emit_ast_rule_group RESOURCE_LIFECYCLE_IDS RESOURCE_LIFECYCLE_SEVERITY RESOURCE_LIFECYCLE_SUMMARY RESOURCE_LIFECYCLE_REMEDIATION \
+  if emit_ast_rule_group RESOURCE_LIFECYCLE_RULE_IDS RESOURCE_LIFECYCLE_RULE_SEVERITY RESOURCE_LIFECYCLE_RULE_SUMMARY RESOURCE_LIFECYCLE_RULE_REMEDIATION \
     "All tracked resource acquisitions have matching cleanups" "Resource lifecycle checks"; then
     return
   fi
@@ -930,6 +952,36 @@ severity: warning
 message: "ExecutorService created without shutdown()/shutdownNow() in the same scope."
 YAML
 
+  cat >"$AST_RULE_DIR/java-resource-thread.yml" <<'YAML'
+id: java.resource.thread-no-join
+language: java
+rule:
+  pattern: |
+    Thread $T = new Thread($ARGS);
+    $T.start();
+  not:
+    inside:
+      pattern: $T.join($$)
+severity: warning
+message: "Thread started without a matching join(); join threads or await termination."
+YAML
+
+  cat >"$AST_RULE_DIR/java-resource-jdbc.yml" <<'YAML'
+id: java.resource.jdbc-no-close
+language: java
+rule:
+  pattern: java.sql.Connection $C = java.sql.DriverManager.getConnection($$);
+  not:
+    inside:
+      pattern: $C.close()
+  not:
+    inside:
+      kind: try_with_resources_statement
+severity: warning
+message: "JDBC Connection acquired without close(); wrap in try-with-resources or close in finally."
+YAML
+
+
   cat >"$AST_RULE_DIR/thread-sleep-in-sync.yml" <<'YAML'
 id: java.thread-sleep-in-synchronized
 language: java
@@ -1110,6 +1162,130 @@ run_ast_rules() {
   if [[ -n "$SARIF_OUT" ]]; then "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --sarif > "$SARIF_OUT" 2>/dev/null || true; fi
   if [[ -n "$JSON_OUT" ]]; then "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json=stream > "$JSON_OUT" 2>/dev/null || true; fi
   "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" $outfmt 2>/dev/null
+
+
+ensure_ast_rule_results() {
+  [[ "$HAS_AST_GREP" -eq 1 && -n "$AST_RULE_DIR" ]] || return 1
+  if [[ -n "$AST_RULE_RESULTS_JSON" && -f "$AST_RULE_RESULTS_JSON" ]]; then
+    return 0
+  fi
+  local tmp_json
+  tmp_json="$(mktemp 2>/dev/null || mktemp -t java_ast_results.XXXXXX)"
+  if [[ ! -f "$tmp_json" ]]; then
+    return 1
+  fi
+  if ! "${AST_GREP_CMD[@]}" scan -r "$AST_RULE_DIR" "$PROJECT_DIR" --json=stream >"$tmp_json" 2>/dev/null; then
+    rm -f "$tmp_json"
+    return 1
+  fi
+  AST_RULE_RESULTS_JSON="$tmp_json"
+  trap '[[ -n "${AST_RULE_RESULTS_JSON:-}" ]] && rm -f "$AST_RULE_RESULTS_JSON" || true; [[ -n "${AST_RULE_DIR:-}" ]] && rm -rf "$AST_RULE_DIR" || true' EXIT
+  return 0
+}
+
+emit_ast_rule_group() {
+  local rules_name="$1"
+  local severity_map_name="$2"
+  local summary_map_name="$3"
+  local remediation_map_name="$4"
+  local good_msg="$5"
+  local missing_msg="$6"
+
+  if [[ "$HAS_AST_GREP" -ne 1 || -z "$AST_RULE_DIR" ]]; then
+    print_finding "info" 0 "$missing_msg" "Install ast-grep to enable this check"
+    return 1
+  fi
+
+  declare -n _rule_ids="$rules_name"
+  declare -n _severity="$severity_map_name"
+  declare -n _summary="$summary_map_name"
+  declare -n _remediation="$remediation_map_name"
+
+  if ! ensure_ast_rule_results; then
+    print_finding "info" 0 "$missing_msg" "ast-grep scan failed"
+    return 1
+  fi
+  local result_json="$AST_RULE_RESULTS_JSON"
+  if ! [[ -s "$result_json" ]]; then
+    print_finding "good" "$good_msg"
+    return 0
+  fi
+
+  local had_matches=0
+  if command -v python3 >/dev/null 2>&1; then
+    while IFS=$'	' read -r match_rid match_count match_samples; do
+      [[ -z "$match_rid" ]] && continue
+      had_matches=1
+      local sev=${_severity[$match_rid]:-warning}
+      local summary=${_summary[$match_rid]:-$match_rid}
+      local desc=${_remediation[$match_rid]:-}
+      print_finding "$sev" "$match_count" "$summary" "$desc"
+      if [[ -n "$match_samples" ]]; then
+        IFS=',' read -r -a sample_arr <<<"$match_samples"
+        for sample in "${sample_arr[@]}"; do
+          [[ -z "$sample" ]] && continue
+          say "    ${DIM}$sample${RESET}"
+        done
+      fi
+    done < <(python3 - "$result_json" "${_rule_ids[@]}" <<'PYRULE'
+import json, sys
+from collections import OrderedDict
+
+if len(sys.argv) < 2:
+    sys.exit(0)
+
+rule_file = sys.argv[1]
+want = set(sys.argv[2:])
+if not want:
+    sys.exit(0)
+
+stats = OrderedDict()
+with open(rule_file, 'r', encoding='utf-8') as fh:
+    for line in fh:
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        rid = obj.get('ruleId') or obj.get('rule_id') or obj.get('id')
+        if not rid or rid not in want:
+            continue
+        f = obj.get('file') or obj.get('path') or '?'
+        rng = obj.get('range') or {}
+        start = rng.get('start') or {}
+        line_no = start.get('line')
+        if isinstance(line_no, int):
+            line_no += 1
+        sample = f"{f}:{line_no if line_no is not None else '?'}"
+        entry = stats.setdefault(rid, {'count': 0, 'samples': []})
+        entry['count'] += 1
+        if len(entry['samples']) < 3:
+            entry['samples'].append(sample)
+
+for rid, data in stats.items():
+    print(rid, data['count'], ','.join(data['samples']), sep='	')
+PYRULE
+    )
+  else
+    for rid in "${_rule_ids[@]}"; do
+      local c
+      c=$(grep -c "\"ruleId\": \"$rid\"" "$result_json" 2>/dev/null || echo 0)
+      if [[ "$c" -gt 0 ]]; then
+        had_matches=1
+        local sev=${_severity[$rid]:-warning}
+        local summary=${_summary[$rid]:-$rid}
+        local desc=${_remediation[$rid]:-}
+        print_finding "$sev" "$c" "$summary" "$desc"
+      fi
+    done
+  fi
+
+  if [[ $had_matches -eq 0 ]]; then
+    print_finding "good" "$good_msg"
+  fi
+  return 0
+}
 }
 
 # ────────────────────────────────────────────────────────────────────────────
