@@ -1113,10 +1113,10 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scan
 Run the installer in `--uninstall` mode via curl if you want to remove UBS and all of its integrations:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh | bash -s -- --uninstall --non-interactive
 ```
 
-This command deletes the UBS binary, shell RC snippets/aliases, config under `~/.config/ubs`, and the optional Claude/Git hooks that the installer set up.
+This command deletes the UBS binary, shell RC snippets/aliases, config under `~/.config/ubs`, and the optional Claude/Git hooks that the installer set up. Because it passes `--non-interactive`, it auto-confirms all prompts and runs unattended.
 
 | Flag | What it does | Why it matters |
 |------|--------------|----------------|

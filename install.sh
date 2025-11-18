@@ -69,25 +69,6 @@ declare -A SESSION_FACTS=()
 TEMP_FILES=()
 # Temporary working directory for this run (isolates artifacts; pruned on EXIT)
 WORKDIR_CAN_DELETE=1
-if [ -n "${UBS_INSTALLER_WORKDIR:-}" ]; then
-  if [[ "${UBS_INSTALLER_WORKDIR}" = /* ]]; then
-    WORKDIR="${UBS_INSTALLER_WORKDIR}"
-  else
-    WORKDIR="$PWD/${UBS_INSTALLER_WORKDIR}"
-  fi
-  if [ -e "$WORKDIR" ]; then
-    error "UBS_INSTALLER_WORKDIR path already exists: $WORKDIR"
-    error "Provide a non-existent directory so the installer can manage its lifecycle safely."
-    exit 1
-  fi
-  if ! mkdir -p "$WORKDIR" 2>/dev/null; then
-    error "Unable to create installer work directory: $WORKDIR"
-    exit 1
-  fi
-else
-  WORKDIR="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-install)"
-fi
-TEMP_FILES+=("$WORKDIR")
 # Lock file for concurrent execution prevention (MUST be fixed name, not $$)
 LOCK_FILE="/tmp/ubs-install.lock"
 # Track if we own the lock (only remove it if we created it)
@@ -334,10 +315,6 @@ acquire_lock() {
   fi
 }
 
-# Set up cleanup traps
-trap 'cleanup_on_exit; exit 130' INT   # 130 = 128 + SIGINT (2)
-trap 'cleanup_on_exit; exit 143' TERM  # 143 = 128 + SIGTERM (15)
-trap cleanup_on_exit EXIT
 
 print_header() {
   [ "$QUIET" -eq 1 ] && return 0
@@ -353,7 +330,7 @@ print_header() {
     ║      ╚═════╝ ╚═════╝ ╚══════╝    ╚═╝╚═╝  ╚═══╝╚══════╝   ╚═╝     ║
     ║                                                                  ║
 HEADER
-  echo -e "   ║         ${GREEN}🔬 ULTIMATE BUG SCANNER INSTALLER v${VERSION} 🔬${BLUE}             ║"
+  echo -e "    ║         ${GREEN}🔬 ULTIMATE BUG SCANNER INSTALLER v${VERSION} 🔬${BLUE}             ║"
   cat << 'HEADER'
     ║                                                                  ║
     ║   Industrial-Grade Static Analysis for Polyglot AI Codebases     ║
@@ -385,6 +362,31 @@ log() { print_with_icon "${ARROW}" "$*"; }
 success() { print_with_icon "${CHECK}" "$*"; }
 error() { print_with_icon "${CROSS}" "$*" >&2; }
 warn() { print_with_icon "${WARN}" "$*"; }
+
+# Set up cleanup traps
+trap 'cleanup_on_exit; exit 130' INT   # 130 = 128 + SIGINT (2)
+trap 'cleanup_on_exit; exit 143' TERM  # 143 = 128 + SIGTERM (15)
+trap cleanup_on_exit EXIT
+
+if [ -n "${UBS_INSTALLER_WORKDIR:-}" ]; then
+  if [[ "${UBS_INSTALLER_WORKDIR}" = /* ]]; then
+    WORKDIR="${UBS_INSTALLER_WORKDIR}"
+  else
+    WORKDIR="$PWD/${UBS_INSTALLER_WORKDIR}"
+  fi
+  if [ -e "$WORKDIR" ]; then
+    error "UBS_INSTALLER_WORKDIR path already exists: $WORKDIR"
+    error "Provide a non-existent directory so the installer can manage its lifecycle safely."
+    exit 1
+  fi
+  if ! mkdir -p "$WORKDIR" 2>/dev/null; then
+    error "Unable to create installer work directory: $WORKDIR"
+    exit 1
+  fi
+else
+  WORKDIR="$(mktemp -d 2>/dev/null || mktemp -d -t ubs-install)"
+fi
+TEMP_FILES+=("$WORKDIR")
 
 log_network_failure() {
   local context="$1"
@@ -1523,9 +1525,13 @@ uninstall_ubs() {
   log_section "Uninstall Ultimate Bug Scanner"
 
   warn "This will remove Ultimate Bug Scanner and all integrations"
-  if ! ask "Continue with uninstall?"; then
-    log "Uninstall cancelled"
-    return 0
+  if [ "$NON_INTERACTIVE" -eq 1 ] || [ "$FORCE_UNINSTALL" -eq 1 ]; then
+    log "Auto-confirming uninstall"
+  else
+    if ! ask "Continue with uninstall?"; then
+      log "Uninstall cancelled"
+      return 0
+    fi
   fi
 
   log "Uninstalling Ultimate Bug Scanner..."
@@ -1568,7 +1574,7 @@ uninstall_ubs() {
 
   # Remove hooks
   echo ""
-  if ask "Remove git hooks?"; then
+  if [ "$NON_INTERACTIVE" -eq 1 ] || ask "Remove git hooks?"; then
     if [ -f ".git/hooks/pre-commit" ] && grep -q "Ultimate Bug Scanner" ".git/hooks/pre-commit" 2>/dev/null; then
       if [ -f ".git/hooks/pre-commit.backup" ]; then
         mv ".git/hooks/pre-commit.backup" ".git/hooks/pre-commit"
@@ -1580,7 +1586,7 @@ uninstall_ubs() {
     fi
   fi
 
-  if ask "Remove Claude Code hook?"; then
+  if [ "$NON_INTERACTIVE" -eq 1 ] || ask "Remove Claude Code hook?"; then
     if [ -f ".claude/hooks/on-file-write.sh" ]; then
       rm -f ".claude/hooks/on-file-write.sh"
       success "Removed Claude hook"
