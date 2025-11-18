@@ -8,14 +8,78 @@ from pathlib import Path
 from typing import Iterable
 
 SKIP_DIRS = {".git", "node_modules", "dist", "build", "bin", "out", ".venv", "vendor"}
-STATEMENT_RE = re.compile(r"\b(?:PreparedStatement|Statement)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*?;", re.DOTALL)
+STATEMENT_RE = re.compile(r"\b(?:PreparedStatement|CallableStatement|Statement)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*?;", re.DOTALL)
 RESULTSET_RE = re.compile(r"\bResultSet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=.*?;", re.DOTALL)
 TRY_RE = re.compile(r"\btry\s*\(")
 
 
 def strip_comments(text: str) -> str:
-    text = re.sub(r"//.*", "", text)
-    return re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    result: list[str] = []
+    i = 0
+    n = len(text)
+    in_line = False
+    in_block = False
+    in_string = False
+    string_quote = ""
+    escaped = False
+
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+
+        if in_line:
+            if ch == "\n":
+                in_line = False
+                result.append("\n")
+            else:
+                result.append(" ")
+            i += 1
+            continue
+
+        if in_block:
+            if ch == "*" and nxt == "/":
+                result.extend("  ")
+                in_block = False
+                i += 2
+            else:
+                result.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+
+        if in_string:
+            result.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == string_quote:
+                in_string = False
+            i += 1
+            continue
+
+        if ch in ('"', "'"):
+            in_string = True
+            string_quote = ch
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            in_line = True
+            result.extend("  ")
+            i += 2
+            continue
+
+        if ch == "/" and nxt == "*":
+            in_block = True
+            result.extend("  ")
+            i += 2
+            continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
 
 
 def iter_java_files(root: Path) -> Iterable[Path]:
@@ -63,7 +127,7 @@ def collect_issues(root: Path) -> list[tuple[str, str, int]]:
         code_text = strip_comments(text)
         lines = text.splitlines()
         def handle_matches(regex: re.Pattern[str], kind: str) -> None:
-            for match in regex.finditer(text):
+            for match in regex.finditer(code_text):
                 name = match.group(1)
                 if name == "_":
                     continue
@@ -72,7 +136,7 @@ def collect_issues(root: Path) -> list[tuple[str, str, int]]:
                 line_idx = line_no - 1
                 line_text = lines[line_idx] if 0 <= line_idx < len(lines) else ""
                 prefix = line_text.split(name, 1)[0]
-                if inside_try_with(text, start):
+                if inside_try_with(code_text, start):
                     continue
                 if has_close(name, code_text):
                     continue
