@@ -106,3 +106,18 @@ _Updated: 2025-11-18 01:30 UTC_
 - [x] README/test-suite docs: new Swift/Kotlin coverage table row plus CLI flag mention.
 - [x] UBS CLI help text: mention cross-language coverage + `--skip-type-narrowing` effects (ensuring help section includes languages).
 - [x] Tests: run targeted manifest cases + `test-suite/run_all.sh` to verify metrics.
+
+### 10. Java Lifecycle AST Coverage (6x4)
+- [x] Generate ast-grep rules for ExecutorService shutdown, raw Thread join, and JDBC connection close detection.
+- [x] Wire `emit_ast_rule_group` + shared AST result caching into `ubs-java.sh` so resource heuristics use AST first with regex fallback.
+- [x] Keep manifest expectations stable (java-resource-lifecycle) via summary strings + new rule IDs.
+
+### 11. Python Resource Helper (41t)
+- [x] Enhance `resource_lifecycle_py.py` to understand `with/async with`, alias imports, and attribute `.open()` / `.connect()` patterns (pathlib, DB handles, etc.).
+- [x] Ensure helper output powers Category 19 so regex heuristics are only a fallback when Python 3 or the helper file is unavailable.
+- [x] Update fixtures/docs to note the AST-driven detection and re-run manifest suites.
+
+### 12. Universal AST Adoption (7g7)
+- [x] Document the AST coverage story in README (JS/TS, Python, Go, C++, Rust, Java, Ruby, Swift, Kotlin) so the epic has a single source of truth.
+- [x] Verify every language module now has AST-powered detectors for its flagship categories (type narrowing, resource lifecycle, taint/async errors) with regex only as a fallback.
+- [x] Re-run `test-suite/run_all.sh` + `./ubs --ci .` to prove the AST stack is stable across languages.

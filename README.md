@@ -425,6 +425,12 @@ ubs .
 - **Kotlin** – The Java module scans `.kt` sources for `if (value == null)` guards that merely log and keep running before hitting `value!!`, catching the same pitfall on JVM teams that mix Java + Kotlin.
 - **Swift** – Guard-`let` validation plus optional chaining/Objective‑C bridging heuristics catch cases where code logs and continues before force-unwrapping `value!`, protecting iOS/macOS pipelines that blend Swift + ObjC.
 
+### **Resource Lifecycle AST Coverage**
+
+- **Python** – `modules/helpers/resource_lifecycle_py.py` now reasons over the AST, tracking `with`/`async with`, alias imports, and `.open()`/`.connect()` calls so `ubs-python` warns only when a handle is truly leaking. Pathlib `Path.open()` and similar patterns are handled without brittle regexes.
+- **Java** – New ast-grep rules (`java.resource.executor-no-shutdown`, `java.resource.thread-no-join`, `java.resource.jdbc-no-close`) ensure ExecutorServices, raw `Thread`s, and `java.sql.Connection`s get proper shutdown/close semantics before the regex fallback ever runs.
+- **C++ / Rust / Ruby** – These modules already relied on ast-grep rule packs; the “Universal AST Adoption” epic is now complete with every language module (JS, Python, Go, C++, Rust, Java, Ruby, Swift, Kotlin) running semantic detectors instead of fragile grep-only heuristics.
+
 Use `--skip-type-narrowing` (or `UBS_SKIP_TYPE_NARROWING=1`) when you want to bypass all of these guard analyzers—for example on air-gapped CI environments or when validating legacy projects one language at a time.
 
 ### **4. Speed Enables Tight Iteration Loops**
