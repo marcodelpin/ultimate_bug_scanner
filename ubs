@@ -38,6 +38,44 @@ fi
 CHECK="✓"; WARN="⚠"; INFO="ℹ"; X="✗"
 say(){ echo -e "$*"; }
 
+print_with_permalinks(){
+  local file="$1"
+  if [[ -z "$file" || ! -s "$file" ]]; then return; fi
+  if [[ -z "$GIT_BLOB_BASE" ]]; then
+    cat "$file"
+    return
+  fi
+  python3 - "$SOURCE_PROJECT_DIR" "$GIT_BLOB_BASE" "$file" <<'PY' 2>/dev/null || cat "$file"
+import sys, pathlib, re
+root = pathlib.Path(sys.argv[1]).resolve()
+blob = sys.argv[2].rstrip('/')
+input_path = pathlib.Path(sys.argv[3])
+pattern = re.compile(r'^(\s*)([^:\s][^:]*?):(\d+)(?::(\d+))?')
+
+def to_url(path_str, line):
+    candidate = pathlib.Path(path_str)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        rel = candidate.resolve().relative_to(root)
+    except Exception:
+        return None
+    return f"{blob}/{rel.as_posix()}#L{line}"
+
+with input_path.open('r', encoding='utf-8', errors='ignore') as fh:
+    for raw in fh:
+        m = pattern.match(raw)
+        if not m:
+            sys.stdout.write(raw)
+            continue
+        url = to_url(m.group(2), m.group(3))
+        if not url:
+            sys.stdout.write(raw)
+            continue
+        sys.stdout.write(raw.rstrip('\n') + f" ({url})\n")
+PY
+}
+
 on_err(){ local ec=$? ln=${BASH_LINENO[0]:-?} cmd=${BASH_COMMAND:-?}; say "${RED}${BOLD}Error${RESET}${DIM} (exit $ec)${RESET} ${WHITE}line $ln:${RESET} $cmd"; exit $ec; }
 trap on_err ERR
 
@@ -60,11 +98,27 @@ UPDATE_MODULES=0
 JOBS="${JOBS:-0}"
 SKIP_TYPE_NARROWING=0
 MODE="scan"
+SESSION_ENTRIES=1
+SESSION_RAW=0
+SESSION_LOG_DIR_OVERRIDE=""
 VERIFY_MODULE_ERR=""
 ALL_LANGS=(js python cpp rust golang java ruby)
+CATEGORY_FILTER=""
+COMPARISON_FILE=""
+REPORT_JSON_PATH=""
+HTML_REPORT_PATH=""
+SHAREABLE_MODE=0
+GIT_REMOTE_URL=""
+GIT_REMOTE_HTTP=""
+GIT_COMMIT_SHA=""
+GIT_BLOB_BASE=""
+SARIF_AUTOMATION_ID=""
 
 if [[ "${1:-}" == "doctor" ]]; then
   MODE="doctor"
+  shift
+elif [[ "${1:-}" == "sessions" || "${1:-}" == "session-log" ]]; then
+  MODE="sessions"
   shift
 fi
 
@@ -72,6 +126,7 @@ usage() {
   cat <<USAGE >&2
 Usage: ubs [options] [PROJECT_DIR]
        ubs doctor [options]
+       ubs sessions [--entries N] [--raw]
 
 Options:
   --format=FMT            text|json|sarif (default: text)
@@ -81,10 +136,14 @@ Options:
   --only=CSV              Restrict to languages: js,python,cpp,rust,golang,java,ruby
   --exclude=CSV           Exclude languages
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
+  --category=CSV          Focus on category packs (resource-lifecycle)
+  --comparison=FILE       Baseline JSON to diff combined results against
+  --report-json=FILE      Write combined summary JSON to FILE
+  --html-report=FILE      Emit shareable HTML report to FILE
   --update-modules        Force re-download of modules before run
   --jobs=N                Parallelism hint (passed to children if supported)
   --ignore-file=PATH      Read additional ignore globs (default: PROJECT/.ubsignore if present)
-  --skip-type-narrowing   Skip JS/Rust type narrowing checks (falls back to basic heuristics)
+  --skip-type-narrowing   Skip JS/Rust/Kotlin/Swift type narrowing checks (falls back to basic heuristics)
   -h, --help              Show this help
 
 Examples:
@@ -92,6 +151,7 @@ Examples:
   ubs --format=json --ci .    # machine-readable combined JSON
   ubs --only=js,python .      # restrict language set
   ubs doctor --fix            # validate cached modules & redownload corrupted copies
+  ubs sessions --entries 1    # view the most recent installer summary
 USAGE
 }
 
@@ -104,6 +164,72 @@ Options:
   --fix              Automatically download or refresh cached modules
   -h, --help         Show this help message
 DOC
+}
+
+sessions_usage(){
+  cat <<SESS >&2
+Usage: ubs sessions [options]
+
+Options:
+  --entries=N        Show the last N install sessions (default: 1)
+  --raw              Print the entire session log as-is
+  --config-dir=DIR   Override the config directory (defaults to \$XDG_CONFIG_HOME/ubs)
+  -h, --help         Show this help message
+SESS
+}
+
+show_session_history(){
+  local entries="$1"
+  local raw="$2"
+  local override="$3"
+  local base_dir
+  if [[ -n "$override" ]]; then
+    base_dir="$override"
+  else
+    base_dir="${XDG_CONFIG_HOME:-$HOME/.config}/ubs"
+  fi
+  local log_file="$base_dir/session.md"
+  if [[ ! -f "$log_file" ]]; then
+    say "${RED}$X no session history found${RESET} (expected at ${log_file})"
+    exit 1
+  fi
+  local entries_int=1
+  if [[ "$entries" =~ ^[0-9]+$ ]]; then
+    entries_int="$entries"
+  fi
+  if [[ "$entries_int" -lt 1 ]]; then
+    entries_int=1
+  fi
+  if [[ "$raw" -eq 1 ]]; then
+    say "${BLUE}${INFO}${RESET} Showing session log from ${log_file}"
+    cat "$log_file"
+    exit 0
+  fi
+  if ! need_cmd python3; then
+    say "${RED}$X python3 required${RESET} to format session history"
+    exit 1
+  fi
+  say "${BLUE}${INFO}${RESET} Showing last ${entries_int} session(s) from ${log_file}"
+  python3 - "$log_file" "$entries_int" <<'PY' 2>/dev/null
+import sys, pathlib
+from itertools import islice
+
+path = pathlib.Path(sys.argv[1])
+entries = max(1, int(sys.argv[2]))
+text = path.read_text(encoding='utf-8', errors='ignore').strip()
+if not text:
+    print("No session entries recorded.")
+    sys.exit(1)
+sections = [block.strip() for block in text.split('\n---\n') if block.strip()]
+if not sections:
+    print("No session entries recorded.")
+    sys.exit(1)
+subset = sections[-entries:]
+for idx, block in enumerate(subset):
+    print(block)
+    if idx != len(subset) - 1:
+        print("\n---\n")
+PY
 }
 
 DOCTOR_FIX=0
@@ -123,6 +249,26 @@ if [[ "$MODE" == "doctor" ]]; then
         ;;
     esac
   done
+elif [[ "$MODE" == "sessions" ]]; then
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --entries=*) SESSION_ENTRIES="${1#*=}"; shift;;
+      --entries)
+        if [[ $# -lt 2 ]]; then sessions_usage; exit 2; fi
+        shift; SESSION_ENTRIES="$1"; shift;;
+      --raw) SESSION_RAW=1; shift;;
+      --config-dir=*) SESSION_LOG_DIR_OVERRIDE="${1#*=}"; shift;;
+      --config-dir)
+        if [[ $# -lt 2 ]]; then sessions_usage; exit 2; fi
+        shift; SESSION_LOG_DIR_OVERRIDE="$1"; shift;;
+      -h|--help) sessions_usage; exit 0;;
+      *)
+        say "${RED}$X unknown sessions option${RESET}: $1"
+        sessions_usage
+        exit 2
+        ;;
+    esac
+  done
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -132,6 +278,10 @@ else
       -v|--verbose) VERBOSE=1; shift;;
       --only=*) ONLY_LANGS="${1#*=}"; shift;;
       --exclude=*) EXCLUDE_LANGS="${1#*=}"; shift;;
+      --category=*) CATEGORY_FILTER="${1#*=}"; shift;;
+      --comparison=*) COMPARISON_FILE="${1#*=}"; SHAREABLE_MODE=1; SARIF_AUTOMATION_ID="ubs-comparison"; shift;;
+      --report-json=*) REPORT_JSON_PATH="${1#*=}"; SHAREABLE_MODE=1; shift;;
+      --html-report=*) HTML_REPORT_PATH="${1#*=}"; SHAREABLE_MODE=1; shift;;
       --ignore-file=*) IGNORE_FILE="${1#*=}"; shift;;
       --module-dir=*) MODULE_DIR="${1#*=}"; shift;;
       --module-dir)
@@ -166,6 +316,23 @@ else
 fi
 SOURCE_PROJECT_DIR="$PROJECT_DIR"
 
+if [[ -n "$CATEGORY_FILTER" ]]; then
+  CATEGORY_FILTER="${CATEGORY_FILTER,,}"
+  if [[ "$CATEGORY_FILTER" == "resource-lifecycle" ]]; then
+    SHAREABLE_MODE=$((SHAREABLE_MODE+0))
+    if [[ -z "$ONLY_LANGS" ]]; then
+      ONLY_LANGS="python,golang,java"
+    fi
+    export UBS_CATEGORY_FILTER="$CATEGORY_FILTER"
+  else
+    say "${YELLOW}${WARN}${RESET} Unknown category filter: $CATEGORY_FILTER"
+    CATEGORY_FILTER=""
+    unset UBS_CATEGORY_FILTER
+  fi
+else
+  unset UBS_CATEGORY_FILTER
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Capabilities & helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +365,43 @@ finalize_module_dir(){
   if resolved=$(cd "$MODULE_DIR" 2>/dev/null && pwd -P); then
     MODULE_DIR="$resolved"
   fi
+}
+
+resolve_git_metadata(){
+  local root
+  if ! root=$(git -C "$SOURCE_PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null); then
+    return
+  fi
+  local remote commit
+  remote=$(git -C "$root" config --get remote.origin.url 2>/dev/null || true)
+  commit=$(git -C "$root" rev-parse HEAD 2>/dev/null || true)
+  [[ -n "$remote" && -n "$commit" ]] || return
+  GIT_REMOTE_URL="$remote"
+  GIT_COMMIT_SHA="$commit"
+  GIT_REMOTE_HTTP=""
+  case "$remote" in
+    git@github.com:*)
+      local path_part=${remote#git@github.com:}
+      path_part=${path_part%.git}
+      GIT_REMOTE_HTTP="https://github.com/${path_part}"
+      GIT_BLOB_BASE="https://github.com/${path_part}/blob/${commit}"
+      ;;
+    https://github.com/*)
+      local path_part=${remote#https://github.com/}
+      path_part=${path_part%.git}
+      GIT_REMOTE_HTTP="https://github.com/${path_part}"
+      GIT_BLOB_BASE="https://github.com/${path_part}/blob/${commit}"
+      ;;
+    git://github.com/*)
+      local path_part=${remote#git://github.com/}
+      path_part=${path_part%.git}
+      GIT_REMOTE_HTTP="https://github.com/${path_part}"
+      GIT_BLOB_BASE="https://github.com/${path_part}/blob/${commit}"
+      ;;
+    *)
+      GIT_BLOB_BASE=""
+      ;;
+  esac
 }
 
 load_ignore_patterns(){
@@ -439,6 +643,11 @@ path.write_text(data.replace(src, dst))
 PY
 }
 
+if [[ "$MODE" == "sessions" ]]; then
+  show_session_history "$SESSION_ENTRIES" "$SESSION_RAW" "$SESSION_LOG_DIR_OVERRIDE"
+  exit 0
+fi
+
 if [[ "$MODE" != "doctor" ]]; then
   if [[ -z "$IGNORE_FILE" && -f "$SOURCE_PROJECT_DIR/.ubsignore" ]]; then
     IGNORE_FILE="$SOURCE_PROJECT_DIR/.ubsignore"
@@ -582,6 +791,7 @@ ensure_module(){
 }
 
 finalize_module_dir
+resolve_git_metadata
 
 if [[ "$MODE" == "doctor" ]]; then
   run_doctor "$DOCTOR_FIX"
@@ -594,6 +804,7 @@ fi
 TMPDIR_RUN="$(mktemp -d 2>/dev/null || mktemp -d -t ubsrun.XXXXXX)"
 cleanup(){ rm -rf "$TMPDIR_RUN" || true; }
 trap cleanup EXIT
+COMBINED_JSON_FILE="$TMPDIR_RUN/combined.json"
 
 apply_ignore_filters
 
@@ -788,18 +999,30 @@ merge_json_scanners(){
      }}' "${jsons[@]}"
 }
 
+generate_combined_json(){
+  [[ -n "$COMBINED_JSON_FILE" ]] || return 1
+  if [[ -s "$COMBINED_JSON_FILE" ]]; then return 0; fi
+  if ! need_cmd jq; then return 1; fi
+  merge_json_scanners >"$COMBINED_JSON_FILE" 2>/dev/null || return 1
+  return 0
+}
+
 merge_sarif_runs(){
   local sarifs=( "$TMPDIR_RUN"/*.sarif )
   if ! need_cmd jq; then
     say "${YELLOW}${WARN}${RESET} jq not found; cannot merge SARIF; printing first artifact"; cat "${sarifs[0]}"; return 0
   fi
   # Accept either raw SARIF root or wrapped under "sarifLog"
-  jq -s '
+  jq -s --arg repo "$GIT_REMOTE_HTTP" --arg rev "$GIT_COMMIT_SHA" --arg auto "$SARIF_AUTOMATION_ID" '
     def toRuns(x):
       if x.sarifLog? then x.sarifLog.runs
       elif x.version? and x.runs? then x.runs
       else [] end;
-    {"version":"2.1.0","runs": (map(toRuns(.)) | add)}' "${sarifs[@]}"
+    def attachMeta(run):
+      (if ($repo|length) > 0 then run + {versionControlProvenance:[{repositoryUri:$repo, revisionId:$rev}]}
+       else run end)
+      | (if ($auto|length) > 0 then . + {automationDetails:{id:$auto}} else . end);
+    {"version":"2.1.0","runs": (map(toRuns(.)) | add | map(attachMeta))}' "${sarifs[@]}"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -875,7 +1098,11 @@ for pid in "${pids[@]}"; do wait "$pid" || status=1; done
 # ─────────────────────────────────────────────────────────────────────────────
 case "$FORMAT" in
   json)
-    merge_json_scanners || { say "${RED}$X could not produce combined JSON${RESET}"; status=1; }
+    if generate_combined_json; then
+      cat "$COMBINED_JSON_FILE"
+    else
+      merge_json_scanners || { say "${RED}$X could not produce combined JSON${RESET}"; status=1; }
+    fi
     ;;
   sarif)
     merge_sarif_runs
@@ -884,7 +1111,7 @@ case "$FORMAT" in
     for L in "${langs[@]}"; do
       say "\n${MAGENTA}${BOLD}──────── $L ────────${RESET}"
       if [ -s "$TMPDIR_RUN/$L.txt" ]; then
-        cat "$TMPDIR_RUN/$L.txt"
+        print_with_permalinks "$TMPDIR_RUN/$L.txt"
       elif [ -s "$TMPDIR_RUN/$L.json" ]; then
         say "${DIM}[json summary]${RESET}"
         cat "$TMPDIR_RUN/$L.json"
@@ -896,9 +1123,13 @@ case "$FORMAT" in
     # Combined human summary (if JSON pieces exist)
     if need_cmd jq && ls "$TMPDIR_RUN"/*.json >/dev/null 2>&1; then
       say "\n${WHITE}${BOLD}──────── Combined Summary ────────${RESET}"
-      merge_json_scanners | jq -r '
-        "Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"'
-      totals=$(merge_json_scanners | jq -r '.totals')
+      if generate_combined_json; then
+        jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"' "$COMBINED_JSON_FILE"
+        totals=$(jq -r '.totals' "$COMBINED_JSON_FILE")
+      else
+        merge_json_scanners | jq -r '"Files: \(.totals.files)\nCritical: \(.totals.critical)\nWarning: \(.totals.warning)\nInfo: \(.totals.info)"'
+        totals=$(merge_json_scanners | jq -r '.totals')
+      fi
       crit=$(printf '%s' "$totals" | jq -r '.critical')
       warn=$(printf '%s' "$totals" | jq -r '.warning')
       if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then status=1; fi
@@ -906,5 +1137,116 @@ case "$FORMAT" in
     fi
     ;;
 esac
+
+SHAREABLE_REQUEST=0
+[[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] && SHAREABLE_REQUEST=1
+
+if [[ $SHAREABLE_REQUEST -eq 1 ]]; then
+  if generate_combined_json; then
+    SHAREABLE_JSON_FILE="$COMBINED_JSON_FILE"
+    SHAREABLE_TIMESTAMP="$(date_iso)"
+    python3 - "$SHAREABLE_JSON_FILE" "${COMPARISON_FILE:-}" \
+      "${REPORT_JSON_PATH:-}" "${HTML_REPORT_PATH:-}" \
+      "${GIT_REMOTE_HTTP:-}" "${GIT_COMMIT_SHA:-}" "${GIT_BLOB_BASE:-}" \
+      "$SHAREABLE_TIMESTAMP" <<'PY'
+import json, sys, pathlib, datetime, html
+combined_path, baseline_path, out_json, out_html, repo_url, commit, blob_base, ts = sys.argv[1:9]
+root = pathlib.Path(combined_path)
+if not root.exists():
+    sys.exit(0)
+combined = json.loads(root.read_text())
+
+def load_optional(path):
+    if not path:
+        return None
+    p = pathlib.Path(path)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+baseline = load_optional(baseline_path)
+
+shareable = combined.copy()
+shareable["generated_at"] = ts
+if repo_url:
+    git = {"repository": repo_url}
+    if commit:
+        git["commit"] = commit
+    if blob_base:
+        git["blob_base"] = blob_base
+    shareable["git"] = git
+
+def get_totals(doc):
+    if not doc:
+        return {"files":0,"critical":0,"warning":0,"info":0}
+    t = doc.get("totals", {})
+    return {
+        "files": int(t.get("files", 0) or 0),
+        "critical": int(t.get("critical", 0) or 0),
+        "warning": int(t.get("warning", 0) or 0),
+        "info": int(t.get("info", 0) or 0),
+    }
+
+cur_totals = get_totals(combined)
+base_totals = get_totals(baseline)
+
+if baseline is not None:
+    shareable["comparison"] = {
+        "baseline_path": baseline_path,
+        "delta": {
+            "critical": cur_totals["critical"] - base_totals["critical"],
+            "warning": cur_totals["warning"] - base_totals["warning"],
+            "info": cur_totals["info"] - base_totals["info"],
+        },
+        "baseline_totals": base_totals,
+    }
+
+if out_json:
+    pathlib.Path(out_json).write_text(json.dumps(shareable, indent=2))
+
+if out_html:
+    totals_html = f"""
+    <table>
+      <tr><th>Metric</th><th>Current</th><th>Baseline</th><th>Δ</th></tr>
+      <tr><td>Critical</td><td>{cur_totals['critical']}</td><td>{base_totals['critical']}</td><td>{cur_totals['critical']-base_totals['critical']}</td></tr>
+      <tr><td>Warning</td><td>{cur_totals['warning']}</td><td>{base_totals['warning']}</td><td>{cur_totals['warning']-base_totals['warning']}</td></tr>
+      <tr><td>Info</td><td>{cur_totals['info']}</td><td>{base_totals['info']}</td><td>{cur_totals['info']-base_totals['info']}</td></tr>
+    </table>
+    """
+    scanners = shareable.get("scanners", [])
+    scanner_rows = []
+    for entry in scanners:
+        lang = entry.get("language", "-")
+        ct = entry.get("critical", entry.get("totals", {}).get("critical"))
+        wt = entry.get("warning", entry.get("totals", {}).get("warning"))
+        it = entry.get("info", entry.get("totals", {}).get("info"))
+        scanner_rows.append(f"<tr><td>{html.escape(str(lang))}</td><td>{ct or 0}</td><td>{wt or 0}</td><td>{it or 0}</td></tr>")
+    scanners_html = "\n".join(scanner_rows)
+    doc = f"""
+    <html><head><meta charset='utf-8'><title>UBS Report</title>
+    <style>body{{font-family:Arial,sans-serif;padding:1.5rem;background:#111;color:#eee;}}
+    table{{border-collapse:collapse;margin-top:1rem;}}
+    th,td{{border:1px solid #444;padding:0.4rem 0.8rem;text-align:left;}}
+    h1{{margin-bottom:0;}}
+    .meta{{color:#aaa;font-size:0.9rem;}}
+    </style></head><body>
+    <h1>Ultimate Bug Scanner Report</h1>
+    <div class='meta'>Generated {html.escape(ts)}</div>
+    {totals_html}
+    <h2>Per-language totals</h2>
+    <table><tr><th>Language</th><th>Critical</th><th>Warning</th><th>Info</th></tr>{scanners_html}</table>
+    </body></html>
+    """
+    pathlib.Path(out_html).write_text(doc)
+
+print(f"Shareable summary written (critical={cur_totals['critical']}, warning={cur_totals['warning']}, info={cur_totals['info']})")
+PY
+  else
+    say "${YELLOW}${WARN}${RESET} jq not available; cannot build shareable artifacts"
+  fi
+fi
 
 exit "$status"
