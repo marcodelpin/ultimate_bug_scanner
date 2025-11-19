@@ -78,12 +78,12 @@ def extract_guard_region(text: str, match_end: int) -> tuple[str, int]:
     return text[idx:newline], newline
 
 
-def collect_guard_issues(text: str, pattern: re.Pattern[str], message: str):
+def collect_guard_issues(text: str, pattern: re.Pattern[str], message: str, skip_on_exit: bool = True):
     issues = []
     for match in pattern.finditer(text):
         name = match.group(1)
         block_text, guard_end = extract_guard_region(text, match.end())
-        if block_has_exit(block_text):
+        if skip_on_exit and block_has_exit(block_text):
             continue
         assign_regex = re.compile(ASSIGN_TEMPLATE.format(name=re.escape(name)))
         force_regex = re.compile(FORCE_TEMPLATE.format(name=re.escape(name)))
@@ -104,9 +104,15 @@ def collect_guard_issues(text: str, pattern: re.Pattern[str], message: str):
 def analyze_file(path: Path):
     text = path.read_text(encoding="utf-8", errors="ignore")
     issues = []
-    issues.extend(collect_guard_issues(text, NEGATIVE_NIL_GUARD, "{name}! used after == nil guard without exit"))
-    issues.extend(collect_guard_issues(text, POSITIVE_NIL_GUARD, "{name}! used after '!= nil' guard without exit"))
-    issues.extend(collect_guard_issues(text, OPTIONAL_CHAIN_GUARD, "{name}! forced after ?. guard without exit"))
+    # == nil: if (x == nil) { return } -> x! is safe. Skip on exit.
+    issues.extend(collect_guard_issues(text, NEGATIVE_NIL_GUARD, "{name}! used after == nil guard without exit", skip_on_exit=True))
+    
+    # != nil: if (x != nil) { return } -> x! is unsafe (guaranteed crash). Don't skip.
+    issues.extend(collect_guard_issues(text, POSITIVE_NIL_GUARD, "{name}! used after '!= nil' guard without exit", skip_on_exit=False))
+    
+    # ?. : if (x?.p) { return } -> x! is unsafe. Don't skip.
+    issues.extend(collect_guard_issues(text, OPTIONAL_CHAIN_GUARD, "{name}! forced after ?. guard without exit", skip_on_exit=False))
+    
     for match in GUARD_PATTERN.finditer(text):
         name = match.group(1)
         block_start = match.end()

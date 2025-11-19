@@ -76,12 +76,12 @@ def line_col(text: str, pos: int) -> tuple[int, int]:
     return line, col
 
 
-def collect_guard_issues(text: str, pattern: re.Pattern[str], message: str):
+def collect_guard_issues(text: str, pattern: re.Pattern[str], message: str, skip_on_exit: bool = True):
     issues = []
     for match in pattern.finditer(text):
         var_name = match.group(1)
         block_text, guard_end = extract_guard_region(text, match.end())
-        if contains_exit(block_text):
+        if skip_on_exit and contains_exit(block_text):
             continue
         assign_regex = re.compile(ASSIGN_PATTERN.pattern.format(name=re.escape(var_name)))
         double_regex = re.compile(DOUBLE_BANG_PATTERN.format(name=re.escape(var_name)))
@@ -133,9 +133,24 @@ def collect_elvis_issues(text: str):
 def analyze_file(path: Path):
     text = path.read_text(encoding="utf-8", errors="ignore")
     issues = []
-    issues.extend(collect_guard_issues(text, SAFE_CALL_GUARD_PATTERN, "{name}!! used after ?. guard without exit"))
-    issues.extend(collect_guard_issues(text, NEGATIVE_GUARD_PATTERN, "{name}!! after non-exiting null guard"))
-    issues.extend(collect_guard_issues(text, POSITIVE_GUARD_PATTERN, "{name}!! used after '!= null' guard without exit"))
+    # ?. guard: if (x?.prop) { ... }
+    # If block exits, x might be null (if prop was false/null). So x!! is unsafe.
+    # If block continues, x might be null (if prop was false/null). So x!! is unsafe.
+    # So we should NOT skip on exit.
+    issues.extend(collect_guard_issues(text, SAFE_CALL_GUARD_PATTERN, "{name}!! used after ?. guard without exit", skip_on_exit=False))
+    
+    # == null guard: if (x == null) { ... }
+    # If block exits, x is not null. Safe.
+    # If block continues, x is null. Unsafe.
+    # So we SHOULD skip on exit.
+    issues.extend(collect_guard_issues(text, NEGATIVE_GUARD_PATTERN, "{name}!! after non-exiting null guard", skip_on_exit=True))
+    
+    # != null guard: if (x != null) { ... }
+    # If block exits, x is null. Unsafe.
+    # If block continues, x is null. Unsafe.
+    # So we should NOT skip on exit.
+    issues.extend(collect_guard_issues(text, POSITIVE_GUARD_PATTERN, "{name}!! used after '!= null' guard without exit", skip_on_exit=False))
+    
     issues.extend(collect_smart_cast_issues(text))
     issues.extend(collect_elvis_issues(text))
     deduped = []

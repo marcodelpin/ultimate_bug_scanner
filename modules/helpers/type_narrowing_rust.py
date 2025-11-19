@@ -71,8 +71,9 @@ def iter_rust_files(root: Path) -> Iterable[Path]:
 
 def analyze_guard(text: str, guard: GuardMatch) -> tuple[int, int] | None:
     block_text = text[guard.start : guard.end]
-    if EXIT_PATTERN.search(block_text):
-        return None
+    # For 'if let Some', exiting the block means we only reach the unwrap if None (panic).
+    # Continuing means we reach it in both cases (panic if None).
+    # So we don't check EXIT_PATTERN here.
     remainder = text[guard.end :]
     assign_match = re.search(ASSIGN_PATTERN.format(name=re.escape(guard.expr)), remainder)
     search_region = remainder
@@ -170,8 +171,8 @@ def analyze_file_regex(path: Path) -> List[tuple[int, int, str]]:
             continue
         brace_end = find_block_end(text, brace_start)
         block_text = text[match.start() : brace_end]
-        if EXIT_PATTERN.search(block_text):
-            continue
+        # For 'if let Some', exiting the block means we only reach the unwrap if None (panic).
+        # Continuing means we reach it in both cases (panic if None).
         remainder = text[brace_end + 1 :]
         if not remainder.strip():
             continue

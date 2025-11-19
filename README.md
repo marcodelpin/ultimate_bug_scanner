@@ -1421,7 +1421,6 @@ ubs --help                              # Full command reference
 ubs sessions --entries 1                # Tail the latest install session log
 ubs .                                   # Whole project (ignores things like .venv and node_modules automatically)
 ```
-
 **Output Format:**
 ```
 ⚠️  Category (N errors)
