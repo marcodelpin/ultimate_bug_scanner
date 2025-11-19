@@ -115,9 +115,9 @@ def iter_java_files(root: Path) -> Iterable[Path]:
         yield path
 
 
-def has_close(name: str, code_text: str) -> bool:
+def has_close(name: str, code_text: str, start_pos: int) -> bool:
     pattern = re.compile(rf"\b{name}\.close\s*\(")
-    return bool(pattern.search(code_text))
+    return bool(pattern.search(code_text, start_pos))
 
 
 def inside_try_with(text: str, start: int) -> bool:
@@ -161,7 +161,7 @@ def collect_issues(root: Path) -> list[tuple[str, str, int]]:
                 # prefix = line_text.split(name, 1)[0]
                 if inside_try_with(code_text, start):
                     continue
-                if has_close(name, code_text):
+                if has_close(name, code_text, start):
                     continue
                 rel = str(path.relative_to(project_root)) if path.is_relative_to(project_root) else str(path)
                 issues.append((kind, rel, line_no))

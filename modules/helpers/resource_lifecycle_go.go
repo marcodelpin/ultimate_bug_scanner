@@ -20,6 +20,7 @@ const (
 	kindTimer   resourceKind = "timer_stop"
 	kindFile    resourceKind = "file_handle"
 	kindDB      resourceKind = "db_handle"
+	kindListener resourceKind = "listener_close"
 	kindMutex   resourceKind = "mutex_lock"
 )
 
@@ -90,37 +91,75 @@ func (a *analyzer) handleAssign(assign *ast.AssignStmt) {
 	if len(assign.Rhs) == 0 {
 		return
 	}
-	call, ok := assign.Rhs[0].(*ast.CallExpr)
-	if !ok {
-		return
-	}
-	kind := classifyCall(call)
-	if kind == "" {
-		return
-	}
-	names := collectNames(assign.Lhs)
-	pos := a.fset.Position(assign.Pos())
-	switch kind {
-	case kindContext:
-		// expect cancel func as last name
-		if len(names) >= 2 {
-			name := names[len(names)-1]
-			if name == "_" {
-				name = ""
+
+	// Handle multi-assignment: a, b := f(), g()
+	// Or single multi-return: a, b := f()
+	
+	// Case 1: Single RHS expression (function returning multiple values)
+	if len(assign.Rhs) == 1 {
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		kind := classifyCall(call)
+		if kind == "" {
+			return
+		}
+		names := collectNames(assign.Lhs)
+		pos := a.fset.Position(assign.Pos())
+		
+		switch kind {
+		case kindContext:
+			// expect cancel func as last name
+			if len(names) >= 2 {
+				name := names[len(names)-1]
+				if name == "_" {
+					name = ""
+				}
+				a.add(name, kind, pos)
+			} else {
+				a.add("", kind, pos)
 			}
-			a.add(name, kind, pos)
-		} else {
-			a.add("", kind, pos)
+		default:
+			// For other resources, the resource is usually the first return value
+			if len(names) > 0 {
+				name := names[0]
+				if name != "" && name != "_" {
+					a.add(name, kind, pos)
+				}
+			}
 		}
-	default:
-		if len(names) > 1 {
-			names = names[:1]
-		}
-		for _, name := range names {
+		return
+	}
+
+	// Case 2: Multiple RHS expressions (parallel assignment)
+	// a, b := f(), g()
+	if len(assign.Lhs) == len(assign.Rhs) {
+		names := collectNames(assign.Lhs)
+		for i, expr := range assign.Rhs {
+			call, ok := expr.(*ast.CallExpr)
+			if !ok {
+				continue
+			}
+			kind := classifyCall(call)
+			if kind == "" {
+				continue
+			}
+			// In parallel assignment, each RHS returns 1 value (or it's invalid Go)
+			// But our tracked resources (os.Open) return (val, err), so they CANNOT appear here
+			// EXCEPT: time.NewTicker returns *Ticker (1 value).
+			// So we only track single-value returns here.
+			
+			name := names[i]
 			if name == "" || name == "_" {
 				continue
 			}
-			a.add(name, kind, pos)
+			
+			// Context/Open return multiple values, so they won't be here.
+			// Ticker/Timer return 1 value.
+			if kind == kindTicker || kind == kindTimer {
+				a.add(name, kind, a.fset.Position(assign.Pos()))
+			}
 		}
 	}
 }
@@ -139,10 +178,12 @@ func classifyCall(call *ast.CallExpr) resourceKind {
 		return kindTicker
 	case pkg == "time" && fn == "NewTimer":
 		return kindTimer
-	case pkg == "os" && (fn == "Open" || fn == "OpenFile"):
+	case pkg == "os" && (fn == "Open" || fn == "OpenFile" || fn == "Create" || fn == "CreateTemp"):
 		return kindFile
 	case pkg == "sql" && (fn == "Open" || fn == "OpenDB"):
 		return kindDB
+	case pkg == "net" && (fn == "Listen" || fn == "ListenPacket" || fn == "ListenIP" || fn == "ListenTCP" || fn == "ListenUDP" || fn == "ListenUnix"):
+		return kindListener
 	default:
 		return ""
 	}
@@ -161,7 +202,7 @@ func (a *analyzer) handleCall(call *ast.CallExpr) {
 		case "Stop":
 			a.markReleased(base, kindTicker, kindTimer)
 		case "Close":
-			a.markReleased(base, kindFile, kindDB)
+			a.markReleased(base, kindFile, kindDB, kindListener)
 		case "Unlock":
 			a.markReleased(base, kindMutex)
 		}
@@ -246,6 +287,8 @@ func formatMessage(kind resourceKind, name string) string {
 		return fmt.Sprintf("File handle %s opened without Close()", subject)
 	case kindDB:
 		return fmt.Sprintf("DB handle %s opened without Close()", subject)
+	case kindListener:
+		return fmt.Sprintf("Listener %s opened without Close()", subject)
 	case kindMutex:
 		return fmt.Sprintf("Mutex %s locked without Unlock()", subject)
 	default:
