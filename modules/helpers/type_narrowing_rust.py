@@ -11,9 +11,8 @@ from pathlib import Path
 from typing import Iterable, List
 
 SKIP_DIRS = {"target", ".git", ".hg", ".svn", "node_modules"}
-UNWRAP_PATTERN = "{name}\\s*\\.(?:unwrap|expect)\\s*\\("
-ASSIGN_PATTERN = "{name}\\s*="
-EXIT_PATTERN = re.compile(r"\b(return|break|continue)\b")
+UNWRAP_PATTERN = r"\b{name}\s*\.(?:unwrap|expect)\s*\("
+ASSIGN_PATTERN = r"\b{name}\s*="
 IDENT_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 BASE_DIR = Path.cwd().resolve()
 
@@ -70,7 +69,6 @@ def iter_rust_files(root: Path) -> Iterable[Path]:
 
 
 def analyze_guard(text: str, guard: GuardMatch) -> tuple[int, int] | None:
-    block_text = text[guard.start : guard.end]
     # For 'if let Some', exiting the block means we only reach the unwrap if None (panic).
     # Continuing means we reach it in both cases (panic if None).
     # So we don't check EXIT_PATTERN here.
@@ -170,7 +168,6 @@ def analyze_file_regex(path: Path) -> List[tuple[int, int, str]]:
         if brace_start == -1:
             continue
         brace_end = find_block_end(text, brace_start)
-        block_text = text[match.start() : brace_end]
         # For 'if let Some', exiting the block means we only reach the unwrap if None (panic).
         # Continuing means we reach it in both cases (panic if None).
         remainder = text[brace_end + 1 :]

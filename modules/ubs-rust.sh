@@ -574,7 +574,7 @@ import sys, re
 from pathlib import Path
 path = Path(sys.argv[1])
 text = path.read_text()
-names = re.findall(r'let\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*tokio::spawn', text)
+names = re.findall(r'\blet\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*tokio::spawn', text)
 missing = []
 for name in names:
     patt_await = re.compile(rf"\b{name}\.await")
@@ -588,7 +588,7 @@ PY2
 )
     else
       local names
-      names=$(grep -nE 'let[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*tokio::spawn' "$file" 2>/dev/null | sed -E 's/.*let[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/' | sort -u)
+      names=$(grep -nE '\blet[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*tokio::spawn' "$file" 2>/dev/null | sed -E 's/.*let[[:space:]]+([A-Za-z_][A-Za-z0-9_]*).*/\1/' | sort -u)
       for n in $names; do
         if ! grep -qE "\\b${n}\\.(await|abort)\\b" "$file" 2>/dev/null; then
           if [[ -z "$missing" ]]; then missing="$n"; else missing="$missing,$n"; fi
