@@ -17,9 +17,10 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scan
 
 </div>
 
-<div align="center">
 
 Just want it to do everything without confirmations? Live life on the edge with easy-mode to auto-install every dependency, accept all prompts, detect local coding agents, and wire their quality guardrails with zero extra questions:
+
+<div align="center">
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh \
@@ -608,24 +609,26 @@ Critical issues found? ────┤ YES
 ---
 
 > [!IMPORTANT]
-> **Copy the content below to your project's `AGENTS.md`, `.claude/claude_docs/`, or `.cursorrules` file for comprehensive UBS integration guidance.**
+> **Copy the blurb below to your project's `AGENTS.md`, `.claude/claude_docs/`, or `.cursorrules` file for comprehensive UBS integration guidance.**
 
+```markdown
 ## UBS Quick Reference for AI Agents
 
 UBS stands for "Ultimate Bug Scanner": **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**
 
 **Install:** `curl -sSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh | bash`
 
-**Golden Rule:** `./ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
+**Golden Rule:** `ubs <changed-files>` before every commit. Exit 0 = safe. Exit >0 = fix & re-run.
 
 **Commands:**
 ```bash
-./ubs file.ts file2.py                    # Specific files (< 1s) — USE THIS
-./ubs $(git diff --name-only --cached)    # Staged files — before commit
-./ubs --only=js,python src/               # Language filter (3-5x faster)
-./ubs --ci --fail-on-warning .            # CI mode — before PR
-./ubs --help                              # Full command reference
-./ubs sessions --entries 1                # Tail the latest install session log
+ubs file.ts file2.py                    # Specific files (< 1s) — USE THIS
+ubs $(git diff --name-only --cached)    # Staged files — before commit
+ubs --only=js,python src/               # Language filter (3-5x faster)
+ubs --ci --fail-on-warning .            # CI mode — before PR
+ubs --help                              # Full command reference
+ubs sessions --entries 1                # Tail the latest install session log
+ubs .                                   # Whole project (ignores things like .venv and node_modules automatically)
 ```
 
 **Output Format:**
@@ -642,10 +645,10 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 2. Navigate `file:line:col` → view context
 3. Verify real issue (not false positive)
 4. Fix root cause (not symptom)
-5. Re-run `./ubs <file>` → exit 0
+5. Re-run `ubs <file>` → exit 0
 6. Commit
 
-**Speed Critical:** Scope to changed files. `./ubs src/file.ts` (< 1s) vs `./ubs .` (30s). Never full scan for small edits.
+**Speed Critical:** Scope to changed files. `ubs src/file.ts` (< 1s) vs `ubs .` (30s). Never full scan for small edits.
 
 **Bug Severity:**
 - **Critical** (always fix): Null safety, XSS/injection, async/await, memory leaks
@@ -656,6 +659,7 @@ Parse: `file:line:col` → location | 💡 → how to fix | Exit 0/1 → pass/fa
 - ❌ Ignore findings → ✅ Investigate each
 - ❌ Full scan per edit → ✅ Scope to file
 - ❌ Fix symptom (`if (x) { x.y }`) → ✅ Root cause (`x?.y`)
+```
 
 ---
 
@@ -1872,3 +1876,11 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scan
 **Star this repo** if it saved you from a production bug ⭐
 
 </div>
+
+## ✉️ **Works Great with MCP Agent Mail**
+
+[MCP Agent Mail](https://github.com/Dicklesworthstone/mcp_agent_mail) is a Git-backed mailbox system that lets your coding agents coordinate work, hand off tasks, and keep durable histories of every change discussion.
+
+- **UBS + MCP Agent Mail together**: run `ubs --fail-on-warning .` as a standard guardrail step in your MCP Agent Mail workflows so any agent proposing code changes must attach a clean scan (or a summary of remaining issues) to their reply.
+- **Ideal pattern**: one agent writes or refactors code, a “QA agent” triggered via MCP Agent Mail runs UBS against the touched paths, then posts a concise findings report back into the same thread for humans or other agents to act on.
+- **Result**: your multi-agent automation keeps all the communication history in MCP Agent Mail while UBS continuously enforces fast, language-agnostic quality checks on every change.
