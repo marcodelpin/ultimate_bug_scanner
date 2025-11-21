@@ -12,7 +12,7 @@ set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
 
-UBS_VERSION="4.6.0"
+UBS_VERSION="5.0.0"
 REPO_RAW="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master"
 MODULE_PATH_TEMPLATE="$REPO_RAW/modules/ubs-%s.sh"
 
@@ -37,7 +37,13 @@ else
   BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
 fi
 CHECK="✓"; WARN="⚠"; INFO="ℹ"; X="✗"
-say(){ echo -e "$*"; }
+say(){
+  if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "sarif" ]]; then
+    echo -e "$*" >&2
+  else
+    echo -e "$*"
+  fi
+}
 say_err(){ echo -e "$*" >&2; }
 
 print_with_permalinks(){
@@ -93,7 +99,8 @@ QUIET=0
 ONLY_LANGS=""              # csv: js,python,cpp,rust
 EXCLUDE_LANGS=""           # csv
 IGNORE_FILE=""
-GLOBAL_EXCLUDE_PATTERNS=""
+DEFAULT_IGNORES="node_modules,venv,.venv,env,.env,site-packages,dist,build,vendor,target,bin,obj,.idea,.vscode,.git,.hg,.svn,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,coverage,.gradle,DerivedData,bundler,gems,wheels"
+GLOBAL_EXCLUDE_PATTERNS="$DEFAULT_IGNORES"
 FILTERED_PROJECT_DIR=""
 MODULE_DIR_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules"
 MODULE_DIR="$MODULE_DIR_DEFAULT"
@@ -111,6 +118,7 @@ COMPARISON_FILE=""
 REPORT_JSON_PATH=""
 HTML_REPORT_PATH=""
 SHAREABLE_MODE=0
+GIT_MODE=""  # staged, diff, or empty
 GIT_REMOTE_URL=""
 GIT_REMOTE_HTTP=""
 GIT_COMMIT_SHA=""
@@ -148,10 +156,14 @@ Options:
   --ignore-file=PATH      Read additional ignore globs (default: PROJECT/.ubsignore if present)
   --skip-type-narrowing   Skip JS/Rust/Kotlin/Swift type narrowing checks (falls back to basic heuristics)
   --no-auto-update        Disable automatic self-update
+  --staged                Scan only files staged for commit (git index)
+  --diff, --git-diff      Scan only modified files (working tree vs HEAD)
   -h, --help              Show this help
 
 Examples:
   ubs .                       # auto-detect languages and scan
+  ubs --staged                # scan only staged files (pre-commit style)
+  ubs --diff                  # scan only modified files (quick check)
   ubs --format=json --ci .    # machine-readable combined JSON
   ubs --only=js,python .      # restrict language set
   ubs doctor --fix            # validate cached modules & redownload corrupted copies
@@ -287,8 +299,8 @@ else
       --category)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; CATEGORY_FILTER="$1"; shift;;
-      --comparison=*) COMPARISON_FILE="${1#*=}"; SHAREABLE_MODE=1; SARIF_AUTOMATION_ID="ubs-comparison"; shift;;
-      --comparison)
+      --comparison=*|--baseline=*) COMPARISON_FILE="${1#*=}"; SHAREABLE_MODE=1; SARIF_AUTOMATION_ID="ubs-comparison"; shift;;
+      --comparison|--baseline)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
         shift; COMPARISON_FILE="$1"; SHAREABLE_MODE=1; SARIF_AUTOMATION_ID="ubs-comparison"; shift;;
       --report-json=*) REPORT_JSON_PATH="${1#*=}"; SHAREABLE_MODE=1; shift;;
@@ -308,6 +320,15 @@ else
       --jobs=*) JOBS="${1#*=}"; shift;;
       --skip-type-narrowing) SKIP_TYPE_NARROWING=1; shift;;
       --no-auto-update) export UBS_NO_AUTO_UPDATE=1; shift;;
+      --staged) GIT_MODE="staged"; shift;;
+      --diff|--git-diff) GIT_MODE="diff"; shift;;
+      --profile=*)
+        export UBS_PROFILE="${1#*=}"
+        if [[ "$UBS_PROFILE" == "strict" ]]; then FAIL_ON_WARNING=1; fi
+        shift;;
+      --skip=*)
+        export UBS_SKIP_CATEGORIES="${1#*=}"
+        shift;;
       -h|--help) usage; exit 0;;
       *)
         if [[ "$PROJECT_DIR" == "." ]]; then PROJECT_DIR="$1"; else usage; exit 2; fi
@@ -454,9 +475,66 @@ PY
   csv="${csv//$'\n'/}"
   csv="${csv%,}"
   if [[ -n "$csv" ]]; then
-    GLOBAL_EXCLUDE_PATTERNS="$csv"
+    if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
+      GLOBAL_EXCLUDE_PATTERNS="$GLOBAL_EXCLUDE_PATTERNS,$csv"
+    else
+      GLOBAL_EXCLUDE_PATTERNS="$csv"
+    fi
     local human="${csv//,/ }"
     say "${DIM}${INFO}${RESET} Ignoring paths from ${file} → ${human}"
+  fi
+}
+
+prepare_git_workspace(){
+  local mode="$1"
+  if ! need_cmd git; then
+    say "${RED}$X git not found; cannot run --$mode${RESET}"
+    exit 1
+  fi
+  if ! git -C "$SOURCE_PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    say "${RED}$X not a git repository; cannot run --$mode${RESET}"
+    exit 1
+  fi
+  
+  local files=()
+  local git_cmd=""
+  if [[ "$mode" == "staged" ]]; then
+    git_cmd="git -C \"$SOURCE_PROJECT_DIR\" diff --name-only --cached --diff-filter=ACMR"
+  else
+    git_cmd="git -C \"$SOURCE_PROJECT_DIR\" diff --name-only --diff-filter=ACMR HEAD"
+  fi
+  
+  while IFS= read -r file; do
+    [[ -n "$file" ]] && files+=("$file")
+  done < <(eval "$git_cmd")
+  
+  if [[ ${#files[@]} -eq 0 ]]; then
+    say "${GREEN}${CHECK} No changed files to scan.${RESET}"
+    exit 0
+  fi
+  
+  if ! need_cmd rsync; then
+    say "${RED}$X rsync not found; required for --$mode${RESET}"
+    exit 1
+  fi
+  
+  local dest="$TMPDIR_RUN/git_scan"
+  rm -rf "$dest" 2>/dev/null || true
+  ensure_dir "$dest"
+  
+  say "${BLUE}${INFO} Preparing shadow workspace for $mode files (${#files[@]} detected)${RESET}"
+  
+  # Use rsync with --files-from to copy only the target files while preserving hierarchy
+  local file_list="$TMPDIR_RUN/files_to_scan.txt"
+  printf "%s\n" "${files[@]}" > "$file_list"
+  
+  if rsync -a --files-from="$file_list" "$SOURCE_PROJECT_DIR/" "$dest/" >/dev/null 2>&1; then
+    FILTERED_PROJECT_DIR="$dest"
+    PROJECT_DIR="$FILTERED_PROJECT_DIR"
+    say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
+  else
+    say "${RED}$X Failed to prepare shadow workspace${RESET}"
+    exit 1
   fi
 }
 
@@ -473,6 +551,97 @@ compute_sha256(){
   if need_cmd shasum; then shasum -a 256 "$path" | awk '{print $1}'; return 0; fi
   if need_cmd openssl; then openssl dgst -sha256 "$path" | awk '{print $NF}'; return 0; fi
   return 1
+}
+
+apply_inline_suppressions(){
+  if ! need_cmd python3; then cat; return 0; fi
+  local py_script
+  py_script="$(mktemp -t ubs_suppress.XXXXXX 2>/dev/null || mktemp -t ubs_suppress)"
+  cat >"$py_script" <<'PY'
+import sys, re, io
+from pathlib import Path
+
+# Robust I/O handling for varied environments
+try:
+    input_stream = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8', errors='replace')
+    output_stream = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+except Exception:
+    input_stream = sys.stdin
+    output_stream = sys.stdout
+
+ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+FINDING_PATTERN = re.compile(r'^\s*([^:\s]+):(\d+)(?::(\d+))?')
+SUPPRESSION_MARKERS = ["ubs:ignore", "ubs: disable", "nolint", "noqa"]
+
+def strip_ansi(text):
+    return ANSI_ESCAPE.sub('', text)
+
+def has_suppression(line_content):
+    if not line_content: return False
+    lower = line_content.lower()
+    return any(m in lower for m in SUPPRESSION_MARKERS)
+
+def main():
+    try:
+        # Read all lines first to ensure we consume the stream (prevents SIGPIPE upstream)
+        lines = input_stream.readlines()
+        
+        file_cache = {}
+        
+        for line in lines:
+            clean_line = strip_ansi(line)
+            match = FINDING_PATTERN.match(clean_line)
+            
+            if not match:
+                output_stream.write(line)
+                continue
+            
+            file_path_str = match.group(1)
+            try:
+                line_no = int(match.group(2))
+            except ValueError:
+                output_stream.write(line)
+                continue
+            
+            if file_path_str not in file_cache:
+                try:
+                    p = Path(file_path_str)
+                    # Check existence relative to CWD
+                    if p.is_file():
+                        file_cache[file_path_str] = p.read_text(encoding='utf-8', errors='replace').splitlines()
+                    else:
+                        file_cache[file_path_str] = None
+                except:
+                    file_cache[file_path_str] = None
+            
+            content = file_cache[file_path_str]
+            suppressed = False
+            if content:
+                idx = line_no - 1
+                # Check line itself (idx) and previous line (idx-1) for comments
+                if 0 <= idx < len(content) and has_suppression(content[idx]):
+                    suppressed = True
+                elif 0 <= idx-1 < len(content) and has_suppression(content[idx-1]):
+                    suppressed = True
+            
+            if not suppressed:
+                output_stream.write(line)
+                
+    except Exception as e:
+        # If python fails, we MUST consume stdin and dump to stdout to avoid breaking the pipe
+        sys.stderr.write(f"[ubs] warning: inline suppression failed ({e}); passthrough enabled\n")
+        try:
+            # Try to dump what we read plus the rest
+            for l in lines: output_stream.write(l)
+            output_stream.write(input_stream.read())
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
+PY
+  python3 "$py_script"
+  rm -f "$py_script"
 }
 
 should_verify_module_path(){
@@ -918,6 +1087,10 @@ COMBINED_JSON_FILE="$TMPDIR_RUN/combined.json"
 
 apply_ignore_filters
 
+if [[ -n "$GIT_MODE" ]]; then
+  prepare_git_workspace "$GIT_MODE"
+fi
+
 # Build selected language set
 select_langs(){
   local detected=()
@@ -968,6 +1141,7 @@ run_lang(){
   [[ "${QUIET:-0}" -eq 1 ]] && args+=('-q')
   [[ "$JOBS" -gt 0 ]] && args+=("--jobs=$JOBS")
   [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]] && args+=("--exclude=$GLOBAL_EXCLUDE_PATTERNS")
+  [[ -n "${UBS_SKIP_CATEGORIES:-}" ]] && args+=("--skip=$UBS_SKIP_CATEGORIES")
   args+=("$PROJECT_DIR")
 
   case "$fmt" in
@@ -986,7 +1160,7 @@ run_lang(){
         module_status=$?
       fi
       prepare_metrics_dir "$metrics_dir"
-      if ! UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" >"$out_txt" 2>>"$err"; then
+      if ! UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
         module_status=$?
       fi
       restore_original_paths "$out_txt"
@@ -1007,7 +1181,7 @@ run_lang(){
         module_status=$?
       fi
       prepare_metrics_dir "$metrics_dir"
-      if ! UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" >"$out_txt" 2>>"$err"; then
+      if ! UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
         module_status=$?
       fi
       restore_original_paths "$out_txt"
@@ -1017,7 +1191,7 @@ run_lang(){
       ;;
     text|*)
       prepare_metrics_dir "$metrics_dir"
-      if ! UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" >"$out_txt" 2>"$err"; then
+      if ! UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" "$module" "${args[@]}" | apply_inline_suppressions >"$out_txt" 2>"$err"; then
         module_status=$?
       fi
       restore_original_paths "$out_txt"
@@ -1150,8 +1324,9 @@ merge_sarif_runs(){
 # ─────────────────────────────────────────────────────────────────────────────
 # Banner & preflight
 # ─────────────────────────────────────────────────────────────────────────────
-say "${BOLD}${CYAN}"
-cat <<'BANNER'
+if [[ "${FORMAT:-text}" == "text" ]]; then
+  say "${BOLD}${CYAN}"
+  cat <<'BANNER'
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║  ██╗   ██╗██╗  ████████╗██╗███╗   ███╗ █████╗ ████████╗███████╗              ║
 ║  ██║   ██║██║  ╚══██╔══╝██║████╗ ████║██╔══██╗╚══██╔══╝██╔════╝              ║
@@ -1185,7 +1360,9 @@ cat <<'BANNER'
 ║                     “We see bugs before you do.”                             ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 BANNER
-say "${RESET}"
+  say "${RESET}"
+fi
+
 say "${CYAN}${BOLD}UBS Meta-Runner v${UBS_VERSION}${RESET}  ${DIM}$(date_iso)${RESET}"
 say "${WHITE}Project:${RESET} ${CYAN}$SOURCE_PROJECT_DIR${RESET}"
 say "${WHITE}Format:${RESET}  ${CYAN}$FORMAT${RESET}"

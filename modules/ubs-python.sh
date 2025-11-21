@@ -109,6 +109,15 @@ case "${UBS_CATEGORY_FILTER:-}" in
     ;;
 esac
 
+if [[ "${UBS_PROFILE:-}" == "loose" ]]; then
+  # Skip Debug/Prod(11) and Code Quality(14) in loose mode
+  if [[ -z "$SKIP_CATEGORIES" ]]; then
+    SKIP_CATEGORIES="11,14"
+  else
+    SKIP_CATEGORIES="$SKIP_CATEGORIES,11,14"
+  fi
+fi
+
 # Async error coverage metadata
 ASYNC_ERROR_RULE_IDS=(py.async.task-no-await)
 declare -A ASYNC_ERROR_SUMMARY=(
@@ -1460,6 +1469,9 @@ def add(obj):
     rid = obj.get('rule_id') or obj.get('id') or 'unknown'
     sev = (obj.get('severity') or '').lower() or 'info'
     file = obj.get('file','?')
+    # Suppress asserts in test files
+    if rid == 'py.assert-used' and ('test' in file.lower() or 'conftest' in file.lower()):
+        return
     rng  = obj.get('range') or {}
     ln = (rng.get('start') or {}).get('row',0)+1
     msg = obj.get('message') or rid
@@ -1999,7 +2011,7 @@ fi
 
 print_subheader "Hardcoded secrets"
 count=$("${GREP_RNI[@]}" -e "(password|api_?key|secret|token)[[:space:]]*[:=][[:space:]]*['\"][^\"']+['\"]" "$PROJECT_DIR" 2>/dev/null | \
-  (grep -v "#.*(password|api_?key|secret|token)" || true) | count_lines)
+  (grep -vE "#.*(password|api_?key|secret|token)|['\"]\\$" || true) | count_lines)
 if [ "$count" -gt 0 ]; then
   print_finding "critical" "$count" "Potential hardcoded secrets" "Use secret manager or env vars"
   show_detailed_finding "(password|api_?key|secret|token)[[:space:]]*[:=][[:space:]]*['\"][^\"']+['\"]" 5
@@ -2416,7 +2428,7 @@ if [[ "$ENABLE_UV_TOOLS" -eq 1 ]]; then
       ruff)
         print_subheader "ruff (lint)"
         run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=json || true
-        ruff_count=$(run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=count | tail -n1 | awk '{print $1+0}')
+        ruff_count=$(run_uv_tool_text ruff check "$PROJECT_DIR" --output-format=text | grep -c "^" || true)
         if [ "${ruff_count:-0}" -gt 0 ]; then print_finding "info" "$ruff_count" "Ruff emitted findings" "Review ruff output above"; else print_finding "good" "Ruff clean"; fi
         ;;
       bandit)

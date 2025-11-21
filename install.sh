@@ -6,7 +6,7 @@ shopt -s lastpipe 2>/dev/null || true
 # Ultimate Bug Scanner - Installation Script
 # https://github.com/Dicklesworthstone/ultimate_bug_scanner
 
-VERSION="4.6.0"
+VERSION="5.0.0"
 SCRIPT_NAME="ubs"
 INSTALL_NAME="ubs"
 REPO_URL="https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master"

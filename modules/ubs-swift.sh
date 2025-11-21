@@ -143,6 +143,15 @@ case "${SUBS_CATEGORY_FILTER:-}" in
     ;;
 esac
 
+if [[ "${UBS_PROFILE:-}" == "loose" ]]; then
+  # Skip Debug(11), Code Quality(15), Tests(22) in loose mode
+  if [[ -z "$SKIP_CATEGORIES" ]]; then
+    SKIP_CATEGORIES="11,15,22"
+  else
+    SKIP_CATEGORIES="$SKIP_CATEGORIES,11,15,22"
+  fi
+fi
+
 # Async error coverage metadata (Swift)
 ASYNC_RULE_IDS=(swift.task.floating swift.continuation.no-resume swift.task.detached-no-handle)
 declare -A ASYNC_ERROR_SUMMARY=(
@@ -484,7 +493,7 @@ write_ast_rules() {
 id: swift.force-unwrap
 language: swift
 rule:
-  regex: "\\b[A-Za-z0-9_\\)\\]]\\s*!\\b"
+  pattern: $X!
 severity: warning
 message: "Force unwrap; prefer optional binding (if let/guard let)."
 YAML
@@ -1343,7 +1352,11 @@ run_swiftlint() {
   print_subheader "SwiftLint"
   if command -v swiftlint >/dev/null 2>&1; then
     local tmp; tmp="$(mktemp -t ubs_swiftlint.XXXXXX 2>/dev/null || mktemp -t ubs_swiftlint)"
-    (cd "$PROJECT_DIR" && with_timeout swiftlint --reporter json --strict >"$tmp" 2>/dev/null || true)
+    if [[ -d "$PROJECT_DIR" ]]; then
+      (cd "$PROJECT_DIR" && with_timeout swiftlint --reporter json --strict >"$tmp" 2>/dev/null || true)
+    else
+      (cd "$(dirname "$PROJECT_DIR")" && with_timeout swiftlint --reporter json --strict "$(basename "$PROJECT_DIR")" >"$tmp" 2>/dev/null || true)
+    fi
     if [[ -s "$tmp" ]] && command -v python3 >/dev/null 2>&1; then
       read -r errs warns files <<<"$(python3 - "$tmp" <<'PY'
 import json,sys
@@ -1391,7 +1404,14 @@ run_periphery() {
   print_subheader "Periphery (dead code)"
   if command -v periphery >/dev/null 2>&1; then
     local tmp; tmp="$(mktemp -t ubs_periphery.XXXXXX 2>/dev/null || mktemp -t ubs_periphery)"
-    (cd "$PROJECT_DIR" && with_timeout periphery scan --quiet >"$tmp" 2>/dev/null || true)
+    if [[ -d "$PROJECT_DIR" ]]; then
+      (cd "$PROJECT_DIR" && with_timeout periphery scan --quiet >"$tmp" 2>/dev/null || true)
+    else
+      # Periphery generally requires a project root, skipping if file
+      say "  ${GRAY}${INFO} Periphery skipped (requires directory scan)${RESET}"
+      rm -f "$tmp"
+      return 0
+    fi
     local unused; unused=$(grep -cE 'unused' "$tmp" 2>/dev/null || echo 0)
     if [[ "$unused" -gt 0 ]]; then
       say "  ${YELLOW}${WARN} Periphery unused symbols:${RESET} ${WHITE}${unused}${RESET}"
@@ -1667,7 +1687,7 @@ print_category "Detects: force unwrap (!), try!, as!, IUO declarations" \
 tick
 
 print_subheader "Force unwrap (!) occurrences"
-count=$("${GREP_RN[@]}" -e "[A-Za-z0-9_\\)\\]]\\s*!\\b" "$PROJECT_DIR" 2>/dev/null | (grep -v -E "!!|!==" || true) | count_lines || true)
+count=$("${GREP_RN[@]}" -e "[A-Za-z0-9_\\)\\]]\\s*!\\b" "$PROJECT_DIR" 2>/dev/null | grep "\.swift:" | (grep -v -E "!!|!==" || true) | count_lines || true)
 if [ "$count" -gt 30 ]; then
   print_finding "warning" "$count" "Heavy use of force unwrap"
   show_detailed_finding "[A-Za-z0-9_\\)\\]]\\s*!\\b" 5
@@ -1759,7 +1779,7 @@ if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "URLSession tasks l
 tick
 
 print_subheader "http:// literals"
-count=$("${GREP_RN[@]}" -e "\"http://[^\"]+\"" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
+count=$("${GREP_RN[@]}" -e "\"http://[^\"]+\"" "$PROJECT_DIR" 2>/dev/null | grep -v "http://www.apple.com/DTDs" | count_lines || true)
 if [ "$count" -gt 0 ]; then print_finding "warning" "$count" "http:// URLs"; show_detailed_finding "\"http://[^\"]+\"" 5; else print_finding "good" "No http:// literals"; fi
 tick
 

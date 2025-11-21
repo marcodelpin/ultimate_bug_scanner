@@ -1557,7 +1557,7 @@ print_category "Detects: frozen_string_literal pragma, mass assignment hints, cs
   "Rails conventions and Ruby pragmas that impact safety/perf."
 
 print_subheader "Missing 'frozen_string_literal: true' pragma (heuristic)"
-rb_files=$(( set +o pipefail; find "$PROJECT_DIR" -type d \( -name .git -o -name vendor -o -name node_modules \) -prune -o -type f -name "*.rb" -print 2>/dev/null || true ))
+rb_files=$( set +o pipefail; find "$PROJECT_DIR" -type d \( -name .git -o -name vendor -o -name node_modules \) -prune -o -type f -name "*.rb" -print 2>/dev/null || true )
 missing_pragma=0
 while IFS= read -r f; do
   [[ -z "$f" ]] && continue

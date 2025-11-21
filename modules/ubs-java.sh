@@ -1812,7 +1812,7 @@ print_category "Detects: fall-through (classic switch), switch without default" 
 
 print_subheader "Classic switch fall-through (ignore '->' labels)"
 switch_count=$("${GREP_RN[@]}" -e "switch\s*\(" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
-case_count=$("${GREP_RN[@]}" -e "case[[:space:]]+.*:" "$PROJECT_DIR" 2>/dev/null | (grep -v "->" || true) | count_lines || true)
+case_count=$("${GREP_RN[@]}" -e "case[[:space:]]+.*:" "$PROJECT_DIR" 2>/dev/null | (grep -v -- "->" || true) | count_lines || true)
 break_count=$("${GREP_RN[@]}" -e "\bbreak\s*;" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 if [ "$case_count" -gt "$break_count" ] && [ "$case_count" -gt 0 ]; then
   diff=$((case_count - break_count))
