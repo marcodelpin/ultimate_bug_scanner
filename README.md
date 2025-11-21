@@ -27,6 +27,8 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scan
   | bash -s -- --easy-mode
 ```
 
+Note: Windows users must run the installer one-liner from within Git Bash, or use WSL for Windows. 
+
 </div>
 
 ## 💥 **The Problem: AI Moves Fast, Bugs Move Faster**
