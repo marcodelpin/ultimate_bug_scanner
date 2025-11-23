@@ -6,7 +6,10 @@ shopt -s lastpipe 2>/dev/null || true
 # Ultimate Bug Scanner - Installation Script
 # https://github.com/Dicklesworthstone/ultimate_bug_scanner
 
-VERSION_DEFAULT="4.6.5"
+# Always present latest master version to users; actual binary will be fetched
+# from master branch (not releases). VERSION is cosmetic only.
+VERSION_DEFAULT="master"
+
 # Handle case when script is piped (BASH_SOURCE[0] not set)
 if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
   VERSION_FILE="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/VERSION"
@@ -2361,41 +2364,53 @@ install_scanner() {
       return 1
     fi
   else
-    log "Downloading from GitHub..."
-    # Always download from master branch for latest code
-    local download_url="${REPO_URL}/${SCRIPT_NAME}"
+      log "Downloading from GitHub master..."
 
-    if download_to_file "$download_url" "$temp_path"; then
-      log "Downloaded successfully"
-    else
-      error "Download failed. Check $download_err"
-      rm -f "$temp_path"
-      return 1
-    fi
-
-    # Download and verify checksums from master
-    if [ "$RUN_VERIFICATION" -eq 1 ] && [ "$INSECURE" -eq 0 ]; then
-      local sums_url="${REPO_URL}/SHA256SUMS"
+      # Append cache-buster so users never get stale CDN copies
+      local cache_buster="$(date +%s)"
+      local download_url="${REPO_URL}/${SCRIPT_NAME}?cache=${cache_buster}"
+      local sums_url="${REPO_URL}/SHA256SUMS?cache=${cache_buster}"
       local sums_file="$WORKDIR/SHA256SUMS"
 
-      log "Verifying checksum..."
-      if download_to_file "$sums_url" "$sums_file"; then
-        # Verify checksum
-        local expected_sum=$(grep "  ${SCRIPT_NAME}$" "$sums_file" | awk '{print $1}')
-        local actual_sum=$(sha256sum "$temp_path" | awk '{print $1}')
+      if download_to_file "$download_url" "$temp_path"; then
+        log "Downloaded successfully"
+      else
+        error "Download failed. Check $download_err"
+        rm -f "$temp_path"
+        return 1
+      fi
 
-        if [[ "$expected_sum" == "$actual_sum" ]]; then
-          success "Checksum verified"
+      # Always verify against master checksums unless --insecure
+      if [ "$RUN_VERIFICATION" -eq 1 ] && [ "$INSECURE" -eq 0 ]; then
+        log "Verifying checksum against master..."
+        if download_to_file "$sums_url" "$sums_file"; then
+          local expected_sum
+          expected_sum=$(grep "  ${SCRIPT_NAME}$" "$sums_file" | awk '{print $1}') || true
+          if [[ -z "$expected_sum" ]]; then
+            error "Checksum entry for ${SCRIPT_NAME} not found in SHA256SUMS"
+            rm -f "$temp_path"
+            return 1
+          fi
+
+          local actual_sum
+          actual_sum=$(sha256sum "$temp_path" | awk '{print $1}')
+
+          if [[ "$expected_sum" == "$actual_sum" ]]; then
+            success "Checksum verified"
+          else
+            error "Checksum mismatch! Expected: $expected_sum, Got: $actual_sum"
+            rm -f "$temp_path"
+            return 1
+          fi
         else
-          error "Checksum mismatch! Expected: $expected_sum, Got: $actual_sum"
+          error "Could not download SHA256SUMS from master"
           rm -f "$temp_path"
-          exit 1
+          return 1
         fi
       else
-        warn "Could not download SHA256SUMS - skipping verification"
+        warn "Checksum verification skipped (--insecure set)"
       fi
     fi
-  fi
 
   if [ ! -s "$temp_path" ]; then
     error "Downloaded file is empty"
