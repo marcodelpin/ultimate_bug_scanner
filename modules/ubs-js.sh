@@ -647,7 +647,20 @@ run_async_error_checks() {
 run_hooks_dependency_checks() {
   print_subheader "React hooks dependency analysis"
   if [[ "$HAS_AST_GREP" -ne 1 ]]; then
-    print_finding "info" 0 "ast-grep not available" "Install ast-grep to analyze React hook dependencies"
+    # Fallback: use ripgrep multiline mode to detect hooks with empty dependency arrays
+    if [[ "$FAIL_ON_WARNING" -eq 0 ]]; then
+      print_finding "info" 0 "React hooks fallback disabled" "Run with --fail-on-warning to check hooks when ast-grep is unavailable"
+      return
+    fi
+    # Search for hooks with empty deps using multiline regex
+    local hooks_count
+    hooks_count=$(rg --multiline --multiline-dotall -e 'use(Effect|Callback|Memo|LayoutEffect)\s*\(.*?\[\s*\]' "$PROJECT_DIR" 2>/dev/null | \
+      grep -c 'use' || echo 0)
+    if [ "$hooks_count" -gt 0 ]; then
+      print_finding "warning" "$hooks_count" "React hooks with empty dependency arrays" "Review hook dependencies - may be missing required deps"
+    else
+      print_finding "good" "No hooks with suspicious empty dependency arrays detected"
+    fi
     return
   fi
   local rule_dir tmp_json
