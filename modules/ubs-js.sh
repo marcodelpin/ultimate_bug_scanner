@@ -62,21 +62,24 @@ DISABLE_PIPEFAIL_DURING_SCAN=1
 AST_RULE_RESULTS_JSON=""
 
 # Async error coverage spec (rule ids -> metadata)
-ASYNC_ERROR_RULE_IDS=(js.async.then-no-catch js.async.promiseall-no-try js.async.await-no-try)
+ASYNC_ERROR_RULE_IDS=(js.async.then-no-catch js.async.promiseall-no-try js.async.await-no-try js.async.dangling-promise)
 declare -A ASYNC_ERROR_SUMMARY=(
   [js.async.then-no-catch]='Promise.then chain missing .catch()'
   [js.async.promiseall-no-try]='Promise.all without try/catch'
   [js.async.await-no-try]='await outside try/catch'
+  [js.async.dangling-promise]='Possible unhandled promise (not awaited/returned)'
 )
 declare -A ASYNC_ERROR_REMEDIATION=(
   [js.async.then-no-catch]='Chain .catch() (or .finally()) to surface rejections'
   [js.async.promiseall-no-try]='Wrap Promise.all in try/catch to handle aggregate failures'
   [js.async.await-no-try]='Wrap awaited calls in try/catch to surface rejections'
+  [js.async.dangling-promise]='Await the promise, return it, or add .catch()/.finally()'
 )
 declare -A ASYNC_ERROR_SEVERITY=(
   [js.async.then-no-catch]='warning'
   [js.async.promiseall-no-try]='warning'
-  [js.async.await-no-try]='info'
+  [js.async.await-no-try]='warning'
+  [js.async.dangling-promise]='warning'
 )
 
 # Error handling AST metadata
@@ -1871,7 +1874,9 @@ rule:
             - pattern: $EXPR.then($ARGS)
             - pattern: Promise.all($ARGS)
             - pattern: Promise.race($ARGS)
+            - pattern: Promise.allSettled($ARGS)
             - kind: return_statement
+            - kind: try_statement
     - not:
         regex:
           target: CALLEE
