@@ -1687,10 +1687,23 @@ YAML
 id: js.async.await-no-try
 language: javascript
 rule:
-  pattern: await $E
-  not:
-    inside:
-      kind: try_statement
+  all:
+    - pattern: await $E
+    - not:
+        inside:
+          kind: try_statement
+    - not:
+        inside:
+          kind: return_statement
+    - not:
+        inside:
+          pattern: await Promise.all($ARGS)
+    - not:
+        inside:
+          pattern: await Promise.allSettled($ARGS)
+    - not:
+        inside:
+          pattern: await Promise.race($ARGS)
 severity: warning
 message: "await without try/catch; wrap to handle rejections"
 YAML
