@@ -799,7 +799,14 @@ end_scan_section(){
 # ────────────────────────────────────────────────────────────────────────────
 check_ast_grep() {
   if command -v ast-grep >/dev/null 2>&1; then AST_GREP_CMD=(ast-grep); HAS_AST_GREP=1; return 0; fi
-  if command -v sg       >/dev/null 2>&1; then AST_GREP_CMD=(sg);       HAS_AST_GREP=1; return 0; fi
+  # Verify 'sg' is actually ast-grep, not the Unix newgrp command
+  if command -v sg >/dev/null 2>&1 && sg --version 2>&1 | grep -qi "ast-grep"; then
+    AST_GREP_CMD=(sg); HAS_AST_GREP=1; return 0
+  fi
+  # Verify npx can actually run ast-grep before trusting it
+  if command -v npx >/dev/null 2>&1 && npx -y @ast-grep/cli --version >/dev/null 2>&1; then
+    AST_GREP_CMD=(npx -y @ast-grep/cli); HAS_AST_GREP=1; return 0
+  fi
   say "${YELLOW}${WARN} ast-grep not found. Advanced AST checks will be limited.${RESET}"
   say "${DIM}Tip: cargo install ast-grep  or  npm i -g @ast-grep/cli${RESET}"
   HAS_AST_GREP=0; return 1
