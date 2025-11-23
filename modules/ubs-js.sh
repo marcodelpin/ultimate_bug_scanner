@@ -1847,9 +1847,10 @@ id: js.async.dangling-promise
 language: javascript
 rule:
   all:
-    - any:
-        - pattern: $CALLEE($ARGS)
-        - pattern: new $CALLEE($ARGS)
+    - pattern: $CALLEE($ARGS)
+    - regex:
+        target: CALLEE
+        pattern: "^(fetch|axios\\.?|.*[Aa]sync$|.*Promise$|Promise\\.|new Promise$|request|req|http|https|api)"
     - not:
         inside:
           any:
