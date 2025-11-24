@@ -2426,8 +2426,10 @@ print_category "Detects: Code injection, XSS, prototype pollution, timing attack
 print_subheader "eval() usage (CRITICAL SECURITY RISK)"
 eval_count=$( \
   ( \
-    ( [[ "$HAS_AST_GREP" -eq 1 ]] && ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern 'eval($$)' "$PROJECT_DIR" 2>/dev/null || true ) ) \
-    || ( "${GREP_RN[@]}" -e "(^|[^\"'])[Ee]val[[:space:]]*\\(" "$PROJECT_DIR" 2>/dev/null || true ) \
+    if [[ "$HAS_AST_GREP" -eq 1 ]]; then
+      ( set +o pipefail; "${AST_GREP_CMD[@]}" --pattern 'eval($$)' "$PROJECT_DIR" 2>/dev/null || true )
+    fi
+    "${GREP_RN[@]}" -e "(^|[^\"'])[Ee]val[[:space:]]*\\(" "$PROJECT_DIR" 2>/dev/null || true \
   ) \
   | (grep -Ev "^[[:space:]]*(//|/\*|\*)" || true) \
   | count_lines

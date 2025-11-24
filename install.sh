@@ -1216,9 +1216,10 @@ verify_installation() {
   test_file="$(mktemp_in_workdir "ubs-smoke.js.XXXXXX")"
   cat > "$test_file" << 'SMOKE'
 // Intentional bugs for smoke test
-eval(userInput);
-const x = null;
-x.foo();
+const value = getUserValue();
+if (value === NaN) {
+  console.log('bad math check');
+}
 SMOKE
 
   if [ "$had_ubs" -eq 1 ]; then
