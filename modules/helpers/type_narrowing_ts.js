@@ -157,6 +157,26 @@ async function analyzeFileWithTs(filePath) {
     return null;
   }
 
+  function statementAssigns(stmt, name) {
+    if (ts.isExpressionStatement(stmt) && ts.isBinaryExpression(stmt.expression)) {
+      if (stmt.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken && ts.isIdentifier(stmt.expression.left)) {
+        return stmt.expression.left.text === name;
+      }
+    }
+    return false;
+  }
+
+  function blockAssigns(node, name) {
+    if (statementAssigns(node, name)) return true;
+    if (ts.isBlock(node)) {
+      return node.statements.some((s) => blockAssigns(s, name));
+    }
+    if (ts.isIfStatement(node)) {
+      return node.elseStatement ? blockAssigns(node.thenStatement, name) && blockAssigns(node.elseStatement, name) : false;
+    }
+    return false;
+  }
+
   function visit(node) {
     if (ts.isBlock(node)) {
       const statements = node.statements;
@@ -174,6 +194,7 @@ async function analyzeFileWithTs(filePath) {
           // This logic seems correct for "guard clauses that fail to guard".
           
           if (guarded && !stmt.elseStatement && !blockHasExit(stmt.thenStatement)) {
+            if (blockAssigns(stmt.thenStatement, guarded.text)) return;
             const usage = findUsageAfter(statements, idx, guarded);
             if (usage) {
               results.push({

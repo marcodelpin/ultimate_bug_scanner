@@ -1037,6 +1037,8 @@ def main():
                 sample = f"{file_path}:{hook_start + 1}"
                 add_issue(issues, 'warning', summary, desc, sample)
                 continue
+            if not (deps_text.strip().startswith('[') and deps_text.strip().endswith(']')):
+                continue
             deps = parse_deps(deps_text)
             identifiers = extract_identifiers(callback)
             identifiers -= KEYWORDS
