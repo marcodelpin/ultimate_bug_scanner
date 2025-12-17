@@ -19,12 +19,12 @@ MODULE_PATH_TEMPLATE="$REPO_RAW/modules/ubs-%s.sh"
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
   [cpp]='b451503aa899e0b79aa6328eb0af11730ce0c4b5e95e5db4839293adc64c7e93'
-  [golang]='5b57e9880a9ce20726fda62ff317d32d6972686fdc9ede68bfab133cae1d34be'
+  [golang]='676a67caa5a7a223fc48e710c5ac2386b6d3a44dba2e2ce774c765543f8f7198'
   [java]='4bd80dcf4a91f230038c97cf177610b3fa1481d9e9759cd134b15fe0510af22b'
-  [js]='e06841bebf109b7b075eb74c3957c2a748ea2f83b85677e8312b231c670b1cdb'
-  [python]='4413e8a0a91f379e4c91b5d4b8dc0ee3f97793818753c3e33971f5c3cb527e05'
+  [js]='01f1ef9be6679fa4d5bcd0f0903b4f42b52f4cf8701e00a6f29a4464b48bc7f6'
+  [python]='f83dcabe9b268a85f3f948f4a188d7861a3eec1b55c32f301f92d97a6dd17d75'
   [ruby]='3756886cfbb9c8838ef965dc0e323b878b2b6a707b4e58e4646039f25f680026'
-  [rust]='e1502d38d4d2899a8a51397311b4026e5934f73e22ea28b9004556a8ec3ae620'
+  [rust]='f8ea18afe41b90422cf362ee87bd1b0b2a0f1658f0727da4cded2f1ffae7e7e9'
   [swift]='44b1450a5bab04391472d188360b830a462d8fae87c9c85d2c2a5af2cb18add9'
 )
 
