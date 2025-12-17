@@ -137,11 +137,13 @@ class Analyzer(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _handle_return_yield(self, value: ast.AST) -> None:
-        names = self._collect_names(value)
-        for name in names:
-            # When returning/yielding a resource, we consider it "released" (ownership transfer)
-            # We check all scopes because a closure might return a variable from an outer scope
-            self._mark_released(name, None, check_all_scopes=True)
+        # Returning/yielding a resource is an *escape*, not a cleanup. UBS should still
+        # report resources that were acquired but never explicitly closed/cancelled.
+        #
+        # This intentionally errs on the side of catching leaks: callers frequently
+        # forget to close handles returned from helpers, and our scanning target is
+        # "likely bugs" rather than enforcing ownership conventions.
+        _ = value
 
     # With/async with -----------------------------------------------------
     def visit_With(self, node: ast.With) -> None:
@@ -298,7 +300,7 @@ class Analyzer(ast.NodeVisitor):
                 else:
                     # e.g. os.path.join -> base.id="os"
                     # _lookup_alias("os") -> (None, None) usually if just imported
-                    # Wait, if "import os", then alias is "os" -> ("os", None)
+                    # Wait: for "import os", alias == "os" -> ("os", None)
                     pass
                 
                 # If we didn't find an alias, check if it matches a known structure

@@ -730,7 +730,10 @@ write_ast_rules(){
 id: swift.urlsession.task-no-resume
 language: swift
 rule:
-  regex: "\\.(dataTask|uploadTask|downloadTask)\\s*\\("
+  pattern: $SESSION.$METHOD($$$)
+constraints:
+  METHOD:
+    regex: '^(dataTask|uploadTask|downloadTask)$'
 severity: info
 message: "URLSession task created (correlation will check resume/cancel); ensure lifecycle management."
 YAML

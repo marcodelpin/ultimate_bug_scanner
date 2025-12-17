@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+from json import JSONDecodeError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
@@ -37,6 +38,14 @@ def read_file(path: Path, cache: dict[Path, str]) -> str:
     if path not in cache:
         cache[path] = path.read_text(encoding="utf-8", errors="ignore")
     return cache[path]
+
+
+def safe_json_loads(line: str) -> dict | None:
+    try:
+        payload = json.JSONDecoder().decode(line)
+    except JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def line_col(text: str, pos: int) -> tuple[int, int]:
@@ -115,9 +124,8 @@ def analyze_with_ast_json(root: Path, json_path: Path) -> List[tuple[Path, int, 
                 line = line.strip()
                 if not line:
                     continue
-                try:
-                    match = json.loads(line)
-                except json.JSONDecodeError:
+                match = safe_json_loads(line)
+                if match is None:
                     continue
                 guard = guard_from_match(match)
                 if guard and is_safe_path(guard.path):
