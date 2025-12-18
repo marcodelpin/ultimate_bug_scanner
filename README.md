@@ -216,7 +216,7 @@ docker run --rm -v /:/host ghcr.io/dicklesworthstone/ubs-tools bash -c "cd /host
 
 The installer will:
 - ✅ Install the `ubs` command globally
-- ✅ Optionally install `ast-grep` (for advanced AST analysis)
+- ✅ Install/ensure `ast-grep` (required for accurate JS/TS scanning; UBS can auto-provision a pinned binary)
 - ✅ Optionally install `ripgrep` (for 10x faster scanning)
 - ✅ Optionally install `jq` (needed for JSON/SARIF merging across all language scanners)
 - ✅ Optionally install `typos` (smart spellchecker for docs and identifiers)
@@ -250,8 +250,9 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scan
 # Verify it works
 ubs --help
 
-# Optional but recommended: Install dependencies
-npm install -g @ast-grep/cli     # AST-based analysis
+# Install dependencies (ast-grep required for JS/TS scanning)
+# Required for JS/TS scanning (syntax-aware AST engine)
+brew install ast-grep            # or: cargo install ast-grep, npm i -g @ast-grep/cli
 brew install ripgrep             # 10x faster searching (or: apt/dnf/cargo install)
 brew install typos-cli           # Spellchecker tuned for code (or: cargo install typos-cli)
 npm install -g typescript        # Enables full tsserver-based type narrowing checks
@@ -923,7 +924,29 @@ Exit Codes:
   0                        No critical issues (or no issues at all)
   1                        Critical issues found
   1                        Warnings found (only with --fail-on-warning)
-  2                        Invalid arguments or configuration
+  2                        Invalid arguments or environment error (e.g., missing ast-grep for JS/TS)
+```
+
+### Environment errors (exit 2)
+
+If UBS prints an **Environment error** and exits `2`, a required dependency is missing or unusable.
+
+Most common fix for JS/TS projects:
+
+```bash
+ubs doctor --fix
+```
+
+Or install the dependency manually:
+
+```bash
+brew install ast-grep            # or: cargo install ast-grep, npm i -g @ast-grep/cli
+```
+
+If you’re intentionally scanning non-JS languages only, exclude JS:
+
+```bash
+ubs --exclude=js .
 ```
 
 ### **Examples**
