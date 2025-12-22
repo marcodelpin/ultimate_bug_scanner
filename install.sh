@@ -1474,11 +1474,12 @@ run_post_install_doctor() {
     write_session_summary "FAILED" "" "$install_dir" "installer binary missing"
     return 0
   fi
-  log "Running 'ubs doctor' (post-install health check)..."
+  log "Running 'ubs doctor --fix' (post-install health check + pre-cache modules)..."
   local doctor_log
   doctor_log="$(mktemp_in_workdir "doctor.log.XXXXXX")"
   note="All checks passed"
-  if NO_COLOR=1 "$installed_bin" doctor >"$doctor_log" 2>&1; then
+  # Use --fix to pre-download language modules during install (avoids "not cached" warnings)
+  if NO_COLOR=1 "$installed_bin" doctor --fix >"$doctor_log" 2>&1; then
     success "'ubs doctor' completed without issues"
   else
     warn "'ubs doctor' reported issues"
@@ -2232,7 +2233,27 @@ install_ripgrep() {
 }
 
 check_node() {
-  command -v node >/dev/null 2>&1
+  # First check if node is already in PATH
+  if command -v node >/dev/null 2>&1; then
+    return 0
+  fi
+  # Try sourcing nvm if available (common install method)
+  if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+    export NVM_DIR="$HOME/.nvm"
+    # shellcheck source=/dev/null
+    source "$NVM_DIR/nvm.sh" 2>/dev/null
+    command -v node >/dev/null 2>&1 && return 0
+  fi
+  # Try common nvm install locations
+  for dir in "$HOME/.local/share/nvm" "/usr/local/nvm" "/opt/nvm"; do
+    if [[ -s "$dir/nvm.sh" ]]; then
+      export NVM_DIR="$dir"
+      # shellcheck source=/dev/null
+      source "$NVM_DIR/nvm.sh" 2>/dev/null
+      command -v node >/dev/null 2>&1 && return 0
+    fi
+  done
+  return 1
 }
 
 check_typescript_pkg() {
@@ -3210,8 +3231,8 @@ local label="$1"
 local detected_flag="$2"
 local fn_name="$3"
 
+# Skip silently if agent not detected (avoid noisy output)
 if [ "$detected_flag" != "-1" ] && [ "$detected_flag" -eq 0 ]; then
-log "Skipping ${label} (agent not detected)"
 return 0
 fi
 
