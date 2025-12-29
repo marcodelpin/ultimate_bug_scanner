@@ -10,7 +10,9 @@ Exit behavior:
   - Exit 0 with no output = allow
 """
 import json
+import os
 import re
+import shlex
 import sys
 
 # Destructive patterns to block - tuple of (regex, reason)
@@ -79,21 +81,75 @@ DESTRUCTIVE_PATTERNS = [
     ),
 ]
 
-# Patterns that are safe even if they match above (allowlist)
-SAFE_PATTERNS = [
-    r"git\s+checkout\s+-b\s+",           # Creating new branch
-    r"git\s+checkout\s+--orphan\s+",     # Creating orphan branch
-    r"git\s+restore\s+--staged\s+",      # Unstaging (safe)
-    r"git\s+clean\s+-n",                 # Dry run
-    r"git\s+clean\s+--dry-run",          # Dry run
-    # Allow rm -rf on temp directories (these are designed for ephemeral data)
-    r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/tmp/",        # /tmp/...
-    r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/var/tmp/",    # /var/tmp/...
-    r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+\$TMPDIR/",    # $TMPDIR/...
-    r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+\$\{TMPDIR",   # ${TMPDIR}/... or ${TMPDIR:-...}
-    r'rm\s+-[a-z]*r[a-z]*f[a-z]*\s+"\$TMPDIR/',   # "$TMPDIR/..."
-    r'rm\s+-[a-z]*r[a-z]*f[a-z]*\s+"\$\{TMPDIR',  # "${TMPDIR}/..." or "${TMPDIR:-...}"
-]
+RM_RF_ALLOWED_PREFIXES = (
+    os.path.join(os.sep, "tmp", ""),
+    os.path.join(os.sep, "var", "tmp", ""),
+    "${TMPDIR:-/tmp}/",
+    "${TMPDIR:-/var/tmp}/",
+)
+
+RM_SEPARATORS = {"&&", "||", ";", "|"}
+
+
+def rm_rf_targets_are_safe(command: str) -> bool:
+    """Allow `rm -rf` only when *all* targets are clearly temp paths.
+
+    IMPORTANT: We intentionally avoid trying to evaluate variables like `$TMPDIR`
+    (it can be set to `/`). Only the explicit fallbacks `${TMPDIR:-/tmp}/...`
+    and `${TMPDIR:-/var/tmp}/...` are allowed.
+    """
+
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return False
+
+    i = 0
+    while i < len(tokens):
+        if tokens[i] != "rm":
+            i += 1
+            continue
+
+        i += 1
+        flags = set()
+        end_of_opts = False
+
+        while i < len(tokens) and not end_of_opts:
+            tok = tokens[i]
+            if tok == "--":
+                end_of_opts = True
+                i += 1
+                break
+            if tok in RM_SEPARATORS:
+                break
+            if not tok.startswith("-"):
+                break
+            # Short options like -rf / -fr, plus long --recursive/--force variants.
+            if tok.startswith("--"):
+                if tok == "--recursive":
+                    flags.add("r")
+                elif tok == "--force":
+                    flags.add("f")
+            else:
+                if "r" in tok:
+                    flags.add("r")
+                if "f" in tok:
+                    flags.add("f")
+            i += 1
+
+        targets: list[str] = []
+        while i < len(tokens) and tokens[i] not in RM_SEPARATORS:
+            targets.append(tokens[i])
+            i += 1
+
+        if "r" in flags and "f" in flags:
+            if not targets:
+                return False
+            for target in targets:
+                if not any(target.startswith(prefix) for prefix in RM_RF_ALLOWED_PREFIXES):
+                    return False
+
+    return True
 
 
 def main():
@@ -111,14 +167,19 @@ def main():
     if tool_name != "Bash" or not command:
         sys.exit(0)
 
-    # Check if command matches any safe pattern first
-    for pattern in SAFE_PATTERNS:
-        if re.search(pattern, command, re.IGNORECASE):
-            sys.exit(0)
-
     # Check if command matches any destructive pattern
+    rm_rf_verified = False
     for pattern, reason in DESTRUCTIVE_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
+            if pattern.startswith("rm\\s+"):
+                if not rm_rf_targets_are_safe(command):
+                    reason = (
+                        "rm -rf is destructive. Only explicit temp paths are allowed "
+                        f"({', '.join(RM_RF_ALLOWED_PREFIXES)})."
+                    )
+                else:
+                    rm_rf_verified = True
+                    continue
             output = {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -136,6 +197,7 @@ def main():
             sys.exit(0)
 
     # Allow all other commands
+    _ = rm_rf_verified
     sys.exit(0)
 
 
