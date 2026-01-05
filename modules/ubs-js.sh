@@ -1896,8 +1896,9 @@ rule:
   all:
     - pattern: $P.then($ARGS)
     - not:
-        has:
-          pattern: .catch($CATCH)
+        inside:
+          pattern: $_.catch($$$)
+          stopBy: end
     - not:
         inside:
           kind: try_statement
@@ -1917,8 +1918,9 @@ rule:
   all:
     - pattern: $P.then($ARGS)
     - not:
-        has:
-          pattern: .catch($CATCH)
+        inside:
+          pattern: $_.catch($$$)
+          stopBy: end
     - not:
         inside:
           kind: try_statement
@@ -1939,6 +1941,10 @@ rule:
     - not:
         inside:
           kind: try_statement
+          stopBy: end
+    - not:
+        inside:
+          kind: return_statement
           stopBy: end
 severity: warning
 message: "await Promise.all() without try/catch; wrap to handle aggregate failures"
