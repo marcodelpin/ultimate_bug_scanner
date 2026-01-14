@@ -15,6 +15,12 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_sca
   | bash -s --
 ```
 
+**Or via Homebrew (macOS/Linux):**
+
+```bash
+brew install dicklesworthstone/tap/ubs
+```
+
 </div>
 
 ---
