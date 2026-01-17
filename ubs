@@ -167,7 +167,7 @@ SESSION_RAW=0
 SESSION_LOG_DIR_OVERRIDE=""
 VERIFY_MODULE_ERR=""
 VERIFY_HELPER_ERR=""
-ALL_LANGS=(js python cpp rust golang java ruby swift)
+ALL_LANGS=(js python cpp rust golang java ruby swift csharp coderabbit)
 UPDATE_ONLY=0
 FORCE_SELF_UPDATE=0
 CATEGORY_FILTER=""
@@ -211,7 +211,7 @@ Options:
   --fail-on-warning       Exit non-zero if warnings or critical exist
   -v, --verbose           Pass -v to child scanners (if supported)
   -q, --quiet             Reduce console output (also passes -q to scanners)
-  --only=CSV              Restrict to languages: js,python,cpp,rust,golang,java,ruby,swift
+  --only=CSV              Restrict to languages: js,python,cpp,rust,golang,java,ruby,swift,csharp,coderabbit
   --exclude=CSV           Exclude languages
   --module-dir=DIR        Where to store/lookup modules (default: $MODULE_DIR_DEFAULT)
   --category=CSV          Focus on category packs (e.g., resource-lifecycle for AST lifecycle analyzers)
@@ -1516,6 +1516,25 @@ detect_lang(){
           -type f \( -name '*.swift' -o -name '*.metal' -o -name 'Package.swift' -o -name '*.xcodeproj' -o -name '*.xcworkspace' \) -print -quit 2>/dev/null | grep -q . && found=0
       fi
       ;;
+    csharp)
+      if need_cmd rg; then
+        rg -q --hidden -g '!obj/**' -g '!bin/**' -g '!packages/**' -g '!.nuget/**' \
+           -g '*.cs' -g '*.csproj' -g '*.sln' . "$PROJECT_DIR" 2>/dev/null && found=0
+      else
+        find "$PROJECT_DIR" \( -name obj -o -name bin -o -name packages -o -name .nuget -o -name .git \) -prune -o \
+          -type f \( -name '*.cs' -o -name '*.csproj' -o -name '*.sln' \) -print -quit 2>/dev/null | grep -q . && found=0
+      fi
+      ;;
+    coderabbit)
+      # CodeRabbit: detect if CLI is installed (module handles git checks)
+      # Check SOURCE_PROJECT_DIR for git, not the filtered shadow workspace
+      if (command -v coderabbit >/dev/null 2>&1 || command -v cr >/dev/null 2>&1); then
+        local src_dir="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+        if [ -d "$src_dir/.git" ] || (cd "$src_dir" 2>/dev/null && git rev-parse --git-dir >/dev/null 2>&1); then
+          found=0
+        fi
+      fi
+      ;;
   esac
   return $found
 }
@@ -1913,7 +1932,7 @@ run_lang(){
         report_args=(--report-json="$out_findings")
       fi
 
-      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" UBS_SOURCE_PROJECT_DIR="$SOURCE_PROJECT_DIR" \
         "$module" "${args[@]}" "${report_args[@]}" --format=json >"$out_json" 2>"$err"; then
         module_status=0
       else
@@ -1928,7 +1947,7 @@ run_lang(){
         attach_metrics_to_json "$out_json" "$metrics_dir"
       else
         prepare_metrics_dir "$metrics_dir"
-        if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+        if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" UBS_SOURCE_PROJECT_DIR="$SOURCE_PROJECT_DIR" \
           "$module" "${args[@]}" "${report_args[@]}" 2>>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
           module_status=0
         else
@@ -1941,7 +1960,7 @@ run_lang(){
       ;;
     sarif)
       prepare_metrics_dir "$metrics_dir"
-      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" UBS_SOURCE_PROJECT_DIR="$SOURCE_PROJECT_DIR" \
         "$module" "${args[@]}" --format=sarif >"$out_sarif" 2>"$err"; then
         module_status=0
       else
@@ -1953,7 +1972,7 @@ run_lang(){
         attach_metrics_to_json "$out_json" "$metrics_dir" 2>/dev/null || true
       else
         prepare_metrics_dir "$metrics_dir"
-        if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+        if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" UBS_SOURCE_PROJECT_DIR="$SOURCE_PROJECT_DIR" \
           "$module" "${args[@]}" 2>>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
           module_status=0
         else
@@ -1967,7 +1986,7 @@ run_lang(){
       ;;
     text|*)
       prepare_metrics_dir "$metrics_dir"
-      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" \
+      if UBS_METRICS_DIR="$metrics_dir" UBS_LANG="$lang" UBS_SKIP_TYPE_NARROWING="$SKIP_TYPE_NARROWING" UBS_SOURCE_PROJECT_DIR="$SOURCE_PROJECT_DIR" \
         "$module" "${args[@]}" 2>"$err" | apply_inline_suppressions >"$out_txt" 2>>"$err"; then
         module_status=0
       else
