@@ -3688,6 +3688,9 @@ echo -e "${BLUE}├──${RESET} ${BOLD}Get help:${RESET}       ${GREEN}ubs --h
 echo -e "${BLUE}├──${RESET} ${BOLD}View session log:${RESET} ${GREEN}ubs sessions --entries 1${RESET}"
 echo -e "${BLUE}└──${RESET} ${BOLD}Verbose mode:${RESET}   ${GREEN}ubs -v .${RESET}"
 echo ""
+echo -e "${BOLD}${BLUE}Tip: For automatic updates, install via Homebrew:${RESET}"
+echo -e "  ${GREEN}brew install dicklesworthstone/tap/ubs${RESET}"
+echo ""
 [ "$NO_PATH_MODIFY" -eq 1 ] && warn "PATH was not modified per --no-path-modify; ensure $install_dir is on PATH."
 else
 echo -e "${BOLD}${YELLOW}┌─ Almost Done! (Reload Required)${RESET}"

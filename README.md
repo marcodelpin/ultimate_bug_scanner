@@ -172,7 +172,25 @@ ubs . --format=jsonl --beads-jsonl out/findings.jsonl  # Save JSONL for Beads/"s
 
 ## 🚀 **Quick Install (30 Seconds)**
 
-### **Option 1: Automated Install (Recommended)**
+### **Recommended: Homebrew (macOS/Linux)**
+
+```bash
+brew install dicklesworthstone/tap/ubs
+```
+
+This method provides:
+- Automatic updates via `brew upgrade`
+- Dependency management
+- Easy uninstall via `brew uninstall`
+
+### **Windows: Scoop**
+
+```powershell
+scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
+scoop install dicklesworthstone/ubs
+```
+
+### **Alternative: Automated Install**
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh?$(date +%s)" | bash
