@@ -2814,7 +2814,32 @@ append_agent_rule_block() {
 }
 
 setup_cursor_rules() { append_agent_rule_block ".cursor" "Cursor"; }
-setup_codex_rules() { append_agent_rule_block ".codex" "Codex CLI"; }
+setup_codex_rules() {
+  # Codex CLI v0.77.0+ expects .codex/rules/ as a DIRECTORY, not a file
+  # Always create as directory and write to ubs.md inside it
+  local rules_path=".codex/rules"
+
+  if dry_run_enabled; then
+    log_dry_run "Would update ${rules_path}/ubs.md with Codex CLI quick reference."
+    return 0
+  fi
+
+  # If rules exists as a file (legacy format), migrate it
+  if [ -f "$rules_path" ]; then
+    log "Migrating Codex rules from file to directory format..."
+    local backup="${rules_path}.backup.$(date +%s)"
+    mv "$rules_path" "$backup"
+    mkdir -p "$rules_path"
+    mv "$backup" "${rules_path}/legacy-rules.md"
+    success "Migrated existing rules to ${rules_path}/legacy-rules.md"
+  fi
+
+  # Ensure rules directory exists
+  mkdir -p "$rules_path"
+
+  # Write UBS reference to ubs.md inside the directory
+  append_quick_reference_block "${rules_path}/ubs.md" "Codex CLI guardrails"
+}
 setup_gemini_rules() { append_agent_rule_block ".gemini" "Gemini Code Assist"; }
 setup_windsurf_rules() { append_agent_rule_block ".windsurf" "Windsurf"; }
 setup_cline_rules()  { append_agent_rule_block ".cline"  "Cline"; }
