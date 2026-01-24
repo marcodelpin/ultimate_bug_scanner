@@ -131,20 +131,20 @@ totals:
 
 The format switch is already extensible. Adding TOON requires:
 1. A new case in the format dispatch (bash: ~20 lines)
-2. Piping existing JSON output through `toon` binary
-3. Optionally: native TOON emission in bash (harder but avoids toon dependency)
+2. Piping existing JSON output through `tr` binary
+3. Optionally: native TOON emission in bash (harder but avoids tr dependency)
 
-### Recommended Approach: **Pattern A - Pipe through `toon` binary**
+### Recommended Approach: **Pattern A - Pipe through `tr` binary**
 
 Since UBS already generates JSON output internally (even for text format, it builds JSON summaries), the simplest approach is:
 
 ```bash
 case "$FORMAT" in
   toon)
-    # Generate JSON internally, pipe through toon
+    # Generate JSON internally, pipe through tr
     local json_output
     json_output=$(generate_json_report)
-    echo "$json_output" | toon
+    echo "$json_output" | tr
     ;;
 esac
 ```
@@ -153,7 +153,7 @@ This avoids rewriting any serialization logic and leverages the existing `--repo
 
 ### Alternative Approach: **Pattern B - Native bash TOON emission**
 
-For maximum performance (avoid toon process spawn), emit TOON directly:
+For maximum performance (avoid tr process spawn), emit TOON directly:
 ```bash
 emit_toon_findings() {
   local count="${#FINDINGS[@]}"
@@ -165,7 +165,7 @@ emit_toon_findings() {
 }
 ```
 
-This is more work but eliminates the toon dependency.
+This is more work but eliminates the tr dependency.
 
 ### Key Integration Points
 
@@ -174,11 +174,11 @@ This is more work but eliminates the toon dependency.
 | `ubs` line ~145 | Add "toon" to valid FORMAT values |
 | `ubs` line ~369-425 | CLI arg parsing (already handles `--format=*`) |
 | `ubs` line ~2407-2452 | Output emission switch - add toon case |
-| `install.sh` | Optionally bundle `toon` binary |
+| `install.sh` | Optionally bundle `tr` binary |
 | `modules/ubs-*.sh` | No changes needed (they emit JSON internally) |
 
 ### Dependencies
-- **toon binary** must be available in PATH (or bundled)
+- **tr binary** must be available in PATH (or bundled)
 - No Cargo.toml changes needed (UBS is bash, not Rust)
 - No serde patterns to modify
 
@@ -206,21 +206,21 @@ The **findings array** is the primary savings driver. With 65+ uniform findings 
 
 ### Language-Specific Notes
 - UBS is **bash** (not Rust as the bead template assumed)
-- Integration via `toon` binary subprocess is the natural approach
+- Integration via `tr` binary subprocess is the natural approach
 - No Cargo.toml, no serde, no Rust dependencies
 
 ### Implementation Order
 1. Add `--format=toon` CLI flag recognition
-2. Pipe existing JSON through `toon` binary
-3. Add `--stats` flag (already in toon: `toon --stats`)
+2. Pipe existing JSON through `tr` binary
+3. Add `--stats` flag (already in tr: `tr --stats`)
 4. Add env var `UBS_OUTPUT_FORMAT=toon`
 5. Test with manifest.json test cases
 6. Document in ubs help output
 
 ### Risk Assessment
 - **Low risk**: New format, no existing behavior changes
-- **Dependency risk**: Requires `toon` binary in PATH
-- **Mitigation**: Fallback to JSON if `toon` not found, with warning
+- **Dependency risk**: Requires `tr` binary in PATH
+- **Mitigation**: Fallback to JSON if `tr` not found, with warning
 
 ---
 
@@ -237,10 +237,10 @@ The **findings array** is the primary savings driver. With 65+ uniform findings 
 The following beads should be created in `/data/projects/ultimate_bug_scanner/.beads/`:
 
 1. **ubs-toon-flag**: Add `--format=toon` CLI flag to meta-runner
-2. **ubs-toon-pipe**: Implement JSON-to-TOON piping via `toon` binary
+2. **ubs-toon-pipe**: Implement JSON-to-TOON piping via `tr` binary
 3. **ubs-toon-env**: Add `UBS_OUTPUT_FORMAT` env var support
 4. **ubs-toon-stats**: Add `--stats` flag for token comparison display
-5. **ubs-toon-fallback**: Graceful fallback if `toon` not in PATH
+5. **ubs-toon-fallback**: Graceful fallback if `tr` not in PATH
 6. **ubs-toon-test**: Add TOON format test cases to manifest.json
 7. **ubs-toon-docs**: Update `ubs --help` and README with TOON documentation
 8. **ubs-toon-jsonl**: Consider TOON for JSONL format variant
@@ -281,9 +281,9 @@ The following beads should be created in `/data/projects/ultimate_bug_scanner/.b
   - Precedence: CLI > `UBS_OUTPUT_FORMAT` > `TOON_DEFAULT_FORMAT` > default
 
 ### TOON Strategy (json vs toon vs toonl)
-- **Recommended**: Add `--format=toon` to meta-runner and pipe combined JSON through `toon`.
+- **Recommended**: Add `--format=toon` to meta-runner and pipe combined JSON through `tr`.
   - Implement as new `case "toon")` branch in unified output switch (`/data/projects/ultimate_bug_scanner/ubs:2426+`).
-  - Use `generate_combined_json` → `cat "$COMBINED_JSON_FILE" | toon`.
+  - Use `generate_combined_json` → `cat "$COMBINED_JSON_FILE" | tr`.
 - **JSONL**: keep `jsonl` unchanged (streaming records). If needed, add a separate `toonl` later.
 - **SARIF**: **must remain unchanged** (protocol-bound output).
 
@@ -305,9 +305,9 @@ Commands (run in ubs repo):
 
 ### Test Plan (unit + e2e)
 - **Unit**: format precedence (CLI/env), TOON round-trip, JSONL unchanged, SARIF unchanged.
-- **E2E**: run json vs toon and compare decoded output; capture stdout/stderr + exit codes.
+- **E2E**: run json vs toon and compare `tr -d` output; capture stdout/stderr + exit codes.
 
 ### Risks & Edge Cases
-- `toon` binary missing → warn + fallback to JSON
-- Large outputs: ensure `toon` piping handles big JSON without truncation
+- `tr` binary missing → warn + fallback to JSON
+- Large outputs: ensure `tr` piping handles big JSON without truncation
 - JSONL behavior must remain stable unless `toonl` introduced
