@@ -1775,7 +1775,7 @@
     },
     {
       "id": "toon-format-fallback",
-      "description": "TOON format falls back to JSON when toon binary is not in PATH.",
+      "description": "TOON format falls back to JSON when toon binary is not available.",
       "path": "test-suite/buggy",
       "language": "js",
       "tags": [
@@ -1788,7 +1788,7 @@
         "--format=toon"
       ],
       "env": {
-        "PATH": "/usr/bin:/bin"
+        "UBS_TEST_FORCE_NO_TOON": "1"
       },
       "expect": {
         "exit_code": "nonzero",

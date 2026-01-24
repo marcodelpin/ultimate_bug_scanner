@@ -2474,8 +2474,8 @@ case "$FORMAT" in
       emit_env_error_json
       status=2
     else
-      # Check if toon (TOON encoder) is available
-      if command -v toon >/dev/null 2>&1; then
+      # Check if toon (TOON encoder) is available (UBS_TEST_FORCE_NO_TOON=1 forces fallback for testing)
+      if [[ "${UBS_TEST_FORCE_NO_TOON:-0}" != "1" ]] && command -v toon >/dev/null 2>&1; then
         if generate_combined_json; then
           cat "$COMBINED_JSON_FILE" | toon
         else
