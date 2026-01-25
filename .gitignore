@@ -37,3 +37,6 @@ Cargo.lock
 
 # Test artifacts
 test-suite/artifacts/
+
+# Compiled test artifacts
+a.out
