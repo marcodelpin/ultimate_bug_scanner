@@ -38,6 +38,26 @@ Note: Windows users must run the installer one-liner from within Git Bash, or us
 
 </div>
 
+---
+
+## 🤖 Agent Quickstart (JSON/TOON)
+
+**Use machine-readable output in agent contexts.** stdout = data, stderr = diagnostics, exit 0 = success.
+
+```bash
+# Scan current repo (JSON)
+ubs . --format=json
+
+# Token-optimized output (TOON)
+ubs . --format=toon
+
+# Scan only staged changes
+ubs --staged --format=json
+
+# CI-strict (fail on warnings)
+ubs . --profile=strict --fail-on-warning --format=json
+```
+
 ## 💥 **The Problem: AI Moves Fast, Bugs Move Faster**
 
 You're coding faster than ever with Claude Code, Codex, Cursor, and other AI coding agents. You're shipping features in minutes that used to take days. **But here's the painful truth:**
