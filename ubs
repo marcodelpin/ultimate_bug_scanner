@@ -1560,19 +1560,19 @@ detect_lang(){
   case "$lang" in
     js)
       if need_cmd rg; then
-        rg -q --hidden -g '!node_modules/**' -g '!dist/**' -g '!build/**' -g '!coverage/**' -g '!*.min.*' \
+        rg -q --hidden -g '!node_modules/**' -g '!dist/**' -g '!build/**' -g '!coverage/**' -g '!*.min.*' -g '!venv/**' -g '!.venv/**' \
            -g '*.{js,jsx,ts,tsx,mjs,cjs}' -g 'package.json' . "$PROJECT_DIR" 2>/dev/null && found=0
       else
-        find "$PROJECT_DIR" \( -name node_modules -o -name dist -o -name build -o -name coverage -o -name .git \) -prune -o \
+        find "$PROJECT_DIR" \( -name node_modules -o -name dist -o -name build -o -name coverage -o -name venv -o -name .venv -o -name .git \) -prune -o \
           -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' -o -name '*.mjs' -o -name '*.cjs' -o -name 'package.json' \) -print -quit 2>/dev/null | grep -q . && found=0
       fi
       ;;
     python)
       if need_cmd rg; then
-        rg -q --hidden -g '!venv/**' -g '!**/__pycache__/**' -g '!build/**' -g '!dist/**' \
+        rg -q --hidden -g '!venv/**' -g '!.venv/**' -g '!**/__pycache__/**' -g '!build/**' -g '!dist/**' \
            -g '*.py' -g 'pyproject.toml' -g 'requirements.txt' -g 'setup.py' . "$PROJECT_DIR" 2>/dev/null && found=0
       else
-        find "$PROJECT_DIR" \( -name venv -o -name __pycache__ -o -name build -o -name dist -o -name .git \) -prune -o \
+        find "$PROJECT_DIR" \( -name venv -o -name .venv -o -name __pycache__ -o -name build -o -name dist -o -name .git \) -prune -o \
           -type f \( -name '*.py' -o -name 'pyproject.toml' -o -name 'requirements.txt' -o -name 'setup.py' \) -print -quit 2>/dev/null | grep -q . && found=0
       fi
       ;;
