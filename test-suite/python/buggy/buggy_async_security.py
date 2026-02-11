@@ -1,7 +1,6 @@
 """Buggy Python sample exercising UBS python module detections."""
 
 import json
-import os
 import random
 import subprocess
 import requests

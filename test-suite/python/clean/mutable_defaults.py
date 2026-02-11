@@ -10,7 +10,7 @@ def append_item(item, bucket=None):
 
 try:
     raise ValueError('boom')
-except ValueError as err:
+except ValueError:
     raise
 
 print(hashlib.sha256(b'secret').hexdigest())
