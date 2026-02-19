@@ -257,6 +257,7 @@ REPORT_JSON_PATH=""
 HTML_REPORT_PATH=""
 SHAREABLE_MODE=0
 GIT_MODE=""  # staged, diff, or empty
+SCAN_FILES=()  # explicit file list from --files or multiple positional args
 GIT_REMOTE_URL=""
 GIT_REMOTE_HTTP=""
 GIT_COMMIT_SHA=""
@@ -282,6 +283,8 @@ fi
 usage() {
   cat <<USAGE >&2
 Usage: ubs [options] [PROJECT_DIR]
+       ubs [options] FILE1 FILE2 ...
+       ubs --files FILE1,FILE2,... [options] [PROJECT_DIR]
        ubs doctor [options]
        ubs sessions [--entries N] [--raw]
 
@@ -312,6 +315,7 @@ Options:
   --no-auto-update        Disable auto-update (even if UBS_ENABLE_AUTO_UPDATE=1)
   --staged                Scan only files staged for commit (git index)
   --diff, --git-diff      Scan only modified files (working tree vs HEAD)
+  --files=F1,F2,...       Scan only the listed files (comma or space separated)
   -h, --help              Show this help
 
 Environment Variables:
@@ -331,6 +335,8 @@ Examples:
   ubs .                       # auto-detect languages and scan
   ubs --staged                # scan only staged files (pre-commit style)
   ubs --diff                  # scan only modified files (quick check)
+  ubs --files=a.js,b.py .     # scan specific files in current dir
+  ubs src/a.js src/b.py       # multiple positional args (same effect)
   ubs --format=json --ci .    # machine-readable combined JSON
   ubs --format=toon .         # TOON format (~50% smaller than JSON)
   ubs --only=js,python .      # restrict language set
@@ -502,6 +508,10 @@ else
       --no-auto-update) export UBS_NO_AUTO_UPDATE=1; shift;;
       --staged) GIT_MODE="staged"; shift;;
       --diff|--git-diff) GIT_MODE="diff"; shift;;
+      --files=*) IFS=',' read -r -a _f <<<"${1#*=}"; SCAN_FILES+=("${_f[@]}"); shift;;
+      --files)
+        if [[ $# -lt 2 ]]; then usage; exit 2; fi
+        shift; IFS=',' read -r -a _f <<<"$1"; SCAN_FILES+=("${_f[@]}"); shift;;
       --profile=*)
         export UBS_PROFILE="${1#*=}"
         if [[ "$UBS_PROFILE" == "strict" ]]; then FAIL_ON_WARNING=1; fi
@@ -511,7 +521,17 @@ else
         shift;;
       -h|--help) usage; exit 0;;
       *)
-        if [[ "$PROJECT_DIR" == "." ]]; then PROJECT_DIR="$1"; else usage; exit 2; fi
+        if [[ "$PROJECT_DIR" == "." ]]; then
+          # First positional arg: could be a directory OR a file
+          if [[ -d "$1" ]]; then
+            PROJECT_DIR="$1"
+          else
+            SCAN_FILES+=("$1")
+          fi
+        else
+          # Additional positional args: accumulate as files
+          SCAN_FILES+=("$1")
+        fi
         shift;;
     esac
   done
@@ -835,6 +855,71 @@ prepare_git_workspace(){
     say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
   else
     say "${RED}$X Failed to prepare shadow workspace${RESET}"
+    exit 1
+  fi
+}
+
+# Copy an explicit list of files (from --files or multiple positional args)
+# into a shadow workspace so the rest of the pipeline scans only those files.
+prepare_files_workspace(){
+  local scan_root="$SOURCE_PROJECT_DIR"
+  if [[ -f "$scan_root" ]]; then
+    scan_root="$(dirname "$scan_root")"
+  fi
+
+  # Resolve each path relative to scan_root; reject missing files
+  local resolved=()
+  local f rel
+  for f in "${SCAN_FILES[@]}"; do
+    [[ -z "$f" ]] && continue
+    if [[ "$f" == /* ]]; then
+      # Absolute path — make it relative to scan_root
+      if [[ -f "$f" ]]; then
+        rel="${f#"$scan_root"/}"
+        resolved+=("$rel")
+      else
+        say "${RED}$X file not found${RESET}: $f"
+        exit 2
+      fi
+    elif [[ -f "$scan_root/$f" ]]; then
+      resolved+=("$f")
+    elif [[ -f "$f" ]]; then
+      # Relative to cwd, convert to relative to scan_root
+      local abs
+      abs="$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")"
+      rel="${abs#"$scan_root"/}"
+      resolved+=("$rel")
+    else
+      say "${RED}$X file not found${RESET}: $f"
+      exit 2
+    fi
+  done
+
+  if [[ ${#resolved[@]} -eq 0 ]]; then
+    say "${RED}$X --files: no valid files specified${RESET}"
+    exit 2
+  fi
+
+  if ! need_cmd rsync; then
+    say "${RED}$X rsync not found; required for --files${RESET}"
+    exit 1
+  fi
+
+  local dest="$TMPDIR_RUN/files_scan"
+  rm -rf "$dest" 2>/dev/null || true
+  ensure_dir "$dest"
+
+  say "${BLUE}${INFO} Preparing shadow workspace for ${#resolved[@]} specified file(s)${RESET}"
+
+  local file_list="$TMPDIR_RUN/explicit_files.txt"
+  printf "%s\n" "${resolved[@]}" > "$file_list"
+
+  if rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>&1; then
+    FILTERED_PROJECT_DIR="$dest"
+    PROJECT_DIR="$FILTERED_PROJECT_DIR"
+    say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
+  else
+    say "${RED}$X Failed to prepare files workspace${RESET}"
     exit 1
   fi
 }
@@ -1968,6 +2053,8 @@ fi
 
 if [[ -n "$GIT_MODE" ]]; then
   prepare_git_workspace "$GIT_MODE"
+elif [[ ${#SCAN_FILES[@]} -gt 0 ]]; then
+  prepare_files_workspace
 fi
 
 # Build selected language set
