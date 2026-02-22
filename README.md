@@ -1,6 +1,10 @@
 
 # 🔬 Ultimate Bug Scanner v5.0
 
+<div align="center">
+  <img src="ubs_illustration.webp" alt="Ultimate Bug Scanner - The AI Coding Agent's Secret Weapon">
+</div>
+
 ### **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
