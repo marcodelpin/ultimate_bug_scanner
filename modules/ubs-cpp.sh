@@ -373,7 +373,7 @@ else
 fi
 
 # Helper: robust numeric end-of-pipeline counter
-count_lines() { awk 'END{print (NR+0)}'; }
+count_lines() { grep -v 'ubs:ignore' | awk 'END{print (NR+0)}'; }
 
 # Targets placeholder; populated after SCAN_PATHS is finalized
 TARGETS=()
@@ -489,6 +489,7 @@ show_detailed_finding() {
   local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
   search_show "$pattern" "$limit" | while IFS= read -r rawline; do
     [[ -z "$rawline" ]] && continue
+    [[ "$rawline" == *"ubs:ignore"* ]] && continue
     parse_grep_line "$rawline" || continue
     [[ -z "$PARSED_FILE" ]] && continue
     print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"; printed=$((printed+1))

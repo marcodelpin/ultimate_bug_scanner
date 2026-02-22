@@ -18,14 +18,14 @@ MODULE_PATH_TEMPLATE="$REPO_RAW/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='ac6a213e3cb8fc2eb24d18754c1e83c994c89149e5f690116d848c57548e6f28'
-  [golang]='b157d6e8f2684246c8add2a6cd0b3da698a8f3aace6e7c367ed76336e21ff4c6'
-  [java]='6b120bd6bd199d45e5f80d295888aeab10c1439abe064797047e776258b37256'
-  [js]='f92889318e794d96277f55d6dee9da3947c122786ee929d7eaf380d4332a38c0'
-  [python]='0ca0dd919413a5b9b5439ad95fb5c8d2fdda90324d8e48cd5d00850d2e246902'
-  [ruby]='3490a56a174f4873d01a83d4ceac8bdb7b6d56024c9aff25257af28c9d805405'
-  [rust]='d3bed67cbb0a234765129ae133e6c4a92f6c1fd0dd3afc5c7635fe864382d809'
-  [swift]='b350c2ae42725f96a2c94eaf7c70ff4864ecae53e0fc7d9a3fee5988128c8a2a'
+  [cpp]='16193339dcb4b80ccab6b6a7906d092969133bdca86cf38ca2c80b320b00da44'
+  [golang]='eb647a33198514ee15e989bfc277e215263b1326e1a188b7d8bd68afde37b1b9'
+  [java]='6bf5710d2c970d1dbf9705ad1d28c7de19f7ea7c6c62eaf1f5ea599df574e35f'
+  [js]='2ef4321af6c25c8c3eeb8c23ec174e407585c1f5a76020788f67ad66ebb727c0'
+  [python]='dfa584639c21494ddf107ec4562c550798b2b97db15ff34e11c4694ec2b6fb11'
+  [ruby]='0351acfbab83ab86a339307d1f07493e26dd383238576959b1882aa7d1de9d6f'
+  [rust]='8c183151bf2416f9a4c98060a96d28dd2365e9d01a20c98852473ec6d6661784'
+  [swift]='1429436c7de226ef2302dc8860e9737a44cbf23028da97437a0c89baa6b7870b'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -828,7 +828,46 @@ prepare_git_workspace(){
   else
     files=("${raw_files[@]}")
   fi
-  
+
+  # Apply .ubsignore / GLOBAL_EXCLUDE_PATTERNS filtering to the staged file list
+  # so that ignored paths are never copied into the shadow workspace.
+  if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" && ${#files[@]} -gt 0 ]] && need_cmd python3; then
+    local filtered_csv
+    filtered_csv=$(printf '%s\n' "${files[@]}" | python3 -c "
+import sys, fnmatch, pathlib
+patterns = sys.argv[1].split(',')
+for line in sys.stdin:
+    f = line.rstrip('\n')
+    if not f:
+        continue
+    name = pathlib.PurePosixPath(f).name
+    excluded = False
+    for pat in patterns:
+        if not pat:
+            continue
+        if fnmatch.fnmatch(f, pat) or fnmatch.fnmatch(name, pat):
+            excluded = True
+            break
+        for part in pathlib.PurePosixPath(f).parts:
+            if fnmatch.fnmatch(part, pat):
+                excluded = True
+                break
+        if excluded:
+            break
+    if not excluded:
+        print(f)
+" "$GLOBAL_EXCLUDE_PATTERNS" 2>/dev/null) || true
+    if [[ -n "$filtered_csv" ]]; then
+      local filtered_files=()
+      while IFS= read -r f; do
+        [[ -n "$f" ]] && filtered_files+=("$f")
+      done <<<"$filtered_csv"
+      files=("${filtered_files[@]}")
+    else
+      files=()
+    fi
+  fi
+
   if [[ ${#files[@]} -eq 0 ]]; then
     say "${GREEN}${CHECK} No changed files to scan.${RESET}"
     exit 0

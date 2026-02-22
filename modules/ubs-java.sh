@@ -344,7 +344,7 @@ else
   GREP_RNW=("grep" "${GREP_R_OPTS[@]}" -n -w -E)
 fi
 
-count_lines() { awk 'END{print (NR+0)}'; }
+count_lines() { grep -v 'ubs:ignore' | awk 'END{print (NR+0)}'; }
 severity_allows() {
   declare -A rank=( [info]=1 [warning]=2 [critical]=3 )
   local s="$1"; local want="${MIN_SEVERITY}"
@@ -432,6 +432,7 @@ show_detailed_finding() {
   local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
   while IFS= read -r rawline; do
     [[ -z "$rawline" ]] && continue
+    [[ "$rawline" == *"ubs:ignore"* ]] && continue
     parse_grep_line "$rawline" || continue
     [[ -z "$PARSED_FILE" || -z "$PARSED_LINE" ]] && continue
     print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"; printed=$((printed+1))

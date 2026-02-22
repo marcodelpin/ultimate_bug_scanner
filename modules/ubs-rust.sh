@@ -594,7 +594,7 @@ else
   GREP_RNW=(ubs_grep -n -w -E)
 fi
 
-count_lines() { awk 'END{print (NR+0)}'; }
+count_lines() { grep -v 'ubs:ignore' | awk 'END{print (NR+0)}'; }
 
 maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 && "$QUIET" -eq 0 ]]; then clear || true; fi; }
 say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
@@ -672,6 +672,7 @@ show_detailed_finding() {
   local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
   while IFS= read -r rawline; do
     [[ -z "$rawline" ]] && continue
+    [[ "$rawline" == *"ubs:ignore"* ]] && continue
     parse_grep_line "$rawline" || continue
     print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
@@ -680,7 +681,7 @@ show_detailed_finding() {
 
 collect_samples_rg() {
   local pattern="$1"; local limit="${2:-$DETAIL_LIMIT}"
-  mapfile -t lines < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit")
+  mapfile -t lines < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | grep -v 'ubs:ignore' | head -n "$limit")
   printf '['; local i=0; for l in "${lines[@]}"; do [[ $i -gt 0 ]] && printf ','; printf '"%s"' "$(printf '%s' "$l" | json_escape)"; i=$((i+1)); done; printf ']'
 }
 
