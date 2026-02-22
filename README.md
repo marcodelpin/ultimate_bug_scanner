@@ -3,7 +3,7 @@
 
 ### **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 [![Version](https://img.shields.io/badge/version-5.0.6-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
@@ -2595,7 +2595,7 @@ ubs . --beads-jsonl=.beads/scan-results.jsonl
 
 ## 📜 **License**
 
-MIT License - see [LICENSE](LICENSE) file
+MIT License (with OpenAI/Anthropic Rider) — see [LICENSE](LICENSE) file
 
 **TL;DR:** Use it anywhere. Modify it. Share it. Commercial use OK. No restrictions.
 
