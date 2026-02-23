@@ -8,6 +8,22 @@
 # - Merges outputs (text/json/sarif) with jq
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Bail early on ancient bash (macOS ships bash 3.2 which lacks associative
+# arrays, `declare -A`, `readarray`, etc.).  Keep this check before `set -E`
+# so it works even under the stock /bin/bash.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "ERROR: UBS requires bash >= 4.0 (you have ${BASH_VERSION:-unknown})." >&2
+  echo "" >&2
+  echo "macOS ships bash 3.2 due to licensing.  Install a modern bash with:" >&2
+  echo "  brew install bash" >&2
+  echo "" >&2
+  echo "Then re-run this script with:  /opt/homebrew/bin/bash $0 \"\$@\"" >&2
+  echo "Or add /opt/homebrew/bin/bash to /etc/shells and chsh." >&2
+  exit 1
+fi
+
 set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
@@ -716,7 +732,22 @@ fi
 
 ensure_dir(){ mkdir -p "$1" 2>/dev/null || { say "${RED}$X cannot create $1${RESET}"; exit 1; }; }
 
-script_dir(){ local src="${BASH_SOURCE[0]}"; while [ -h "$src" ]; do local dir; dir="$(cd -P "$(dirname "$src")" && pwd)"; src="$(readlink "$src")"; [[ "$src" != /* ]] && src="$dir/$src"; done; cd -P "$(dirname "$src")" && pwd; }
+script_dir(){
+  # Resolve the real directory of this script, following symlinks.
+  # Critical for macOS Homebrew where /opt/homebrew/bin/ubs is a relative
+  # symlink (e.g. ../Cellar/ubs/5.0.7/bin/ubs).  We must resolve the
+  # relative target against the *symlink's* parent dir, not CWD.
+  local source="${BASH_SOURCE[0]}"
+  while [ -L "$source" ]; do
+    local dir
+    dir=$(cd -P "$(dirname "$source")" && pwd)
+    source=$(readlink "$source")
+    # If readlink returned a relative path, resolve it against the
+    # directory that contained the symlink we just read.
+    [[ "$source" != /* ]] && source="$dir/$source"
+  done
+  cd -P "$(dirname "$source")" && pwd
+}
 
 prepare_metrics_dir(){
   local dir="$1"
