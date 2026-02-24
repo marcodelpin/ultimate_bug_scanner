@@ -8,6 +8,22 @@
 # - Merges outputs (text/json/sarif) with jq
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Bail early on ancient bash (macOS ships bash 3.2 which lacks associative
+# arrays, `declare -A`, `readarray`, etc.).  Keep this check before `set -E`
+# so it works even under the stock /bin/bash.
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+  echo "ERROR: UBS requires bash >= 4.0 (you have ${BASH_VERSION:-unknown})." >&2
+  echo "" >&2
+  echo "macOS ships bash 3.2 due to licensing.  Install a modern bash with:" >&2
+  echo "  brew install bash" >&2
+  echo "" >&2
+  echo "Then re-run this script with:  /opt/homebrew/bin/bash $0 \"\$@\"" >&2
+  echo "Or add /opt/homebrew/bin/bash to /etc/shells and chsh." >&2
+  exit 1
+fi
+
 set -Eeuo pipefail
 shopt -s lastpipe || true
 trap '' SIGPIPE 2>/dev/null || true
@@ -18,14 +34,14 @@ MODULE_PATH_TEMPLATE="$REPO_RAW/modules/ubs-%s.sh"
 
 # Known-good module digests (sha256) for supply-chain verification.
 declare -A MODULE_CHECKSUMS=(
-  [cpp]='ac6a213e3cb8fc2eb24d18754c1e83c994c89149e5f690116d848c57548e6f28'
-  [golang]='b157d6e8f2684246c8add2a6cd0b3da698a8f3aace6e7c367ed76336e21ff4c6'
-  [java]='6b120bd6bd199d45e5f80d295888aeab10c1439abe064797047e776258b37256'
-  [js]='f92889318e794d96277f55d6dee9da3947c122786ee929d7eaf380d4332a38c0'
-  [python]='e7697af93a7a2b0e413ecb17bf878656ee92229a7fbe47c1fa77f779dd6c9a43'
-  [ruby]='3490a56a174f4873d01a83d4ceac8bdb7b6d56024c9aff25257af28c9d805405'
-  [rust]='5c0df5f4638cc18aca08b9bad263d677ccaa3b180670a4d47ebba1a071e782f0'
-  [swift]='b350c2ae42725f96a2c94eaf7c70ff4864ecae53e0fc7d9a3fee5988128c8a2a'
+  [cpp]='16193339dcb4b80ccab6b6a7906d092969133bdca86cf38ca2c80b320b00da44'
+  [golang]='eb647a33198514ee15e989bfc277e215263b1326e1a188b7d8bd68afde37b1b9'
+  [java]='6bf5710d2c970d1dbf9705ad1d28c7de19f7ea7c6c62eaf1f5ea599df574e35f'
+  [js]='2ef4321af6c25c8c3eeb8c23ec174e407585c1f5a76020788f67ad66ebb727c0'
+  [python]='dfa584639c21494ddf107ec4562c550798b2b97db15ff34e11c4694ec2b6fb11'
+  [ruby]='0351acfbab83ab86a339307d1f07493e26dd383238576959b1882aa7d1de9d6f'
+  [rust]='8c183151bf2416f9a4c98060a96d28dd2365e9d01a20c98852473ec6d6661784'
+  [swift]='1429436c7de226ef2302dc8860e9737a44cbf23028da97437a0c89baa6b7870b'
 )
 
 # Helper assets used by some modules (AST correlation and type narrowing).
@@ -44,6 +60,57 @@ declare -A HELPER_CHECKSUMS=(
 # ─────────────────────────────────────────────────────────────────────────────
 need_cmd(){ command -v "$1" >/dev/null 2>&1; }
 date_iso(){ if [[ "${CI_MODE:-0}" -eq 1 ]]; then date -u '+%Y-%m-%dT%H:%M:%SZ'; else date '+%Y-%m-%d %H:%M:%S'; fi; }
+json_escape(){
+  local s="${1:-}"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+load_ignore_patterns(){
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  if ! need_cmd python3; then
+    say "${YELLOW}${WARN}${RESET} python3 is required to parse ignore file $file (skipping)"
+    return 0
+  fi
+  local csv
+  csv=$(python3 - "$file" <<'PY' 2>/dev/null
+import sys, pathlib
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    sys.exit(0)
+patterns = []
+seen = set()
+for raw in path.read_text().splitlines():
+    stripped = raw.strip()
+    if not stripped or stripped.startswith('#'):
+        continue
+    stripped = stripped.rstrip('/')
+    if stripped.startswith('./'):
+        stripped = stripped[2:]
+    if not stripped or stripped in seen:
+        continue
+    seen.add(stripped)
+    patterns.append(stripped)
+print(",".join(patterns))
+PY
+)
+  csv="${csv//$'\n'/}"
+  csv="${csv%,}"
+  if [[ -n "$csv" ]]; then
+    if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
+      GLOBAL_EXCLUDE_PATTERNS="$GLOBAL_EXCLUDE_PATTERNS,$csv"
+    else
+      GLOBAL_EXCLUDE_PATTERNS="$csv"
+    fi
+    local human="${csv//,/ }"
+    say "${DIM}${INFO}${RESET} Ignoring paths from ${file} → ${human}"
+  fi
+}
 
 HELPER_ASSETS=(
   "helpers/resource_lifecycle_py.py"
@@ -82,13 +149,38 @@ else
 fi
 CHECK="✓"; WARN="⚠"; INFO="ℹ"; X="✗"
 say(){
-  if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "jsonl" || "${FORMAT:-text}" == "sarif" ]]; then
+  if [[ "${FORMAT:-text}" == "json" || "${FORMAT:-text}" == "jsonl" || "${FORMAT:-text}" == "sarif" || "${FORMAT:-text}" == "toon" ]]; then
     echo -e "$*" >&2
   else
     echo -e "$*"
   fi
 }
 say_err(){ echo -e "$*" >&2; }
+
+looks_like_toon_rust_encoder(){
+  local bin="${1:-}"
+  [[ -z "$bin" ]] && return 1
+  # Hard ban: never accept (or invoke) the Node.js encoder as the TOON backend.
+  local base="${bin##*/}"
+  if [[ "$base" == "toon" || "$base" == "toon.exe" ]]; then
+    return 1
+  fi
+
+  # `tru --help` begins with "TOON reference implementation in Rust (JSON <-> TOON)".
+  # `tru --version` prints "tru X.Y.Z".
+  local help ver
+  help="$("$bin" --help 2>&1 | head -n 5 || true)"
+  if [[ "$help" == *"TOON reference implementation in Rust"* ]]; then
+    return 0
+  fi
+
+  ver="$("$bin" --version 2>&1 | head -n 1 || true)"
+  if [[ "$ver" =~ ^tru[[:space:]][0-9] ]]; then
+    return 0
+  fi
+
+  return 1
+}
 
 print_with_permalinks(){
   local file="$1"
@@ -142,7 +234,11 @@ trap on_err ERR
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 PROJECT_DIR="."
-FORMAT="text"              # text|json|jsonl|sarif
+# Format precedence: CLI > UBS_OUTPUT_FORMAT > TOON_DEFAULT_FORMAT > "text"
+FORMAT="${UBS_OUTPUT_FORMAT:-${TOON_DEFAULT_FORMAT:-text}}"  # text|json|jsonl|sarif|toon
+# TOON encoder binary (default: tru from toon_rust; never use the Node.js `toon` CLI)
+# Resolution order: TOON_TRU_BIN > TOON_BIN > tru
+TOON_BIN="${TOON_TRU_BIN:-${TOON_BIN:-tru}}"
 CI_MODE=0
 FAIL_ON_WARNING=0
 VERBOSE=0
@@ -153,6 +249,7 @@ IGNORE_FILE=""
 DEFAULT_IGNORES="node_modules,venv,.venv,env,.env,site-packages,dist,build,vendor,target,bin,obj,.idea,.vscode,.git,.hg,.svn,__pycache__,.mypy_cache,.pytest_cache,.ruff_cache,coverage,.gradle,DerivedData,bundler,gems,wheels"
 # Safety guards: maximum directory size (MB) and whether to refuse home/root dirs
 MAX_DIR_SIZE_MB="${UBS_MAX_DIR_SIZE_MB:-1000}"  # 1GB default; set 0 to disable
+SKIP_SIZE_CHECK="${UBS_SKIP_SIZE_CHECK:-0}"
 REFUSE_HOME_ROOT="${UBS_REFUSE_HOME_ROOT:-1}"  # 1 = refuse, 0 = allow
 GLOBAL_EXCLUDE_PATTERNS="$DEFAULT_IGNORES"
 FILTERED_PROJECT_DIR=""
@@ -176,6 +273,7 @@ REPORT_JSON_PATH=""
 HTML_REPORT_PATH=""
 SHAREABLE_MODE=0
 GIT_MODE=""  # staged, diff, or empty
+SCAN_FILES=()  # explicit file list from --files or multiple positional args
 GIT_REMOTE_URL=""
 GIT_REMOTE_HTTP=""
 GIT_COMMIT_SHA=""
@@ -201,11 +299,13 @@ fi
 usage() {
   cat <<USAGE >&2
 Usage: ubs [options] [PROJECT_DIR]
+       ubs [options] FILE1 FILE2 ...
+       ubs --files FILE1,FILE2,... [options] [PROJECT_DIR]
        ubs doctor [options]
        ubs sessions [--entries N] [--raw]
 
 Options:
-  --format=FMT            text|json|jsonl|sarif (default: text)
+  --format=FMT            text|json|jsonl|sarif|toon (default: text)
   --version               Print version and exit
   --ci                    CI mode (stable timestamps)
   --fail-on-warning       Exit non-zero if warnings or critical exist
@@ -226,15 +326,24 @@ Options:
   --update-modules        Force re-download of modules before run
   --jobs=N                Parallelism hint (passed to children if supported)
   --ignore-file=PATH      Read additional ignore globs (default: PROJECT/.ubsignore if present)
+  --skip-size-check       Skip directory size guard (use with care)
   --skip-type-narrowing   Skip JS/Rust/Kotlin/Swift type narrowing checks (falls back to basic heuristics)
   --no-auto-update        Disable auto-update (even if UBS_ENABLE_AUTO_UPDATE=1)
   --staged                Scan only files staged for commit (git index)
   --diff, --git-diff      Scan only modified files (working tree vs HEAD)
+  --files=F1,F2,...       Scan only the listed files (comma or space separated)
   -h, --help              Show this help
 
 Environment Variables:
+  UBS_OUTPUT_FORMAT=FMT       Default output format (text|json|jsonl|sarif|toon)
+                              Overridden by --format CLI flag
+  TOON_DEFAULT_FORMAT=FMT     Global fallback format if UBS_OUTPUT_FORMAT not set
+  TOON_TRU_BIN=PATH           Explicit path to tru encoder (overrides TOON_BIN)
+  TOON_BIN=PATH               TOON encoder binary (default: tru)
+                              Set to a specific toon_rust encoder path if needed (do not use Node.js toon)
   UBS_MAX_DIR_SIZE_MB=N       Max directory size in MB before refusing to scan (default: 1000)
                               Set to 0 to disable this safety check
+  UBS_SKIP_SIZE_CHECK=1       Skip directory size guard entirely
   UBS_REFUSE_HOME_ROOT=0|1    Whether to refuse scanning \$HOME or / (default: 1)
                               Set to 0 to allow scanning these directories
 
@@ -242,10 +351,14 @@ Examples:
   ubs .                       # auto-detect languages and scan
   ubs --staged                # scan only staged files (pre-commit style)
   ubs --diff                  # scan only modified files (quick check)
+  ubs --files=a.js,b.py .     # scan specific files in current dir
+  ubs src/a.js src/b.py       # multiple positional args (same effect)
   ubs --format=json --ci .    # machine-readable combined JSON
+  ubs --format=toon .         # TOON format (~50% smaller than JSON)
   ubs --only=js,python .      # restrict language set
   ubs doctor --fix            # validate cached modules & redownload corrupted copies
   ubs sessions --entries 1    # view the most recent installer summary
+  UBS_OUTPUT_FORMAT=toon ubs .  # set default format via env var
   UBS_MAX_DIR_SIZE_MB=0 ubs . # disable size check for large directories
 USAGE
 }
@@ -400,6 +513,7 @@ else
       --suggest-ignore) SUGGEST_IGNORE=1; shift;;
       --jsonl-summary-only) JSONL_DETAIL=0; shift;;
       --ignore-file=*) IGNORE_FILE="${1#*=}"; shift;;
+      --skip-size-check) SKIP_SIZE_CHECK=1; shift;;
       --module-dir=*) MODULE_DIR="${1#*=}"; shift;;
       --module-dir)
         if [[ $# -lt 2 ]]; then usage; exit 2; fi
@@ -410,6 +524,10 @@ else
       --no-auto-update) export UBS_NO_AUTO_UPDATE=1; shift;;
       --staged) GIT_MODE="staged"; shift;;
       --diff|--git-diff) GIT_MODE="diff"; shift;;
+      --files=*) IFS=',' read -r -a _f <<<"${1#*=}"; SCAN_FILES+=("${_f[@]}"); shift;;
+      --files)
+        if [[ $# -lt 2 ]]; then usage; exit 2; fi
+        shift; IFS=',' read -r -a _f <<<"$1"; SCAN_FILES+=("${_f[@]}"); shift;;
       --profile=*)
         export UBS_PROFILE="${1#*=}"
         if [[ "$UBS_PROFILE" == "strict" ]]; then FAIL_ON_WARNING=1; fi
@@ -419,7 +537,17 @@ else
         shift;;
       -h|--help) usage; exit 0;;
       *)
-        if [[ "$PROJECT_DIR" == "." ]]; then PROJECT_DIR="$1"; else usage; exit 2; fi
+        if [[ "$PROJECT_DIR" == "." ]]; then
+          # First positional arg: could be a directory OR a file
+          if [[ -d "$1" ]]; then
+            PROJECT_DIR="$1"
+          else
+            SCAN_FILES+=("$1")
+          fi
+        else
+          # Additional positional args: accumulate as files
+          SCAN_FILES+=("$1")
+        fi
         shift;;
     esac
   done
@@ -447,6 +575,16 @@ else
 fi
 SOURCE_PROJECT_DIR="$PROJECT_DIR"
 
+# Load ignore patterns early so size checks can respect .ubsignore
+if [[ "$MODE" != "doctor" && "$UPDATE_ONLY" -eq 0 ]]; then
+  if [[ -z "$IGNORE_FILE" && -f "$SOURCE_PROJECT_DIR/.ubsignore" ]]; then
+    IGNORE_FILE="$SOURCE_PROJECT_DIR/.ubsignore"
+  fi
+  if [[ -n "$IGNORE_FILE" ]]; then
+    load_ignore_patterns "$IGNORE_FILE"
+  fi
+fi
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Safety guards: prevent disk exhaustion when scanning large or sensitive dirs
 # Fixes GitHub issue #12: UBS copies entire scan directory to /tmp
@@ -469,26 +607,92 @@ if [[ "$REFUSE_HOME_ROOT" -eq 1 && -d "$SOURCE_PROJECT_DIR" ]]; then
   fi
 fi
 
-# Check 2: Refuse directories larger than MAX_DIR_SIZE_MB (unless set to 0)
-if [[ "$MAX_DIR_SIZE_MB" -gt 0 && -d "$SOURCE_PROJECT_DIR" ]]; then
-  dir_size_mb=0
+dir_size_mb_filtered(){
+  local dir="$1"
+  local patterns_csv="${2:-}"
+  local result=""
+  local du_can_exclude=0
   if need_cmd du; then
-    # Use du -sm for POSIX-ish systems; fall back to du -sk on others
-    # Carefully validate output is numeric before using it
-    result=""
-    result=$(du -sm "$SOURCE_PROJECT_DIR" 2>/dev/null | cut -f1)
-    if [[ "$result" =~ ^[0-9]+$ ]]; then
-      dir_size_mb="$result"
-    else
-      # Fallback for systems where -m flag doesn't work
-      result=$(du -sk "$SOURCE_PROJECT_DIR" 2>/dev/null | cut -f1)
+    local -a du_args=()
+    if [[ -n "$patterns_csv" ]] && du --help 2>/dev/null | grep -q -- '--exclude'; then
+      du_can_exclude=1
+      local -a pats=()
+      IFS=',' read -r -a pats <<<"$patterns_csv"
+      for pat in "${pats[@]}"; do
+        [[ -n "$pat" ]] && du_args+=( "--exclude=$pat" )
+      done
+    fi
+    # Only use du when no patterns are needed or du supports --exclude;
+    # otherwise fall through to the Python fallback which handles exclusions
+    # correctly on all platforms (fixes macOS/BSD du which lacks --exclude).
+    if [[ -z "$patterns_csv" || "$du_can_exclude" -eq 1 ]]; then
+      result=$(du -sm "${du_args[@]}" "$dir" 2>/dev/null | cut -f1)
       if [[ "$result" =~ ^[0-9]+$ ]]; then
-        dir_size_mb=$((result / 1024))
+        echo "$result"
+        return 0
+      fi
+      result=$(du -sk "${du_args[@]}" "$dir" 2>/dev/null | cut -f1)
+      if [[ "$result" =~ ^[0-9]+$ ]]; then
+        echo $((result / 1024))
+        return 0
       fi
     fi
   fi
+  if need_cmd python3; then
+    python3 - "$dir" "$patterns_csv" <<'PY'
+import fnmatch
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+patterns_csv = sys.argv[2] if len(sys.argv) > 2 else ""
+patterns = [p for p in patterns_csv.split(",") if p]
+
+def excluded(rel_path, name):
+    for pat in patterns:
+        if fnmatch.fnmatch(rel_path, pat) or fnmatch.fnmatch(name, pat):
+            return True
+        for part in pathlib.Path(rel_path).parts:
+            if fnmatch.fnmatch(part, pat):
+                return True
+    return False
+
+total = 0
+for base, dirs, files in os.walk(root, topdown=True):
+    rel_root = os.path.relpath(base, root)
+    pruned = []
+    for d in dirs:
+        rel = os.path.join(rel_root, d) if rel_root != "." else d
+        if excluded(rel, d):
+            continue
+        pruned.append(d)
+    dirs[:] = pruned
+
+    for f in files:
+        rel = os.path.join(rel_root, f) if rel_root != "." else f
+        if excluded(rel, f):
+            continue
+        try:
+            total += (pathlib.Path(base) / f).stat().st_size
+        except OSError:
+            pass
+
+print(int(total / 1024 / 1024))
+PY
+    return 0
+  fi
+  echo "0"
+}
+
+# Check 2: Refuse directories larger than MAX_DIR_SIZE_MB (unless set to 0)
+if [[ "$SKIP_SIZE_CHECK" -eq 0 && "$MAX_DIR_SIZE_MB" -gt 0 && -d "$SOURCE_PROJECT_DIR" ]]; then
+  dir_size_mb="$(dir_size_mb_filtered "$SOURCE_PROJECT_DIR" "$GLOBAL_EXCLUDE_PATTERNS")"
+  if [[ "${QUIET:-0}" -eq 0 ]]; then
+    say "${DIM}${INFO}${RESET} Scan size after ignores: ${dir_size_mb}MB (limit ${MAX_DIR_SIZE_MB}MB)"
+  fi
   if [[ "$dir_size_mb" -gt "$MAX_DIR_SIZE_MB" ]]; then
-    say "${RED}${X}${RESET} ${BOLD}Directory too large${RESET}: ${dir_size_mb}MB exceeds limit of ${MAX_DIR_SIZE_MB}MB"
+    say "${RED}${X}${RESET} ${BOLD}Directory too large (after ignores)${RESET}: ${dir_size_mb}MB exceeds limit of ${MAX_DIR_SIZE_MB}MB"
     say "${DIM}UBS copies the scan target to /tmp before analysis, which can exhaust disk space.${RESET}"
     say "${DIM}This safety check prevents accidental scans of large directories like \$HOME.${RESET}"
     say ""
@@ -528,7 +732,22 @@ fi
 
 ensure_dir(){ mkdir -p "$1" 2>/dev/null || { say "${RED}$X cannot create $1${RESET}"; exit 1; }; }
 
-script_dir(){ local src="${BASH_SOURCE[0]}"; while [ -h "$src" ]; do src="$(readlink "$src")"; done; cd -P "$(dirname "$src")" && pwd; }
+script_dir(){
+  # Resolve the real directory of this script, following symlinks.
+  # Critical for macOS Homebrew where /opt/homebrew/bin/ubs is a relative
+  # symlink (e.g. ../Cellar/ubs/5.0.7/bin/ubs).  We must resolve the
+  # relative target against the *symlink's* parent dir, not CWD.
+  local source="${BASH_SOURCE[0]}"
+  while [ -L "$source" ]; do
+    local dir
+    dir=$(cd -P "$(dirname "$source")" && pwd)
+    source=$(readlink "$source")
+    # If readlink returned a relative path, resolve it against the
+    # directory that contained the symlink we just read.
+    [[ "$source" != /* ]] && source="$dir/$source"
+  done
+  cd -P "$(dirname "$source")" && pwd
+}
 
 prepare_metrics_dir(){
   local dir="$1"
@@ -591,48 +810,6 @@ resolve_git_metadata(){
   esac
 }
 
-load_ignore_patterns(){
-  local file="$1"
-  [[ -f "$file" ]] || return 0
-  if ! need_cmd python3; then
-    say "${YELLOW}${WARN}${RESET} python3 is required to parse ignore file $file (skipping)"
-    return 0
-  fi
-  local csv
-  csv=$(python3 - "$file" <<'PY' 2>/dev/null
-import sys, pathlib
-path = pathlib.Path(sys.argv[1])
-if not path.exists():
-    sys.exit(0)
-patterns = []
-seen = set()
-for raw in path.read_text().splitlines():
-    stripped = raw.strip()
-    if not stripped or stripped.startswith('#'):
-        continue
-    stripped = stripped.rstrip('/')
-    if stripped.startswith('./'):
-        stripped = stripped[2:]
-    if not stripped or stripped in seen:
-        continue
-    seen.add(stripped)
-    patterns.append(stripped)
-print(",".join(patterns))
-PY
-)
-  csv="${csv//$'\n'/}"
-  csv="${csv%,}"
-  if [[ -n "$csv" ]]; then
-    if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" ]]; then
-      GLOBAL_EXCLUDE_PATTERNS="$GLOBAL_EXCLUDE_PATTERNS,$csv"
-    else
-      GLOBAL_EXCLUDE_PATTERNS="$csv"
-    fi
-    local human="${csv//,/ }"
-    say "${DIM}${INFO}${RESET} Ignoring paths from ${file} → ${human}"
-  fi
-}
-
 prepare_git_workspace(){
   local mode="$1"
   if ! need_cmd git; then
@@ -682,7 +859,46 @@ prepare_git_workspace(){
   else
     files=("${raw_files[@]}")
   fi
-  
+
+  # Apply .ubsignore / GLOBAL_EXCLUDE_PATTERNS filtering to the staged file list
+  # so that ignored paths are never copied into the shadow workspace.
+  if [[ -n "$GLOBAL_EXCLUDE_PATTERNS" && ${#files[@]} -gt 0 ]] && need_cmd python3; then
+    local filtered_csv
+    filtered_csv=$(printf '%s\n' "${files[@]}" | python3 -c "
+import sys, fnmatch, pathlib
+patterns = sys.argv[1].split(',')
+for line in sys.stdin:
+    f = line.rstrip('\n')
+    if not f:
+        continue
+    name = pathlib.PurePosixPath(f).name
+    excluded = False
+    for pat in patterns:
+        if not pat:
+            continue
+        if fnmatch.fnmatch(f, pat) or fnmatch.fnmatch(name, pat):
+            excluded = True
+            break
+        for part in pathlib.PurePosixPath(f).parts:
+            if fnmatch.fnmatch(part, pat):
+                excluded = True
+                break
+        if excluded:
+            break
+    if not excluded:
+        print(f)
+" "$GLOBAL_EXCLUDE_PATTERNS" 2>/dev/null) || true
+    if [[ -n "$filtered_csv" ]]; then
+      local filtered_files=()
+      while IFS= read -r f; do
+        [[ -n "$f" ]] && filtered_files+=("$f")
+      done <<<"$filtered_csv"
+      files=("${filtered_files[@]}")
+    else
+      files=()
+    fi
+  fi
+
   if [[ ${#files[@]} -eq 0 ]]; then
     say "${GREEN}${CHECK} No changed files to scan.${RESET}"
     exit 0
@@ -709,6 +925,71 @@ prepare_git_workspace(){
     say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
   else
     say "${RED}$X Failed to prepare shadow workspace${RESET}"
+    exit 1
+  fi
+}
+
+# Copy an explicit list of files (from --files or multiple positional args)
+# into a shadow workspace so the rest of the pipeline scans only those files.
+prepare_files_workspace(){
+  local scan_root="$SOURCE_PROJECT_DIR"
+  if [[ -f "$scan_root" ]]; then
+    scan_root="$(dirname "$scan_root")"
+  fi
+
+  # Resolve each path relative to scan_root; reject missing files
+  local resolved=()
+  local f rel
+  for f in "${SCAN_FILES[@]}"; do
+    [[ -z "$f" ]] && continue
+    if [[ "$f" == /* ]]; then
+      # Absolute path — make it relative to scan_root
+      if [[ -f "$f" ]]; then
+        rel="${f#"$scan_root"/}"
+        resolved+=("$rel")
+      else
+        say "${RED}$X file not found${RESET}: $f"
+        exit 2
+      fi
+    elif [[ -f "$scan_root/$f" ]]; then
+      resolved+=("$f")
+    elif [[ -f "$f" ]]; then
+      # Relative to cwd, convert to relative to scan_root
+      local abs
+      abs="$(cd "$(dirname "$f")" && pwd -P)/$(basename "$f")"
+      rel="${abs#"$scan_root"/}"
+      resolved+=("$rel")
+    else
+      say "${RED}$X file not found${RESET}: $f"
+      exit 2
+    fi
+  done
+
+  if [[ ${#resolved[@]} -eq 0 ]]; then
+    say "${RED}$X --files: no valid files specified${RESET}"
+    exit 2
+  fi
+
+  if ! need_cmd rsync; then
+    say "${RED}$X rsync not found; required for --files${RESET}"
+    exit 1
+  fi
+
+  local dest="$TMPDIR_RUN/files_scan"
+  rm -rf "$dest" 2>/dev/null || true
+  ensure_dir "$dest"
+
+  say "${BLUE}${INFO} Preparing shadow workspace for ${#resolved[@]} specified file(s)${RESET}"
+
+  local file_list="$TMPDIR_RUN/explicit_files.txt"
+  printf "%s\n" "${resolved[@]}" > "$file_list"
+
+  if rsync -a --files-from="$file_list" "$scan_root/" "$dest/" >/dev/null 2>&1; then
+    FILTERED_PROJECT_DIR="$dest"
+    PROJECT_DIR="$FILTERED_PROJECT_DIR"
+    say "${DIM}${INFO}${RESET} Scanning shadow workspace at ${FILTERED_PROJECT_DIR}"
+  else
+    say "${RED}$X Failed to prepare files workspace${RESET}"
     exit 1
   fi
 }
@@ -848,7 +1129,10 @@ ensure_ast_grep_tool_cache(){
   if [[ "$need_download" -eq 1 ]]; then
     [[ "${QUIET:-0}" -eq 0 ]] && say_err "${DIM}${INFO}${RESET} Downloading ast-grep ${AST_GREP_VERSION} (${target})..."
     local tmp_zip
-    tmp_zip="$(mktemp -t ubs-ast-grep.XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/ubs-ast-grep.XXXXXX" 2>/dev/null)"
+    tmp_zip="$(mktemp -t ubs-ast-grep.XXXXXX 2>/dev/null || mktemp "${TMPDIR:-/tmp}/ubs-ast-grep.XXXXXX" 2>/dev/null)" || {
+      say_err "${RED}$X failed to create temp file for module download${RESET}"
+      return 1
+    }
     if ! download_url_to_file "$url" "$tmp_zip"; then
       say_err "${RED}${X}${RESET} failed to download ast-grep: $url"
       say_err "${DIM}Install ast-grep manually (https://ast-grep.github.io/) or re-run install.sh.${RESET}"
@@ -1432,34 +1716,25 @@ if [[ "$MODE" == "sessions" ]]; then
   exit 0
 fi
 
-if [[ "$MODE" != "doctor" && "$UPDATE_ONLY" -eq 0 ]]; then
-  if [[ -z "$IGNORE_FILE" && -f "$SOURCE_PROJECT_DIR/.ubsignore" ]]; then
-    IGNORE_FILE="$SOURCE_PROJECT_DIR/.ubsignore"
-  fi
-  if [[ -n "$IGNORE_FILE" ]]; then
-    load_ignore_patterns "$IGNORE_FILE"
-  fi
-fi
-
 # Detectors (fast ripgrep if available, else find)
 detect_lang(){
   local lang="$1" found=1
   case "$lang" in
     js)
       if need_cmd rg; then
-        rg -q --hidden -g '!node_modules/**' -g '!dist/**' -g '!build/**' -g '!coverage/**' -g '!*.min.*' \
+        rg -q --hidden -g '!node_modules/**' -g '!dist/**' -g '!build/**' -g '!coverage/**' -g '!*.min.*' -g '!venv/**' -g '!.venv/**' \
            -g '*.{js,jsx,ts,tsx,mjs,cjs}' -g 'package.json' . "$PROJECT_DIR" 2>/dev/null && found=0
       else
-        find "$PROJECT_DIR" \( -name node_modules -o -name dist -o -name build -o -name coverage -o -name .git \) -prune -o \
+        find "$PROJECT_DIR" \( -name node_modules -o -name dist -o -name build -o -name coverage -o -name venv -o -name .venv -o -name .git \) -prune -o \
           -type f \( -name '*.js' -o -name '*.jsx' -o -name '*.ts' -o -name '*.tsx' -o -name '*.mjs' -o -name '*.cjs' -o -name 'package.json' \) -print -quit 2>/dev/null | grep -q . && found=0
       fi
       ;;
     python)
       if need_cmd rg; then
-        rg -q --hidden -g '!venv/**' -g '!**/__pycache__/**' -g '!build/**' -g '!dist/**' \
+        rg -q --hidden -g '!venv/**' -g '!.venv/**' -g '!**/__pycache__/**' -g '!build/**' -g '!dist/**' \
            -g '*.py' -g 'pyproject.toml' -g 'requirements.txt' -g 'setup.py' . "$PROJECT_DIR" 2>/dev/null && found=0
       else
-        find "$PROJECT_DIR" \( -name venv -o -name __pycache__ -o -name build -o -name dist -o -name .git \) -prune -o \
+        find "$PROJECT_DIR" \( -name venv -o -name .venv -o -name __pycache__ -o -name build -o -name dist -o -name .git \) -prune -o \
           -type f \( -name '*.py' -o -name 'pyproject.toml' -o -name 'requirements.txt' -o -name 'setup.py' \) -print -quit 2>/dev/null | grep -q . && found=0
       fi
       ;;
@@ -1867,6 +2142,8 @@ fi
 
 if [[ -n "$GIT_MODE" ]]; then
   prepare_git_workspace "$GIT_MODE"
+elif [[ ${#SCAN_FILES[@]} -gt 0 ]]; then
+  prepare_files_workspace
 fi
 
 # Build selected language set
@@ -1925,7 +2202,7 @@ run_lang(){
   args+=("$PROJECT_DIR")
 
   case "$fmt" in
-    json|jsonl)
+    json|jsonl|toon)
       prepare_metrics_dir "$metrics_dir"
       local -a report_args=()
       if [[ "$lang" == "js" ]]; then
@@ -2025,7 +2302,8 @@ parse_text_to_json(){
       | head -n1 || true)
   fi
   critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; files=${files:-0}
-  local proj_display="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  local proj_display
+  proj_display="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
   cat >"$json" <<JSON
 {"language":"$lang","project":"$proj_display","files":$files,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
 JSON
@@ -2082,14 +2360,18 @@ SARIF
 parse_sarif_to_json(){
   local lang="$1" sarif="$2" json="$3"
   [[ -f "$sarif" ]] || return 1
-  if ! need_cmd jq; then return 1; fi
+  if ! need_cmd jq; then
+    say "${YELLOW}${WARN}${RESET} jq not available; cannot parse SARIF"
+    return 1
+  fi
   local critical warning info files
   critical=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "error")] | length' "$sarif" 2>/dev/null || echo 0)
   warning=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "warning")] | length' "$sarif" 2>/dev/null || echo 0)
   info=$(jq '[.runs[]?.results[]? | select((.level // "warning") == "note")] | length' "$sarif" 2>/dev/null || echo 0)
   files=$(jq '[.runs[]?.results[]?.locations[]?.physicalLocation?.artifactLocation?.uri?] | unique | length' "$sarif" 2>/dev/null || echo 0)
   critical=${critical:-0}; warning=${warning:-0}; info=${info:-0}; files=${files:-0}
-  local proj_display="${SOURCE_PROJECT_DIR:-$PROJECT_DIR}"
+  local proj_display
+  proj_display="$(json_escape "${SOURCE_PROJECT_DIR:-$PROJECT_DIR}")"
   cat >"$json" <<JSON
 {"language":"$lang","project":"$proj_display","files":$files,"critical":$critical,"warning":$warning,"info":$info,"timestamp":"$(date_iso)"}
 JSON
@@ -2330,7 +2612,7 @@ if [[ " ${langs[*]} " == *" js "* ]]; then
   else
     say_err "${RED}${X}${RESET} Environment error: ast-grep is required for accurate JS/TS scanning."
     say_err "${DIM}Fix: install ast-grep (https://ast-grep.github.io/) or run the UBS installer.${RESET}"
-    if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" ]]; then
+    if [[ "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "toon" ]]; then
       printf '{"error":"environment","exit_code":2,"failed_modules":["js"]}\n'
     fi
     exit 2
@@ -2380,16 +2662,6 @@ done
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment error handling (exit code 2)
 # ─────────────────────────────────────────────────────────────────────────────
-json_escape(){
-  local s="${1:-}"
-  s=${s//\\/\\\\}
-  s=${s//\"/\\\"}
-  s=${s//$'\n'/\\n}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\t'/\\t}
-  printf '%s' "$s"
-}
-
 env_error_excerpt(){
   local lang="$1"
   local err_file="$TMPDIR_RUN/$lang.err"
@@ -2473,6 +2745,45 @@ case "$FORMAT" in
       merge_sarif_runs
     fi
     ;;
+  toon)
+    if [[ "$HAS_ENV_ERROR" -eq 1 ]]; then
+      emit_env_error_report
+      emit_env_error_json
+      status=2
+    else
+      # Check if TOON encoder is available (UBS_TEST_FORCE_NO_TOON=1 forces fallback for testing)
+      # TOON_BIN can be set to toon_rust's tru binary for better performance
+      toon_skip_reason=""
+      if [[ "${UBS_TEST_FORCE_NO_TOON:-0}" == "1" ]]; then
+        toon_skip_reason="disabled by UBS_TEST_FORCE_NO_TOON=1"
+      elif ! command -v "$TOON_BIN" >/dev/null 2>&1; then
+        toon_skip_reason="not found in PATH"
+      elif ! looks_like_toon_rust_encoder "$TOON_BIN"; then
+        toon_skip_reason="does not appear to be toon_rust (expected tru)"
+      fi
+
+      if [[ -z "$toon_skip_reason" ]]; then
+        if generate_combined_json; then
+          "$TOON_BIN" --encode < "$COMBINED_JSON_FILE"
+        else
+          if ! merge_json_scanners | "$TOON_BIN" --encode; then
+            say "${RED}$X could not produce TOON output${RESET}"
+            [[ "$status" -lt 1 ]] && status=1
+          fi
+        fi
+      else
+        say_err "${YELLOW}Warning: $TOON_BIN (TOON encoder) $toon_skip_reason; falling back to --format=json${RESET}"
+        if generate_combined_json; then
+          cat "$COMBINED_JSON_FILE"
+        else
+          if ! merge_json_scanners; then
+            say "${RED}$X could not produce combined JSON${RESET}"
+            [[ "$status" -lt 1 ]] && status=1
+          fi
+        fi
+      fi
+    fi
+    ;;
   text|*)
     for L in "${langs[@]}"; do
       say "\n${MAGENTA}${BOLD}──────── $L ────────${RESET}"
@@ -2507,7 +2818,7 @@ case "$FORMAT" in
         warn=$(printf '%s' "$totals" | jq -r '.warning')
         desired=0
         if [[ "$FAIL_ON_WARNING" -eq 1 && $((crit+warn)) -gt 0 ]]; then desired=1; fi
-        if [[ "$FAIL_ON_WARNING" -eq 0 && $crit -gt 0 ]]; then desired=1; fi
+        if [[ "$FAIL_ON_WARNING" -eq 0 && "$crit" -gt 0 ]]; then desired=1; fi
         if [[ "$desired" -gt "$status" ]]; then status="$desired"; fi
       fi
     fi
@@ -2517,7 +2828,7 @@ case "$FORMAT" in
 	# Ensure exit status reflects merged totals in machine formats too.
 	# Some modules emit machine output but always exit 0; the meta-runner should still fail
 	# when critical findings exist (or warnings in --fail-on-warning mode).
-	if [[ "$HAS_ENV_ERROR" -eq 0 && ( "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" ) ]]; then
+	if [[ "$HAS_ENV_ERROR" -eq 0 && ( "$FORMAT" == "json" || "$FORMAT" == "jsonl" || "$FORMAT" == "sarif" || "$FORMAT" == "toon" ) ]]; then
 	  if need_cmd jq && generate_combined_json; then
 	    crit=$(jq -r '.totals.critical // 0' "$COMBINED_JSON_FILE" 2>/dev/null || echo 0)
 	    warn=$(jq -r '.totals.warning // 0' "$COMBINED_JSON_FILE" 2>/dev/null || echo 0)
@@ -2533,7 +2844,10 @@ case "$FORMAT" in
 	  [[ -n "$BEADS_JSONL_PATH" ]] && say_err "${YELLOW}${WARN}${RESET} Skipping Beads JSONL export due to environment error."
 	  [[ -n "$REPORT_JSON_PATH" || -n "$HTML_REPORT_PATH" || -n "$COMPARISON_FILE" ]] \
     && say_err "${YELLOW}${WARN}${RESET} Skipping shareable artifacts due to environment error."
-elif [[ -n "$BEADS_JSONL_PATH" ]]; then
+	  exit "$status"
+	fi
+
+if [[ -n "$BEADS_JSONL_PATH" ]]; then
   if ! write_jsonl_summary "$BEADS_JSONL_PATH"; then
     say "${YELLOW}${WARN}${RESET} Could not write Beads JSONL to $BEADS_JSONL_PATH"
   else

@@ -325,6 +325,7 @@ show_detailed_finding() {
   local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
   while IFS= read -r rawline; do
     [[ -z "$rawline" ]] && continue
+    [[ "$rawline" == *"ubs:ignore"* ]] && continue
     parse_grep_line "$rawline" || continue
     print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
@@ -372,7 +373,7 @@ abspath() { perl -MCwd=abs_path -e 'print abs_path(shift)' -- "$1" 2>/dev/null |
 import os,sys; print(os.path.abspath(sys.argv[1]))
 PY
 }
-count_lines() { awk 'END{print (NR>0?NR:0)}'; }
+count_lines() { grep -v 'ubs:ignore' | awk 'END{print (NR>0?NR:0)}'; }
 
 LC_ALL=C
 IFS=',' read -r -a _EXT_ARR <<<"$INCLUDE_EXT"

@@ -358,7 +358,7 @@ else
 fi
 
 # Helper: robust numeric end-of-pipeline counter; never emits 0\n0
-count_lines() { awk 'END{print (NR+0)}'; }
+count_lines() { grep -v 'ubs:ignore' | awk 'END{print (NR+0)}'; }
 
 # Escape a string for JSON (minimal; mirrors ubs runner).
 json_escape(){
@@ -612,6 +612,7 @@ show_detailed_finding() {
   local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
   while IFS= read -r rawline; do
     [[ -z "$rawline" ]] && continue
+    [[ "$rawline" == *"ubs:ignore"* ]] && continue
     parse_grep_line "$rawline" || continue
     print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break

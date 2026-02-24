@@ -24,6 +24,10 @@ temp/
 *.tmp
 .bv/
 
+# Beads ephemeral files
+.beads/last-touched
+.beads/.bv.lock
+
 # Python environments
 .venv/
 __pycache__/
@@ -37,3 +41,23 @@ Cargo.lock
 
 # Test artifacts
 test-suite/artifacts/
+
+# Compiled test artifacts
+a.out
+
+# Bead dump exports (dated ephemeral reports)
+*_bead_dump_*.txt
+
+# Beads history snapshots
+.beads/.br_history/
+
+# Profiling data
+perf.data
+perf.data.*
+
+# Local scratch DBs
+storage.sqlite3
+storage.sqlite3-*
+
+# bv graph output
+--graph-format.svg

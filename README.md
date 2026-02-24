@@ -1,9 +1,13 @@
 
 # 🔬 Ultimate Bug Scanner v5.0
 
+<div align="center">
+  <img src="ubs_illustration.webp" alt="Ultimate Bug Scanner - The AI Coding Agent's Secret Weapon">
+</div>
+
 ### **The AI Coding Agent's Secret Weapon: Flagging Likely Bugs for Fixing Early On**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-blue.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 [![Version](https://img.shields.io/badge/version-5.0.6-blue.svg)](https://github.com/Dicklesworthstone/ultimate_bug_scanner)
 
@@ -37,6 +41,26 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_sca
 Note: Windows users must run the installer one-liner from within Git Bash, or use WSL for Windows. 
 
 </div>
+
+---
+
+## 🤖 Agent Quickstart (JSON/TOON)
+
+**Use machine-readable output in agent contexts.** stdout = data, stderr = diagnostics, exit 0 = success.
+
+```bash
+# Scan current repo (JSON)
+ubs . --format=json
+
+# Token-optimized output (TOON)
+ubs . --format=toon
+
+# Scan only staged changes
+ubs --staged --format=json
+
+# CI-strict (fail on warnings)
+ubs . --profile=strict --fail-on-warning --format=json
+```
 
 ## 💥 **The Problem: AI Moves Fast, Bugs Move Faster**
 
@@ -79,7 +103,7 @@ const zipCode = parseInt(userInput);  // 💥 "08" becomes 0 in old browsers (oc
 
 ### 🧠 Language-Aware Meta-Runner
 - `ubs` auto-detects **JavaScript/TypeScript, Python, C/C++, Rust, Go, Java, Ruby, and Swift** in the same repo and fans out to per-language scanners.
-- Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif` for consistent downstream tooling.
+- Each scanner lives under `modules/ubs-<lang>.sh`, ships independently, and supports `--format text|json|jsonl|sarif|toon` for consistent downstream tooling.
 - Modules download lazily (PATH → repo `modules/` → cached under `${XDG_DATA_HOME:-$HOME/.local/share}/ubs/modules`) and are validated before execution.
 - Results from every language merge into one text/JSON/SARIF report via `jq`, so CI systems and AI agents only have to parse a single artifact.
 
@@ -163,6 +187,7 @@ ubs --profile=loose    # Skip TODO/debug/code-quality nits when prototyping
 # Machine-readable output
 ubs . --format=json    # Pure JSON on stdout; logs go to stderr
 ubs . --format=jsonl   # Line-delimited summary per scanner + totals
+ubs . --format=toon    # TOON format (~50% smaller than JSON, LLM-optimized)
 ubs . --format=jsonl --beads-jsonl out/findings.jsonl  # Save JSONL for Beads/"strung"
 ```
 
@@ -172,7 +197,25 @@ ubs . --format=jsonl --beads-jsonl out/findings.jsonl  # Save JSONL for Beads/"s
 
 ## 🚀 **Quick Install (30 Seconds)**
 
-### **Option 1: Automated Install (Recommended)**
+### **Recommended: Homebrew (macOS/Linux)**
+
+```bash
+brew install dicklesworthstone/tap/ubs
+```
+
+This method provides:
+- Automatic updates via `brew upgrade`
+- Dependency management
+- Easy uninstall via `brew uninstall`
+
+### **Windows: Scoop**
+
+```powershell
+scoop bucket add dicklesworthstone https://github.com/Dicklesworthstone/scoop-bucket
+scoop install dicklesworthstone/ubs
+```
+
+### **Alternative: Automated Install**
 
 ```bash
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/master/install.sh?$(date +%s)" | bash
@@ -918,7 +961,7 @@ Git Integration:
   --diff, --git-diff       Scan only modified files (working tree vs HEAD)
 
 Output Control:
-  --format=FMT             Output format: text|json|jsonl|sarif (default: text)
+  --format=FMT             Output format: text|json|jsonl|sarif|toon (default: text)
   --beads-jsonl=FILE      Write JSONL summary alongside normal output for Beads/"strung"
   --no-color               Force disable ANSI colors
   OUTPUT_FILE              Save report to file (auto-tees to stdout)
@@ -930,6 +973,7 @@ File Selection:
                            Ruby: rb,rake,ru | Custom: --include-ext=js,ts,vue
   --exclude=GLOB[,...]     Additional paths to exclude (comma-separated)
                            Example: --exclude=legacy (deps ignored by default)
+  --skip-size-check        Skip directory size guard (use with care)
 
 Performance:
   --jobs=N                 Parallel jobs for ripgrep (default: auto-detect cores)
@@ -948,6 +992,8 @@ Environment Variables:
   JOBS                     Same as --jobs=N
   NO_COLOR                 Disable colors (respects standard)
   CI                       Enable CI mode automatically
+  UBS_MAX_DIR_SIZE_MB      Max directory size in MB before refusing to scan (default: 1000)
+  UBS_SKIP_SIZE_CHECK      Skip directory size guard entirely (set to 1)
 
 Arguments:
   PROJECT_DIR              Directory to scan (default: current directory)
@@ -959,6 +1005,12 @@ Exit Codes:
   1                        Warnings found (only with --fail-on-warning)
   2                        Invalid arguments or environment error (e.g., missing ast-grep for JS/TS)
 ```
+
+**Directory size guard**
+
+UBS computes scan size **after ignore filters** (defaults + `.ubsignore`) and prints:
+`Scan size after ignores: XMB (limit YMB)` before enforcing the limit. Override via
+`UBS_MAX_DIR_SIZE_MB` or `UBS_SKIP_SIZE_CHECK=1`, or pass `--skip-size-check`.
 
 ### Environment errors (exit 2)
 
@@ -1009,6 +1061,10 @@ ubs --jobs=16 .  # Explicit core count
 
 # Exclude vendor code
 ubs . --exclude=node_modules,vendor,dist,build
+
+# Large directories (size guard)
+UBS_MAX_DIR_SIZE_MB=5000 ubs .
+UBS_SKIP_SIZE_CHECK=1 ubs .
 
 # Custom rules directory
 ubs . --rules=~/.config/ubs/custom-rules
@@ -2543,7 +2599,7 @@ ubs . --beads-jsonl=.beads/scan-results.jsonl
 
 ## 📜 **License**
 
-MIT License - see [LICENSE](LICENSE) file
+MIT License (with OpenAI/Anthropic Rider) — see [LICENSE](LICENSE) file
 
 **TL;DR:** Use it anywhere. Modify it. Share it. Commercial use OK. No restrictions.
 

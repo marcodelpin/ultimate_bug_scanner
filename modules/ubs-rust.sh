@@ -594,7 +594,7 @@ else
   GREP_RNW=(ubs_grep -n -w -E)
 fi
 
-count_lines() { awk 'END{print (NR+0)}'; }
+count_lines() { grep -v 'ubs:ignore' | awk 'END{print (NR+0)}'; }
 
 maybe_clear() { if [[ -t 1 && "$CI_MODE" -eq 0 && "$QUIET" -eq 0 ]]; then clear || true; fi; }
 say() { [[ "$QUIET" -eq 1 ]] && return 0; echo -e "$*"; }
@@ -672,6 +672,7 @@ show_detailed_finding() {
   local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
   while IFS= read -r rawline; do
     [[ -z "$rawline" ]] && continue
+    [[ "$rawline" == *"ubs:ignore"* ]] && continue
     parse_grep_line "$rawline" || continue
     print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
@@ -680,7 +681,7 @@ show_detailed_finding() {
 
 collect_samples_rg() {
   local pattern="$1"; local limit="${2:-$DETAIL_LIMIT}"
-  mapfile -t lines < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | head -n "$limit")
+  mapfile -t lines < <("${GREP_RN[@]}" -e "$pattern" "$PROJECT_DIR" 2>/dev/null | grep -v 'ubs:ignore' | head -n "$limit")
   printf '['; local i=0; for l in "${lines[@]}"; do [[ $i -gt 0 ]] && printf ','; printf '"%s"' "$(printf '%s' "$l" | json_escape)"; i=$((i+1)); done; printf ']'
 }
 
@@ -1538,7 +1539,7 @@ rule:
     - pattern: $X as f32
     - pattern: $X as f64
 severity: info
-message: "`as` cast can truncate or change sign; prefer TryFrom/TryInto when correctness matters"
+message: "\`as\` cast can truncate or change sign; prefer TryFrom/TryInto when correctness matters"
 YAML
 
   cat >"$AST_RULE_DIR/try-into-unwrap.yml" <<'YAML'
@@ -2349,17 +2350,17 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════
 if category_enabled 22; then
 print_header "22. SUSPICIOUS CASTS & TRUNCATION"
-print_category "Detects: pervasive `as` casts, try_into().unwrap, numeric narrowing patterns" \
-  "`as` casts can silently truncate or change sign; conversion panics may be missed in uncommon input paths"
+print_category "Detects: pervasive \`as\` casts, try_into().unwrap, numeric narrowing patterns" \
+  "\`as\` casts can silently truncate or change sign; conversion panics may be missed in uncommon input paths"
 
-print_subheader "`as` cast inventory"
+print_subheader "\`as\` cast inventory"
 as_casts=$("${GREP_RN[@]}" -e "\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b" "$PROJECT_DIR" 2>/dev/null | count_lines || true)
 as_casts=$(printf '%s\n' "${as_casts:-0}" | awk 'END{print $0+0}')
 if [ "$as_casts" -gt 0 ]; then
-  print_finding "info" "$as_casts" "`as` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants"
-  add_finding "info" "$as_casts" "`as` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants" "${CATEGORY_NAME[22]}" "$(collect_samples_rg "\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b" 3)"
+  print_finding "info" "$as_casts" "\`as\` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants"
+  add_finding "info" "$as_casts" "\`as\` casts present (possible truncation/sign bugs)" "Prefer TryFrom/TryInto for correctness or document invariants" "${CATEGORY_NAME[22]}" "$(collect_samples_rg "\bas\s+(u8|u16|u32|u64|usize|i8|i16|i32|i64|isize|f32|f64)\b" 3)"
 else
-  print_finding "good" "No obvious `as` casts detected"
+  print_finding "good" "No obvious \`as\` casts detected"
 fi
 
 print_subheader "try_into().unwrap()/expect() (panic on conversion failure)"

@@ -336,7 +336,7 @@ else
 fi
 
 # Helper: robust numeric end-of-pipeline counter
-count_lines() { awk 'END{print (NR+0)}'; }
+count_lines() { grep -v 'ubs:ignore' | awk 'END{print (NR+0)}'; }
 wc_num(){ wc -l | awk '{print $1+0}'; }
 
 now() {
@@ -457,6 +457,7 @@ show_detailed_finding() {
   fi
   while IFS= read -r rawline; do
     [[ -z "$rawline" ]] && continue
+    [[ "$rawline" == *"ubs:ignore"* ]] && continue
     parse_grep_line "$rawline" || continue
     print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break

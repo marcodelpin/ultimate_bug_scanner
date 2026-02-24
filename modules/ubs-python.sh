@@ -393,7 +393,7 @@ else
 fi
 
 # Helper: robust numeric end-of-pipeline counter
-count_lines() { awk 'END{print (NR+0)}'; }
+count_lines() { grep -v 'ubs:ignore' | awk 'END{print (NR+0)}'; }
 num_clamp() { local v=${1:-0}; printf '%s' "$v" | awk 'END{print ($0+0)}'; }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -495,6 +495,7 @@ show_detailed_finding() {
   local pattern=$1; local limit=${2:-$DETAIL_LIMIT}; local printed=0
   while IFS= read -r rawline; do
     [[ -z "$rawline" ]] && continue
+    [[ "$rawline" == *"ubs:ignore"* ]] && continue
     parse_grep_line "$rawline" || continue
     print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"; printed=$((printed+1))
     [[ $printed -ge $limit || $printed -ge $MAX_DETAILED ]] && break
@@ -2745,7 +2746,29 @@ PY
         ;;
       bandit)
         print_subheader "bandit (security)"
-        _EXC=""; for d in "${EXCLUDE_DIRS[@]}"; do _EXC="${_EXC:+$_EXC,}$d"; done
+        _EXC=""
+        for d in "${EXCLUDE_DIRS[@]}"; do
+          if [[ "$d" == /* ]]; then
+            _EXC="${_EXC:+$_EXC,}$d"
+          else
+            _EXC="${_EXC:+$_EXC,}$PROJECT_DIR/$d"
+          fi
+        done
+        # Expand .ubsignore glob patterns (e.g. **/test_*.py) into real
+        # paths that Bandit's -x flag can understand.  Simple dir names
+        # like "tests" are already handled above; here we only expand
+        # entries that contain glob meta-characters.
+        if [[ -n "$EXTRA_EXCLUDES" ]]; then
+          IFS=',' read -r -a _ign_pats <<< "$EXTRA_EXCLUDES"
+          for _pat in "${_ign_pats[@]}"; do
+            # Skip patterns already covered as plain dir names above
+            [[ "$_pat" != *'*'* && "$_pat" != *'?'* && "$_pat" != *'['* ]] && continue
+            while IFS= read -r _match; do
+              [[ -z "$_match" ]] && continue
+              _EXC="${_EXC:+$_EXC,}$_match"
+            done < <(find "$PROJECT_DIR" -path "$PROJECT_DIR/$_pat" 2>/dev/null || true)
+          done
+        fi
         if run_uv_tool_text bandit -q -r "$PROJECT_DIR" -x "${_EXC:-}" ; then
           print_finding "info" 0 "Bandit scan completed" "See output above"
         else

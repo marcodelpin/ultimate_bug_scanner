@@ -537,7 +537,7 @@ else
   GREP_RNW=(env LC_ALL="${SAFE_LOCALE}" grep "${GREP_R_OPTS[@]}" -n -w -E)
 fi
 
-count_lines(){ awk 'END{print (NR+0)}'; }
+count_lines(){ grep -v 'ubs:ignore' | awk 'END{print (NR+0)}'; }
 num_clamp(){ local v=${1:-0}; printf '%s' "$v" | awk 'END{print ($0+0)}'; }
 
 resolve_timeout(){
@@ -623,6 +623,7 @@ show_detailed_finding(){
  [[ "$DETAILED_EMITTED" -ge "$MAX_DETAILED" ]] && return 0
  while IFS= read -r rawline; do
   [[ -z "$rawline" ]] && continue
+  [[ "$rawline" == *"ubs:ignore"* ]] && continue
   parse_grep_line "$rawline" || continue
   print_code_sample "$PARSED_FILE" "$PARSED_LINE" "$PARSED_CODE"
   printed=$((printed + 1))

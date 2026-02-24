@@ -6,7 +6,7 @@ async def fetch_user(uid):
 
 async def refresh_dashboard():
     try:
-        data = await fetch_user('abc')
+        await fetch_user('abc')
     except Exception as exc:
         print('dashboard failed', exc)
         raise
