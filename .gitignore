@@ -58,6 +58,14 @@ perf.data.*
 # Local scratch DBs
 storage.sqlite3
 storage.sqlite3-*
+*.sqlite3.bak
+
+# Prompt dump files (agent-generated diagnostic exports)
+prompt_dump*.md
+modules/prompt_dump*.md
+
+# macOS resource fork files
+._*
 
 # bv graph output
 --graph-format.svg
