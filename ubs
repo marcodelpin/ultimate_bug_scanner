@@ -737,16 +737,43 @@ script_dir(){
   # Critical for macOS Homebrew where /opt/homebrew/bin/ubs is a relative
   # symlink (e.g. ../Cellar/ubs/5.0.7/bin/ubs).  We must resolve the
   # relative target against the *symlink's* parent dir, not CWD.
-  local source="${BASH_SOURCE[0]}"
+  #
+  # The set -E (errtrace) flag causes the ERR trap to fire inside
+  # functions.  Guard every cd so a failed cd never triggers on_err
+  # and kills the script.
+
+  # Fast path: use realpath if available (Linux, macOS 12.3+, Homebrew coreutils)
+  local self="${BASH_SOURCE[0]}"
+  if command -v realpath >/dev/null 2>&1; then
+    local rp
+    rp="$(realpath "$self" 2>/dev/null)" || true
+    if [[ -n "$rp" ]]; then
+      dirname "$rp"
+      return 0
+    fi
+  fi
+
+  # Fallback: manual symlink-chase loop
+  local source="$self"
   while [ -L "$source" ]; do
-    local dir
-    dir=$(cd -P "$(dirname "$source")" && pwd)
-    source=$(readlink "$source")
+    local link_dir
+    link_dir="$(cd -P "$(dirname "$source")" 2>/dev/null && pwd)" || link_dir=""
+    source="$(readlink "$source")" || true
     # If readlink returned a relative path, resolve it against the
     # directory that contained the symlink we just read.
-    [[ "$source" != /* ]] && source="$dir/$source"
+    if [[ "$source" != /* && -n "$link_dir" ]]; then
+      source="$link_dir/$source"
+    fi
   done
-  cd -P "$(dirname "$source")" && pwd
+  # Use dirname + cd -P to canonicalize; || true prevents ERR trap on failure
+  local resolved
+  resolved="$(cd -P "$(dirname "$source")" 2>/dev/null && pwd)" || true
+  if [[ -n "$resolved" ]]; then
+    echo "$resolved"
+  else
+    # Last resort: return dirname as-is (non-canonical but usable)
+    dirname "$source"
+  fi
 }
 
 prepare_metrics_dir(){
